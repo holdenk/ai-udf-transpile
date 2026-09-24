@@ -25,6 +25,9 @@ BINARY_CLAUDE = PREFIX + "binary.claude"
 MAX_EXAMPLES = PREFIX + "maxExamples"
 MAX_RETRIES = PREFIX + "maxRetries"
 FAIL_COOLDOWN = PREFIX + "failCooldownSeconds"
+MODEL_COCO = PREFIX + "model.coco"
+MODEL_CURSOR = PREFIX + "model.cursor"
+MODEL_CLAUDE = PREFIX + "model.claude"
 
 DEFAULTS: dict[str, str] = {
     CATALOG: "sqlite",

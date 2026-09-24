@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+from ai_udf_transpile import conf
 from ai_udf_transpile.backends.claude import ClaudeBackend
-from ai_udf_transpile.backends.cli import parse_sandbox
+from ai_udf_transpile.backends.cli import _parse_claude_json, parse_sandbox
 from ai_udf_transpile.backends.coco import CocoBackend
 from ai_udf_transpile.backends.cursor import CursorBackend
 from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF
@@ -62,7 +64,60 @@ def test_claude_argv(tmp_path):
     assert "--allowedTools" in argv
     assert "Read,Write" in argv
     assert "--max-turns" in argv
+    assert "--output-format" in argv
+    assert "json" in argv
     assert "PROMPT TEXT" in argv
+
+
+def test_model_flag_appended_when_conf_set(tmp_path):
+    conf.set_value(conf.MODEL_CURSOR, "gpt-x-1")
+    argv = CursorBackend().build_argv(tmp_path, "PROMPT TEXT")
+    assert argv[argv.index("--model") + 1] == "gpt-x-1"
+    assert "PROMPT TEXT" in argv
+
+
+def test_model_flag_absent_by_default(tmp_path):
+    argv = CursorBackend().build_argv(tmp_path, "PROMPT TEXT")
+    assert "--model" not in argv
+
+
+def test_coco_model_flag(tmp_path):
+    conf.set_value(conf.MODEL_COCO, "snow-intelligence-x")
+    argv = CocoBackend().build_argv(tmp_path, "PROMPT TEXT")
+    assert "-m" in argv
+    assert argv[argv.index("-m") + 1] == "snow-intelligence-x"
+
+
+def test_parse_claude_json_extracts_model_and_result():
+    payload = json.dumps(
+        {
+            "type": "result",
+            "result": "_udf_param_0 + 1",
+            "modelUsage": {"claude-test-model": {"inputTokens": 3}},
+        }
+    )
+    model, text = _parse_claude_json(payload)
+    assert model == "claude-test-model"
+    assert text == "_udf_param_0 + 1"
+
+
+def test_parse_claude_json_passthrough_on_non_json():
+    model, text = _parse_claude_json("plain text output")
+    assert model == ""
+    assert text == "plain text output"
+
+
+def test_claude_run_records_detected_model(tmp_path):
+    payload = json.dumps({"result": "ignored", "modelUsage": {"claude-x": {}}})
+
+    def runner(argv, **kwargs):
+        (Path(kwargs["cwd"]) / "OUT.sql").write_text("_udf_param_0 + 1\n")
+        return _Completed(stdout=payload)
+
+    backend = ClaudeBackend(runner=runner)
+    result = backend.run(None, tmp_path)
+    assert result.sql == "_udf_param_0 + 1"
+    assert result.model == "claude-x"
 
 
 def test_parse_sql_wins(tmp_path):
