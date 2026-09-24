@@ -90,7 +90,7 @@ def return_spark_type(return_type: Any) -> Optional[str]:
         return None
     if isinstance(return_type, str):
         simple = return_type.strip().lower()
-        if any(simple.startswith(p) for p in ATOMIC_RETURN_PREFIXES):
+        if any(simple == p or simple.startswith(p + "(") for p in ATOMIC_RETURN_PREFIXES):
             return return_type.strip()
         return None
     simple_fn = getattr(return_type, "simpleString", None)
@@ -99,7 +99,7 @@ def return_spark_type(return_type: Any) -> Optional[str]:
             simple = str(simple_fn())
         except Exception:
             simple = ""
-        if any(simple.lower().startswith(p) for p in ATOMIC_RETURN_PREFIXES):
+        if any(simple.lower() == p or simple.lower().startswith(p + "(") for p in ATOMIC_RETURN_PREFIXES):
             return simple
     name = type(return_type).__name__
     if name in _ATOMIC_RETURN_TYPE_NAMES:

@@ -81,8 +81,13 @@ after `maxRetries` (default 3).
 
 ```bash
 pytest -m "not spark" tests/   # no JVM
-pytest tests/                  # plus classic SparkSession tests
+SPARK_HOME=/path/to/spark-master pytest tests/   # plus classic SparkSession tests
 ```
+
+The Spark tests need a package-only build of `apache/spark@master`
+(`./build/mvn -DskipTests -Phadoop-3 package -pl sql/core,assembly -am`).
+`tests/conftest.py` puts `$SPARK_HOME/python` and py4j on `sys.path` and pins
+`PYSPARK_PYTHON` to the running interpreter so workers match the driver.
 
 CI uses `backend=fake` with a handful of annotated fixtures (`plus_one`,
 `is_none_branch`, `both_positive`, `greet`). Live CoCo/Cursor/Claude CLIs

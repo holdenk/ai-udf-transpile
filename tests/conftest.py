@@ -53,6 +53,10 @@ def spark():
     _bootstrap_spark_home()
     pytest.importorskip("pyspark")
     os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
+    # Workers must run the same interpreter as the driver (cloudpickle shares
+    # bytecode); the system default python3 may be too old for Spark master.
+    os.environ["PYSPARK_PYTHON"] = sys.executable
+    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
     try:
         from pyspark.sql import SparkSession
         from pyspark.sql.transpile import AbstractTranspiler  # noqa: F401
@@ -67,6 +71,8 @@ def spark():
             .config("spark.sql.ansi.enabled", "true")
             .config("spark.driver.host", "127.0.0.1")
             .config("spark.driver.bindAddress", "127.0.0.1")
+            .config("spark.pyspark.python", sys.executable)
+            .config("spark.pyspark.driver.python", sys.executable)
             .getOrCreate()
         )
         session.range(1).count()

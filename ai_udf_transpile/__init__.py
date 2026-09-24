@@ -139,10 +139,17 @@ def enable(
 
 def shutdown() -> None:
     """Stop the inline worker and drop session/catalog globals (for tests)."""
-    from ai_udf_transpile.transpiler import set_catalog, set_session
+    from ai_udf_transpile.transpiler import get_catalog, set_catalog, set_session
     from ai_udf_transpile.worker import stop_inline
 
     stop_inline()
+    catalog = get_catalog()
+    close = getattr(catalog, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            logger.debug("catalog close failed", exc_info=True)
     set_catalog(None)
     set_session(None)
     conf.reset_runtime()

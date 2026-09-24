@@ -44,11 +44,12 @@ def test_fixtures_cover_annotated_defs():
 
 def test_plus_one_sql():
     backend = FakeBackend()
-    with make_sandbox(_job_for(plus_one)) as sandbox:
-        result = backend.run(_job_for(plus_one), sandbox)
+    job = _job_for(plus_one)
+    with make_sandbox(job) as sandbox:
+        result = backend.run(job, sandbox)
+        assert (Path(sandbox) / "OUT.sql").read_text().strip() == "_udf_param_0 + 1"
     assert result.kind == "catalyst"
     assert result.sql == "_udf_param_0 + 1"
-    assert (Path(sandbox) / "OUT.sql").exists() is False or True  # sandbox cleaned up
 
 
 def test_greet_and_branch_and_bool():
