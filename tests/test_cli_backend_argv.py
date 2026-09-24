@@ -31,7 +31,8 @@ def test_coco_argv(tmp_path):
     prompt.write_text("hello")
     argv = backend.build_argv(tmp_path, "hello")
     assert argv[0] == "cortex"
-    assert "-f" in argv
+    assert "exec" in argv
+    assert "--file" in argv
     assert "--workdir" in argv
     assert "--bypass" in argv
     result = backend.run(None, tmp_path)  # job unused
@@ -55,7 +56,7 @@ def test_claude_argv(tmp_path):
     argv = backend.build_argv(tmp_path, "PROMPT TEXT")
     assert argv[0] == "claude"
     assert "-p" in argv
-    assert "--bare" in argv
+    assert "--bare" not in argv  # bare mode skips apiKeyHelper auth
     assert "--permission-mode" in argv
     assert "dontAsk" in argv
     assert "--allowedTools" in argv
