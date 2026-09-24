@@ -164,6 +164,14 @@ class CliBackend:
             return ""
         return conf.get_value(self.spec.model_conf_key, self.spark, "").strip()
 
+    def reported_model(self) -> str:
+        """Model to record in the catalog: the configured model or ``<name>-unknown``.
+
+        We do our own dispatch, so a row should never have a NULL model just
+        because the CLI did not print which model served the request.
+        """
+        return self.model() or f"{self.name}-unknown"
+
     def build_argv(self, sandbox: Path, prompt_text: str) -> list[str]:
         argv = self.spec.argv(self.binary(), sandbox, prompt_text)
         model = self.model()
@@ -209,6 +217,6 @@ class CliBackend:
             raise
         except Exception as exc:
             raise BackendError(f"{self.name} produced no rewrite: {exc}; stderr={stderr[:300]}") from exc
-        if model and not result.model:
-            result.model = model
+        if not result.model:
+            result.model = model or f"{self.name}-unknown"
         return result
