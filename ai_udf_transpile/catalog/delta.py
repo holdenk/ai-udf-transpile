@@ -76,6 +76,7 @@ def _row_from_spark(rec: Any) -> CacheRow:
         impl_binary=binary,
         origin=as_dict.get("origin"),
         backend=as_dict.get("backend"),
+        model=as_dict.get("model"),
         error=as_dict.get("error"),
         hypothesis_passed=None if hyp is None else bool(hyp),
         attempt_count=int(as_dict.get("attempt_count") or 0),
@@ -115,6 +116,7 @@ class DeltaCatalog:
                 impl_binary BINARY,
                 origin STRING,
                 backend STRING,
+                model STRING,
                 error STRING,
                 hypothesis_passed BOOLEAN,
                 attempt_count INT,
@@ -125,6 +127,16 @@ class DeltaCatalog:
             ) USING delta
             """
         )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first schema version."""
+        try:
+            cols = {f.col_name for f in self.spark.sql(f"DESCRIBE {self.table}").collect()}
+        except Exception:
+            return
+        if "model" not in cols:
+            self.spark.sql(f"ALTER TABLE {self.table} ADD COLUMNS (model STRING)")
 
     def _select(self, udf_key: str) -> Optional[CacheRow]:
         rows = self.spark.sql(
@@ -239,6 +251,7 @@ class DeltaCatalog:
                 impl_entry = {_sql_str(result.entry)},
                 impl_binary = {_sql_blob_hex(result.binary)},
                 origin = {_sql_str(origin)},
+                model = {_sql_str(result.model)},
                 hypothesis_passed = {str(bool(hypothesis_passed)).upper()},
                 error = NULL,
                 failed_at = NULL,
@@ -248,7 +261,14 @@ class DeltaCatalog:
             """
         )
 
-    def mark_failed(self, udf_key: str, error: str) -> None:
+    def mark_failed(
+        self,
+        udf_key: str,
+        error: str,
+        *,
+        origin: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
         now = iso_now()
         self.spark.sql(
             f"""
@@ -258,6 +278,8 @@ class DeltaCatalog:
                 failed_at = {_sql_str(now)},
                 claimed_at = NULL,
                 hypothesis_passed = FALSE,
+                origin = COALESCE({_sql_str(origin)}, origin),
+                model = COALESCE({_sql_str(model)}, model),
                 updated_at = {_sql_str(now)}
             WHERE udf_key = {_sql_str(udf_key)}
             """
@@ -305,6 +327,7 @@ class DeltaCatalog:
                 impl_entry = {_sql_str(result.entry)},
                 impl_binary = {_sql_blob_hex(result.binary)},
                 origin = {_sql_str(origin)},
+                model = {_sql_str(result.model)},
                 hypothesis_passed = {hyp},
                 error = NULL,
                 failed_at = NULL,
@@ -314,7 +337,7 @@ class DeltaCatalog:
                 udf_key, source_text, param_names, input_types, input_categories,
                 return_type, spark_version, closure_fingerprint, captures_json,
                 status, target_kind, catalyst_sql, impl_source, impl_class,
-                impl_entry, impl_binary, origin, hypothesis_passed,
+                impl_entry, impl_binary, origin, model, hypothesis_passed,
                 attempt_count, created_at, updated_at
             ) VALUES (
                 {_sql_str(udf_key)}, {_sql_str(source_text)}, {_sql_str(dumps(param_names))},
@@ -324,7 +347,7 @@ class DeltaCatalog:
                 'success', {_sql_str(result.kind)}, {_sql_str(result.sql)},
                 {_sql_str(result.java_source)}, {_sql_str(result.class_name)},
                 {_sql_str(result.entry)}, {_sql_blob_hex(result.binary)},
-                {_sql_str(origin)}, {hyp}, 0, {_sql_str(now)}, {_sql_str(now)}
+                {_sql_str(origin)}, {_sql_str(result.model)}, {hyp}, 0, {_sql_str(now)}, {_sql_str(now)}
             )
             """
         )

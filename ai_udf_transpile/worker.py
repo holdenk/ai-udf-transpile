@@ -52,6 +52,8 @@ def process_row(
     """Run one claimed row to success or failed. Never leaves status=running."""
     key = row.udf_key
     verify_fn = verify_fn or hypothesis_check
+    origin = getattr(backend, "name", "unknown")
+    model: Optional[str] = None
     try:
         if (row.origin == "human") and (row.catalyst_sql or row.impl_class or row.impl_source):
             result = TranspileResult(
@@ -67,7 +69,7 @@ def process_row(
             job = row.as_job()
             with make_sandbox(job) as sandbox:
                 result = backend.run(job, sandbox)
-            origin = getattr(backend, "name", "unknown")
+        model = result.model
         if result.kind == "java_udf" and result.java_source and not result.binary and spark is not None:
             from ai_udf_transpile.javac import compile_java
 
@@ -86,19 +88,25 @@ def process_row(
         )
         if ok:
             catalog.mark_success(key, result, origin, hypothesis_passed=True)
-            logger.info("transpile success key=%s origin=%s kind=%s", key[:12], origin, result.kind)
+            logger.info(
+                "transpile success key=%s origin=%s model=%s kind=%s",
+                key[:12],
+                origin,
+                model,
+                result.kind,
+            )
             return
-        catalog.mark_failed(key, err or "hypothesis failed")
-        logger.info("transpile failed key=%s: %s", key[:12], err)
+        catalog.mark_failed(key, err or "hypothesis failed", origin=origin, model=model)
+        logger.info("transpile failed key=%s origin=%s: %s", key[:12], origin, err)
     except BackendDecline as exc:
         try:
-            catalog.mark_failed(key, f"declined: {exc}")
+            catalog.mark_failed(key, f"declined: {exc}", origin=origin, model=model)
         except Exception:
             logger.exception("failed to mark declined row %s", key)
         logger.info("backend declined key=%s: %s", key[:12], exc)
     except Exception as exc:
         try:
-            catalog.mark_failed(key, f"{type(exc).__name__}: {exc}")
+            catalog.mark_failed(key, f"{type(exc).__name__}: {exc}", origin=origin, model=model)
         except Exception:
             logger.exception("failed to mark error row %s", key)
         logger.exception("process_row failed key=%s", key)

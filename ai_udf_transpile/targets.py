@@ -37,6 +37,7 @@ class TranspileResult:
     class_name: Optional[str] = None
     binary: Optional[bytes] = None
     entry: Optional[str] = None
+    model: Optional[str] = None
 
     def reconstructable(self) -> bool:
         if self.kind == KIND_CATALYST:

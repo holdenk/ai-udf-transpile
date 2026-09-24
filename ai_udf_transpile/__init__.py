@@ -237,7 +237,7 @@ def register_impl(
                     closure_fingerprint=fingerprint,
                     captures=captures,
                 )
-            catalog.mark_failed(key, err or "register_impl verify failed")
+            catalog.mark_failed(key, err or "register_impl verify failed", origin=ORIGIN)
             raise ValueError(f"register_impl Hypothesis failed: {err}")
         hyp = True
 

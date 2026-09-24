@@ -72,6 +72,7 @@ class CacheRow:
     impl_binary: Optional[bytes] = None
     origin: Optional[str] = None
     backend: Optional[str] = None
+    model: Optional[str] = None
     error: Optional[str] = None
     hypothesis_passed: Optional[bool] = None
     attempt_count: int = 0
@@ -133,7 +134,14 @@ class Catalog(Protocol):
         hypothesis_passed: bool = True,
     ) -> None: ...
 
-    def mark_failed(self, udf_key: str, error: str) -> None: ...
+    def mark_failed(
+        self,
+        udf_key: str,
+        error: str,
+        *,
+        origin: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None: ...
 
     def upsert_success(
         self,

@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS cache (
     impl_binary BLOB,
     origin TEXT,
     backend TEXT,
+    model TEXT,
     error TEXT,
     hypothesis_passed INTEGER,
     attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -55,6 +56,7 @@ CREATE TABLE IF NOT EXISTS cache (
 
 def _row_from_sql(raw: sqlite3.Row) -> CacheRow:
     hyp = raw["hypothesis_passed"]
+    keys = set(raw.keys())
     return CacheRow(
         udf_key=raw["udf_key"],
         source_text=raw["source_text"] or "",
@@ -74,6 +76,7 @@ def _row_from_sql(raw: sqlite3.Row) -> CacheRow:
         impl_binary=raw["impl_binary"],
         origin=raw["origin"],
         backend=raw["backend"],
+        model=raw["model"] if "model" in keys else None,
         error=raw["error"],
         hypothesis_passed=None if hyp is None else bool(hyp),
         attempt_count=int(raw["attempt_count"] or 0),
@@ -95,6 +98,14 @@ class SqliteCatalog:
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first schema version."""
+        with self._lock:
+            cols = {row[1] for row in self._conn.execute("PRAGMA table_info(cache)")}
+            if "model" not in cols:
+                self._conn.execute("ALTER TABLE cache ADD COLUMN model TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -217,6 +228,7 @@ class SqliteCatalog:
                     impl_entry = ?,
                     impl_binary = ?,
                     origin = ?,
+                    model = ?,
                     hypothesis_passed = ?,
                     error = NULL,
                     failed_at = NULL,
@@ -232,13 +244,21 @@ class SqliteCatalog:
                     result.entry,
                     result.binary,
                     origin,
+                    result.model,
                     1 if hypothesis_passed else 0,
                     now,
                     udf_key,
                 ),
             )
 
-    def mark_failed(self, udf_key: str, error: str) -> None:
+    def mark_failed(
+        self,
+        udf_key: str,
+        error: str,
+        *,
+        origin: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
         now = iso_now()
         with self._lock:
             self._conn.execute(
@@ -249,10 +269,12 @@ class SqliteCatalog:
                     failed_at = ?,
                     claimed_at = NULL,
                     hypothesis_passed = 0,
+                    origin = COALESCE(?, origin),
+                    model = COALESCE(?, model),
                     updated_at = ?
                 WHERE udf_key = ?
                 """,
-                (error, now, now, udf_key),
+                (error, now, origin, model, now, udf_key),
             )
 
     def upsert_success(
@@ -282,9 +304,9 @@ class SqliteCatalog:
                     udf_key, source_text, param_names, input_types, input_categories,
                     return_type, spark_version, closure_fingerprint, captures_json,
                     status, target_kind, catalyst_sql, impl_source, impl_class,
-                    impl_entry, impl_binary, origin, hypothesis_passed,
+                    impl_entry, impl_binary, origin, model, hypothesis_passed,
                     attempt_count, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 ON CONFLICT(udf_key) DO UPDATE SET
                     source_text = excluded.source_text,
                     param_names = excluded.param_names,
@@ -302,6 +324,7 @@ class SqliteCatalog:
                     impl_entry = excluded.impl_entry,
                     impl_binary = excluded.impl_binary,
                     origin = excluded.origin,
+                    model = excluded.model,
                     hypothesis_passed = excluded.hypothesis_passed,
                     error = NULL,
                     failed_at = NULL,
@@ -325,6 +348,7 @@ class SqliteCatalog:
                     result.entry,
                     result.binary,
                     origin,
+                    result.model,
                     hyp,
                     now,
                     now,

@@ -134,3 +134,62 @@ def test_miss_on_empty(tmp_path):
     kind, row = cat.lookup("missing")
     assert kind == MISS
     assert row is None
+
+
+def test_model_recorded_on_success(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "claude")
+    cat.mark_success(
+        "k1",
+        TranspileResult(kind="catalyst", sql="_udf_param_0 + 1", model="claude-x-1"),
+        origin="claude",
+    )
+    row = cat.get("k1")
+    assert row is not None
+    assert row.model == "claude-x-1"
+    assert row.origin == "claude"
+    assert row.backend == "claude"
+
+
+def test_failure_records_origin_and_model(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "coco")
+    cat.mark_failed("k1", "hypothesis failed: mismatch", origin="coco", model="snow-x")
+    row = cat.get("k1")
+    assert row is not None
+    assert row.status == "failed"
+    assert row.error == "hypothesis failed: mismatch"
+    assert row.origin == "coco"
+    assert row.model == "snow-x"
+    assert row.failed_at is not None
+
+
+def test_mark_failed_without_origin_keeps_existing(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "cursor")
+    cat.mark_failed("k1", "first", origin="cursor", model="m1")
+    cat.mark_failed("k1", "second")
+    row = cat.get("k1")
+    assert row is not None
+    assert row.error == "second"
+    assert row.origin == "cursor"  # COALESCE: not overwritten by NULL
+    assert row.model == "m1"
+
+
+def test_model_column_added_to_existing_db(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE cache (udf_key TEXT PRIMARY KEY, status TEXT NOT NULL, "
+        "return_type TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.commit()
+    conn.close()
+    cat = SqliteCatalog(path)  # migration adds model
+    cols = {r[1] for r in cat._conn.execute("PRAGMA table_info(cache)")}
+    assert "model" in cols

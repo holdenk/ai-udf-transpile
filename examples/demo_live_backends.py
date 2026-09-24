@@ -81,7 +81,7 @@ def run_backend(spark, backend: str) -> dict:
         out["greet_results"] = [r[0] for r in names.select(udf("name")).collect()]
 
     rows = catalog._conn.execute(
-        "SELECT target_kind, status, origin, hypothesis_passed, error FROM cache"
+        "SELECT target_kind, status, origin, model, hypothesis_passed, error FROM cache"
     ).fetchall()
     out["catalog"] = rows
     shutdown()
@@ -123,9 +123,10 @@ def main() -> int:
                 f"  greet:    transpiled={last['greet']} in {last['greet_seconds']}s"
                 f" results={last.get('greet_results')}"
             )
-            for kind, status, origin, hyp, error in last["catalog"]:
+            for kind, status, origin, model, hyp, error in last["catalog"]:
                 print(
-                    f"  catalog: kind={kind} status={status} origin={origin} hypothesis={hyp} {error or ''}"
+                    f"  catalog: kind={kind} status={status} origin={origin}"
+                    f" model={model} hypothesis={hyp} {error or ''}"
                 )
         print(flush=True)
 

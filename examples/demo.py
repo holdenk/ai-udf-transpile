@@ -183,8 +183,8 @@ def main() -> int:
     if found:
         row = wait_for_status(catalog, found[0], "failed", timeout=60)
         print(
-            f"always_decline: status={row.status} error={row.error!r} "
-            "(no fixture -> failed, cooldown applies)"
+            f"always_decline: status={row.status} origin={row.origin} backend={row.backend} "
+            f"error={row.error!r} (no fixture -> failed, cooldown applies)"
         )
     before = catalog.count()
     UserDefinedFunction(always_decline, LongType())
