@@ -37,6 +37,20 @@ BUILTIN_STRING_EXAMPLES: tuple[str, ...] = (
     "é",
 )
 
+# Deterministic maps always tried for map<string,string>-typed params: values
+# that are valid JSON, valid Python literals, both, or neither.
+BUILTIN_MAP_EXAMPLES: tuple[dict, ...] = (
+    {},
+    {"a": "1"},
+    {"a": "plain"},
+    {"k": '{"x": 1}'},
+    {"k": "[1, 2]"},
+    {"k": "{'x': 1}"},
+    {"k": "None"},
+    {"k": "True"},
+    {"k": "null"},
+)
+
 _MAX_STORED_SAMPLES = 64
 
 _process_lock = threading.Lock()
@@ -48,6 +62,10 @@ def _encode(value: Any) -> Any:
         return {"__bytes__": value.hex()}
     if isinstance(value, (int, float, bool, str)) or value is None:
         return value
+    if isinstance(value, dict):
+        # map<string,string> args are real values, tagged so they cannot be
+        # confused with the __bytes__ / __repr__ marker dicts.
+        return {"__map__": [[_encode(k), _encode(v)] for k, v in value.items()]}
     return {"__repr__": repr(value)[:200]}
 
 
@@ -63,6 +81,11 @@ def decode_args(text: str) -> Optional[list]:
         if isinstance(item, dict) and "__bytes__" in item:
             try:
                 out.append(bytes.fromhex(item["__bytes__"]))
+            except Exception:
+                return None
+        elif isinstance(item, dict) and "__map__" in item:
+            try:
+                out.append({k: v for k, v in item["__map__"]})
             except Exception:
                 return None
         elif isinstance(item, dict):

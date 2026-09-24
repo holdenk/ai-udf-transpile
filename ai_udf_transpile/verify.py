@@ -157,6 +157,13 @@ def _strategy_for(spark_type: str):
         return st.one_of(st.none(), st.booleans())
     if t == "binary":
         return st.one_of(st.none(), st.binary(max_size=16))
+    if t.startswith("map<") and t.endswith(">"):
+        key_t, _, val_t = t[4:-1].partition(",")
+        if key_t.strip() == "string" and val_t.strip() == "string":
+            return st.one_of(
+                st.none(),
+                st.dictionaries(st.text(max_size=8), st.text(max_size=16), max_size=4),
+            )
     raise VerifyFailed(f"unsupported input type for verify: {spark_type}")
 
 
@@ -169,11 +176,15 @@ def _spark_type(simple: str):
         FloatType,
         IntegerType,
         LongType,
+        MapType,
         ShortType,
         StringType,
     )
 
     t = simple.strip().lower()
+    if t.startswith("map<") and t.endswith(">"):
+        key_t, _, val_t = t[4:-1].partition(",")
+        return MapType(_spark_type(key_t), _spark_type(val_t))
     return {
         "tinyint": ByteType(),
         "byte": ByteType(),
@@ -310,7 +321,7 @@ def hypothesis_check(
         strings and so does the SQL side -- a vacuous match), so real sampled
         values and a fixed set of structured strings run as @example first.
         """
-        from ai_udf_transpile.sampling import BUILTIN_STRING_EXAMPLES
+        from ai_udf_transpile.sampling import BUILTIN_MAP_EXAMPLES, BUILTIN_STRING_EXAMPLES
 
         examples: list[tuple] = []
         arity = len(input_types)
@@ -322,10 +333,13 @@ def hypothesis_check(
             if len(values) == arity:
                 examples.append(values)
         for i, spark_type in enumerate(input_types):
-            if spark_type.strip().lower() != "string":
-                continue
-            for text in BUILTIN_STRING_EXAMPLES:
-                examples.append(tuple(text if j == i else None for j in range(arity)))
+            stype = spark_type.strip().lower()
+            if stype == "string":
+                for text in BUILTIN_STRING_EXAMPLES:
+                    examples.append(tuple(text if j == i else None for j in range(arity)))
+            elif stype.startswith("map<"):
+                for m in BUILTIN_MAP_EXAMPLES:
+                    examples.append(tuple(dict(m) if j == i else None for j in range(arity)))
         return examples[:64]
 
     check = _run

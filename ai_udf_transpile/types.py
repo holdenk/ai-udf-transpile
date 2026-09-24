@@ -60,6 +60,22 @@ def annotation_name(annotation: Optional[ast.AST]) -> Optional[str]:
     return None
 
 
+def _annotation_mapping(annotation: Optional[ast.AST]) -> Optional[tuple[str, str]]:
+    """(category, Spark simpleString) for an annotation, or None when unknown."""
+    name = annotation_name(annotation)
+    if name is not None:
+        return ANNOTATION_MAP.get(name)
+    if isinstance(annotation, ast.Subscript) and annotation_name(annotation.value) in {
+        "dict",
+        "Dict",
+    }:
+        slice_ = annotation.slice
+        elts = slice_.elts if isinstance(slice_, ast.Tuple) else [slice_]
+        if len(elts) == 2 and all(annotation_name(e) == "str" for e in elts):
+            return ("map", "map<string,string>")
+    return None
+
+
 def _public_args(function_ast: ast.FunctionDef, public_params: list[str]) -> list[ast.arg]:
     n = len(public_params)
     return function_ast.args.args[-n:] if n else []
@@ -68,7 +84,7 @@ def _public_args(function_ast: ast.FunctionDef, public_params: list[str]) -> lis
 def input_categories(function_ast: ast.FunctionDef, public_params: list[str]) -> Optional[list[str]]:
     cats: list[str] = []
     for arg in _public_args(function_ast, public_params):
-        mapped = ANNOTATION_MAP.get(annotation_name(arg.annotation) or "")
+        mapped = _annotation_mapping(arg.annotation)
         if mapped is None:
             return None
         cats.append(mapped[0])
@@ -78,7 +94,7 @@ def input_categories(function_ast: ast.FunctionDef, public_params: list[str]) ->
 def input_spark_types(function_ast: ast.FunctionDef, public_params: list[str]) -> Optional[list[str]]:
     types: list[str] = []
     for arg in _public_args(function_ast, public_params):
-        mapped = ANNOTATION_MAP.get(annotation_name(arg.annotation) or "")
+        mapped = _annotation_mapping(arg.annotation)
         if mapped is None:
             return None
         types.append(mapped[1])

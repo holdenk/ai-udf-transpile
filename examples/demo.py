@@ -60,6 +60,24 @@ def is_none_branch(x: int) -> int:
     return x
 
 
+def pymap_to_json(inp: dict[str, str]) -> str:
+    import ast
+    import json
+
+    if inp is None:
+        return None
+    new = {}
+    for k, v in inp.items():
+        try:
+            new[k] = json.loads(v)
+        except Exception:
+            try:
+                new[k] = ast.literal_eval(v)
+            except Exception:
+                new[k] = v
+    return json.dumps(new)
+
+
 def untyped(x):
     return x + 1
 
@@ -241,6 +259,21 @@ def main() -> int:
         print("BUG: wrong impl was accepted")
     except ValueError as exc:
         print(f"register_impl rejected wrong SQL: {exc}")
+
+    # The classic "looks gucci but is not" rewrite: to_json type-checks and
+    # eyeballs fine, but keeps values as strings, uses compact JSON spacing,
+    # and Spark maps do not preserve Python's key insertion order.
+    try:
+        register_impl(
+            spark,
+            pymap_to_json,
+            kind="catalyst",
+            catalyst_sql="to_json(_udf_param_0)",
+            return_type=StringType(),
+        )
+        print("BUG: naive to_json was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected naive to_json for pymap_to_json (map input): {exc}")
 
     print()
     print("=== INPUT-CATEGORY GATE (int/float only vs int/float/string) ===")

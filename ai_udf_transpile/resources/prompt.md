@@ -25,7 +25,8 @@
      compiled by Janino, which emits no generic signatures and no bridge
      methods, so typed signatures fail at registration.
    - Arguments arrive boxed: `Long`/`Integer`/`Double`/`Float`/`Boolean`/
-     `String`/`byte[]` per `types.json`. Match Python `None` semantics:
+     `String`/`byte[]` per `types.json`; `map<string,string>` arrives as a
+     `scala.collection.Map<Object, Object>`. Match Python `None` semantics:
      return `null` when an argument is `null` unless the Python function
      handles `None` differently.
 3. If neither is possible, print `DECLINE` and write nothing else.
