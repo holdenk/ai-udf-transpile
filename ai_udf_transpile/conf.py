@@ -28,6 +28,9 @@ FAIL_COOLDOWN = PREFIX + "failCooldownSeconds"
 MODEL_COCO = PREFIX + "model.coco"
 MODEL_CURSOR = PREFIX + "model.cursor"
 MODEL_CLAUDE = PREFIX + "model.claude"
+INPUT_CATEGORIES = PREFIX + "inputCategories"
+SAMPLING = PREFIX + "sampling"
+MAX_SAMPLES = PREFIX + "maxSamples"
 
 DEFAULTS: dict[str, str] = {
     CATALOG: "sqlite",
@@ -42,6 +45,9 @@ DEFAULTS: dict[str, str] = {
     MAX_EXAMPLES: "20",
     MAX_RETRIES: "3",
     FAIL_COOLDOWN: "86400",
+    INPUT_CATEGORIES: "numeric,string,bool,binary",
+    SAMPLING: "true",
+    MAX_SAMPLES: "8",
 }
 
 # Side channel so tests and the worker thread can read values even if the JVM
@@ -109,3 +115,9 @@ def get_int(key: str, spark: Any = None, default: int = 0) -> int:
 
 def get_float(key: str, spark: Any = None, default: float = 0.0) -> float:
     return float(get_value(key, spark, str(default)))
+
+
+def get_csv(key: str, spark: Any = None, default: Optional[str] = None) -> set[str]:
+    """Comma-separated conf value as a lowercase set."""
+    raw = get_value(key, spark, default)
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}

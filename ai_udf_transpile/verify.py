@@ -241,6 +241,7 @@ def hypothesis_check(
     spark: Any,
     max_examples: int = 20,
     func: Any = None,
+    samples: Optional[list] = None,
 ) -> tuple[bool, Optional[str]]:
     """Return (ok, error). Analysis failure / mismatch → (False, msg). Never raises to the worker."""
     try:
@@ -269,20 +270,13 @@ def hypothesis_check(
     if spark is None:
         return False, "hypothesis_check requires a SparkSession"
 
-    from hypothesis import HealthCheck, given, settings
+    from hypothesis import HealthCheck, example, given, settings
     from hypothesis import strategies as st
 
     strategies = [_strategy_for(t) for t in input_types]
     mismatch: list[str] = []
 
-    @settings(
-        max_examples=max_examples,
-        deadline=None,
-        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
-        database=None,
-    )
-    @given(st.tuples(*strategies) if strategies else st.just(()))
-    def _check(args: tuple) -> None:
+    def _run(args: tuple) -> None:
         py_exc: Optional[BaseException] = None
         try:
             py_value = python_fn(*args)
@@ -309,8 +303,44 @@ def hypothesis_check(
         if py_value != sql_value:
             mismatch.append(f"mismatch on {args!r}: python={py_value!r} sql={sql_value!r}")
 
+    def _explicit_examples() -> list[tuple]:
+        """Real sampled rows plus built-in interesting strings.
+
+        Random text rarely exercises parsers (a JSON UDF raises on random
+        strings and so does the SQL side -- a vacuous match), so real sampled
+        values and a fixed set of structured strings run as @example first.
+        """
+        from ai_udf_transpile.sampling import BUILTIN_STRING_EXAMPLES
+
+        examples: list[tuple] = []
+        arity = len(input_types)
+        for sample in samples or []:
+            try:
+                values = tuple(sample)
+            except TypeError:
+                continue
+            if len(values) == arity:
+                examples.append(values)
+        for i, spark_type in enumerate(input_types):
+            if spark_type.strip().lower() != "string":
+                continue
+            for text in BUILTIN_STRING_EXAMPLES:
+                examples.append(tuple(text if j == i else None for j in range(arity)))
+        return examples[:64]
+
+    check = _run
+    for ex in _explicit_examples():
+        check = example(ex)(check)  # inside @given: documented ordering
+    check = given(st.tuples(*strategies) if strategies else st.just(()))(check)
+    check = settings(
+        max_examples=max_examples,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+        database=None,
+    )(check)
+
     try:
-        _check()
+        check()
     except Exception as exc:
         return False, f"hypothesis failed: {exc}"
     if mismatch:

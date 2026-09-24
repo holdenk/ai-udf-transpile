@@ -24,7 +24,7 @@ from pyspark.sql import SparkSession  # noqa: E402
 from pyspark.sql.types import BooleanType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
-from ai_udf_transpile import enable, register_impl, shutdown  # noqa: E402
+from ai_udf_transpile import conf, enable, register_impl, shutdown  # noqa: E402
 from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
 
 
@@ -40,6 +40,14 @@ def backwards(name: str) -> str:
     if name is None:
         return None
     return name[::-1]
+
+
+def widget_name(payload: str) -> str:
+    import json
+
+    if payload is None:
+        return None
+    return json.loads(payload).get("widget")
 
 
 def both_positive(x: int, y: int) -> bool:
@@ -120,6 +128,32 @@ def main() -> int:
     names = spark.createDataFrame([("bo",), ("holden",)], ["name"])
     greet_rows = [r[0] for r in names.select(g("name")).collect()]
     print(f"greet: transpiled={bool(g.transpiled)} results={greet_rows}")
+
+    print()
+    print("=== REAL-ROW SAMPLING (string inputs feed Hypothesis) ===")
+    # First call is a cache miss: it runs as a Python UDF, and the real string
+    # arguments are sampled into the catalog so the verifier sees realistic
+    # JSON instead of only random strings (which would let a wrong JSON path
+    # pass vacuously).
+    payloads = spark.createDataFrame(
+        [('{"widget": "gizmo", "n": 1}',), ('{"widget": "sprocket", "n": 2}',)],
+        ["payload"],
+    )
+    w = UserDefinedFunction(widget_name, StringType())
+    first_rows = [r[0] for r in payloads.select(w("payload")).collect()]
+    print(f"widget_name: first call transpiled={bool(w.transpiled)} results={first_rows} (miss -> Python)")
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        w = UserDefinedFunction(widget_name, StringType())
+        if w.transpiled:
+            break
+        time.sleep(1.0)
+    sampled = catalog._conn.execute("SELECT args_json FROM samples").fetchall()
+    print(f"widget_name: sampled real rows={len(sampled)} e.g. {sampled[0][0] if sampled else None}")
+    print(
+        f"widget_name: transpiled={bool(w.transpiled)} "
+        f"results={[r[0] for r in payloads.select(w('payload')).collect()]} (verified against samples)"
+    )
 
     print()
     print("=== JAVA UDF TARGET (compiled on the driver, Hypothesis-verified) ===")
@@ -207,6 +241,26 @@ def main() -> int:
         print("BUG: wrong impl was accepted")
     except ValueError as exc:
         print(f"register_impl rejected wrong SQL: {exc}")
+
+    print()
+    print("=== INPUT-CATEGORY GATE (int/float only vs int/float/string) ===")
+
+    def shout(name: str) -> str:
+        return name.upper()
+
+    conf.set_value(conf.INPUT_CATEGORIES, "numeric,bool,binary", spark)
+    before = catalog.count()
+    s = UserDefinedFunction(shout, StringType())
+    print(
+        f"shout (string input, gate=numeric only): transpiled={bool(s.transpiled)}, "
+        f"catalog rows {before} -> {catalog.count()} (gated out, never queued)"
+    )
+    conf.set_value(conf.INPUT_CATEGORIES, conf.DEFAULTS[conf.INPUT_CATEGORIES], spark)
+    s = UserDefinedFunction(shout, StringType())
+    print(
+        f"shout (gate=default): transpiled={bool(s.transpiled)}, "
+        f"catalog rows {before} -> {catalog.count()} (queued for the backend)"
+    )
 
     shutdown()
     spark.stop()

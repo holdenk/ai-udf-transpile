@@ -166,6 +166,10 @@ class Catalog(Protocol):
 
     def count(self) -> int: ...
 
+    def record_samples(self, udf_key: str, samples: list[list]) -> None: ...
+
+    def samples_for(self, udf_key: str, limit: int = 32) -> list[list]: ...
+
 
 def cooldown_active(row: CacheRow, spark: Any = None) -> bool:
     seconds = conf.get_int(conf.FAIL_COOLDOWN, spark, int(conf.DEFAULTS[conf.FAIL_COOLDOWN]))
