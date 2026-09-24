@@ -205,6 +205,32 @@ def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_
     return df.selectExpr(f"({sql}) AS result").collect()[0][0]
 
 
+def _java_udf_expr(
+    spark: Any,
+    result: Any,
+    input_types: list[str],
+    return_type: str,
+) -> Optional[str]:
+    """Compile (if needed) and register the Java UDF under a content-addressed name."""
+    from ai_udf_transpile.javac import compile_java, register_java_udf, verify_function_name
+
+    binary = getattr(result, "binary", None)
+    class_name = getattr(result, "class_name", None)
+    java_source = getattr(result, "java_source", None)
+    janino: Optional[bool] = None
+    if not binary and java_source:
+        compiled = compile_java(spark, java_source, class_name)
+        binary, class_name, janino = compiled.jar_bytes, compiled.class_name, compiled.janino
+        result.binary = binary
+        result.class_name = class_name
+    if not (binary and class_name):
+        return None
+    fname = verify_function_name("ai_udf_verify", binary)
+    register_java_udf(spark, fname, class_name, binary, _spark_type(return_type), janino=janino)
+    args = ", ".join(f"_udf_param_{i}" for i in range(len(input_types)))
+    return f"{fname}({args})"
+
+
 def hypothesis_check(
     *,
     source_text: str,
@@ -226,11 +252,19 @@ def hypothesis_check(
 
     kind = getattr(result, "kind", "catalyst")
     sql = getattr(result, "sql", None)
-    if kind != "catalyst" or not sql:
-        # v1 Java UDF verification needs a classpath class; without Spark eval, fail closed.
+    if kind == "catalyst" and sql:
+        eval_expr = sql
+    elif kind == "java_udf":
         if spark is None:
             return False, "java_udf verify requires Spark"
-        return False, f"verify of target_kind={kind} is not implemented without impl_class eval"
+        try:
+            eval_expr = _java_udf_expr(spark, result, input_types, return_type)
+        except Exception as exc:
+            return False, f"java_udf verify setup failed: {exc}"
+        if eval_expr is None:
+            return False, "java_udf result has no class/binary to verify"
+    else:
+        return False, f"verify of target_kind={kind} is not implemented"
 
     if spark is None:
         return False, "hypothesis_check requires a SparkSession"
@@ -260,7 +294,7 @@ def hypothesis_check(
             py_exc = exc
             py_value = _SENTINEL_RAISED
         try:
-            sql_value = _eval_sql(spark, sql, args, input_types, return_type)
+            sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type)
             sql_exc = None
         except Exception as exc:
             sql_value = _SENTINEL_RAISED

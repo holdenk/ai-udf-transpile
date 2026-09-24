@@ -36,6 +36,12 @@ def greet(name: str) -> str:
     return "hi " + name
 
 
+def backwards(name: str) -> str:
+    if name is None:
+        return None
+    return name[::-1]
+
+
 def both_positive(x: int, y: int) -> bool:
     return x > 0 and y > 0
 
@@ -114,6 +120,18 @@ def main() -> int:
     names = spark.createDataFrame([("bo",), ("holden",)], ["name"])
     greet_rows = [r[0] for r in names.select(g("name")).collect()]
     print(f"greet: transpiled={bool(g.transpiled)} results={greet_rows}")
+
+    print()
+    print("=== JAVA UDF TARGET (compiled on the driver, Hypothesis-verified) ===")
+    bw = UserDefinedFunction(backwards, StringType())
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        bw = UserDefinedFunction(backwards, StringType())
+        if bw.transpiled:
+            break
+        time.sleep(1.0)
+    bw_rows = [r[0] for r in names.select(bw("name")).collect()]
+    print(f"backwards: transpiled={bool(bw.transpiled)} results={bw_rows} (Java UDF from cache)")
 
     b = UserDefinedFunction(both_positive, BooleanType())
     deadline = time.time() + 120

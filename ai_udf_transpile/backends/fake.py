@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.keys import canonical_source_from_func, canonical_source_text
-from ai_udf_transpile.targets import KIND_CATALYST, TranspileJob, TranspileResult
+from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileJob, TranspileResult
 
 
 def plus_one(x: int) -> int:
@@ -28,6 +28,12 @@ def greet(name: str) -> str:
     return "hi " + name
 
 
+def backwards(name: str) -> str:
+    if name is None:
+        return None
+    return name[::-1]
+
+
 def always_decline(x: int) -> int:
     import os
 
@@ -38,6 +44,18 @@ def _result(sql: str) -> TranspileResult:
     return TranspileResult(kind=KIND_CATALYST, sql=sql)
 
 
+BACKWARDS_JAVA = """package ai_udf;
+
+import org.apache.spark.sql.api.java.UDF1;
+
+public class Backwards implements UDF1<Object, Object> {
+    @Override
+    public Object call(Object s) {
+        return s == null ? null : new StringBuilder((String) s).reverse().toString();
+    }
+}
+"""
+
 FIXTURES: dict[str, TranspileResult] = {
     canonical_source_from_func(plus_one): _result("_udf_param_0 + 1"),
     canonical_source_from_func(is_none_branch): _result(
@@ -45,6 +63,11 @@ FIXTURES: dict[str, TranspileResult] = {
     ),
     canonical_source_from_func(both_positive): _result("_udf_param_0 > 0 AND _udf_param_1 > 0"),
     canonical_source_from_func(greet): _result("concat('hi ', _udf_param_0)"),
+    canonical_source_from_func(backwards): TranspileResult(
+        kind=KIND_JAVA_UDF,
+        java_source=BACKWARDS_JAVA,
+        class_name="ai_udf.Backwards",
+    ),
 }
 
 
@@ -61,4 +84,6 @@ class FakeBackend:
             raise BackendDecline(f"no fake fixture for source {key!r}")
         if result.sql:
             (sandbox / "OUT.sql").write_text(result.sql + "\n", encoding="utf-8")
+        if result.java_source:
+            (sandbox / "OUT.java").write_text(result.java_source + "\n", encoding="utf-8")
         return result
