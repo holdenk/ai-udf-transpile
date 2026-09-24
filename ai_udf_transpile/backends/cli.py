@@ -61,7 +61,15 @@ class CliSpec:
 
 def coco_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
     del prompt_text
-    return [binary, "-f", str(sandbox / "PROMPT.md"), "--workdir", str(sandbox), "--bypass"]
+    return [
+        binary,
+        "exec",
+        "--file",
+        str(sandbox / "PROMPT.md"),
+        "--workdir",
+        str(sandbox),
+        "--bypass",
+    ]
 
 
 def cursor_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
@@ -74,7 +82,6 @@ def claude_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
     return [
         binary,
         "-p",
-        "--bare",
         "--permission-mode",
         "dontAsk",
         "--allowedTools",
