@@ -5,31 +5,17 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from ai_udf_transpile import conf
 from ai_udf_transpile.backends.base import BackendDecline, BackendError
+from ai_udf_transpile.javac import extract_java_class
 from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileJob, TranspileResult
 
 logger = logging.getLogger(__name__)
-
-_CLASS_RE = re.compile(r"\bclass\s+([A-Za-z_][\w.]*)")
-_PACKAGE_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
-
-
-def extract_java_class(source: str) -> Optional[str]:
-    pkg_match = _PACKAGE_RE.search(source)
-    class_match = _CLASS_RE.search(source)
-    if not class_match:
-        return None
-    simple = class_match.group(1)
-    if pkg_match:
-        return f"{pkg_match.group(1)}.{simple}"
-    return simple
 
 
 def parse_sandbox(sandbox: Path, stdout: str = "") -> TranspileResult:

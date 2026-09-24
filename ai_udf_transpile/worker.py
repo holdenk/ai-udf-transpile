@@ -68,6 +68,12 @@ def process_row(
             with make_sandbox(job) as sandbox:
                 result = backend.run(job, sandbox)
             origin = getattr(backend, "name", "unknown")
+        if result.kind == "java_udf" and result.java_source and not result.binary and spark is not None:
+            from ai_udf_transpile.javac import compile_java
+
+            compiled = compile_java(spark, result.java_source, result.class_name)
+            result.binary = compiled.jar_bytes
+            result.class_name = compiled.class_name
         max_examples = conf.get_int(conf.MAX_EXAMPLES, spark, int(conf.default_max_examples()))
         ok, err = verify_fn(
             source_text=row.source_text,

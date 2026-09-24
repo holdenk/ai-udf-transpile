@@ -73,9 +73,14 @@ def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
     if row.target_kind == "java_udf":
         n = len(row.param_names)
         args = ", ".join(f"_udf_param_{i}" for i in range(n))
-        if row.impl_class and spark is not None:
+        if spark is not None and row.impl_class and (row.impl_binary or row.impl_source):
+            from ai_udf_transpile.javac import compile_java, register_java_udf
+
+            binary = row.impl_binary
+            if binary is None and row.impl_source:
+                binary = compile_java(spark, row.impl_source, row.impl_class).jar_bytes
             fname = f"ai_udf_{row.udf_key[:16]}"
-            spark.udf.registerJavaFunction(fname, row.impl_class, return_type)
+            register_java_udf(spark, fname, row.impl_class, binary, return_type)
             return F.expr(f"{fname}({args})").cast(return_type)
         if row.impl_source:
             logger.debug("java_udf impl_source without impl_class; cannot reconstruct")
