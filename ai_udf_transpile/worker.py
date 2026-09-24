@@ -41,6 +41,17 @@ def inline_thread_alive() -> bool:
     return _thread is not None and _thread.is_alive()
 
 
+def _reported_model(backend: Any) -> Optional[str]:
+    """Model the backend says it dispatches with (for failure paths with no result)."""
+    fn = getattr(backend, "reported_model", None)
+    if fn is None:
+        return None
+    try:
+        return fn() or None
+    except Exception:
+        return None
+
+
 def process_row(
     catalog: Catalog,
     row: Any,
@@ -106,13 +117,20 @@ def process_row(
         logger.info("transpile failed key=%s origin=%s: %s", key[:12], origin, err)
     except BackendDecline as exc:
         try:
-            catalog.mark_failed(key, f"declined: {exc}", origin=origin, model=model)
+            catalog.mark_failed(
+                key, f"declined: {exc}", origin=origin, model=model or _reported_model(backend)
+            )
         except Exception:
             logger.exception("failed to mark declined row %s", key)
         logger.info("backend declined key=%s: %s", key[:12], exc)
     except Exception as exc:
         try:
-            catalog.mark_failed(key, f"{type(exc).__name__}: {exc}", origin=origin, model=model)
+            catalog.mark_failed(
+                key,
+                f"{type(exc).__name__}: {exc}",
+                origin=origin,
+                model=model or _reported_model(backend),
+            )
         except Exception:
             logger.exception("failed to mark error row %s", key)
         logger.exception("process_row failed key=%s", key)

@@ -120,6 +120,34 @@ def test_claude_run_records_detected_model(tmp_path):
     assert result.model == "claude-x"
 
 
+def _sql_runner(argv, **kwargs):
+    (Path(kwargs["cwd"]) / "OUT.sql").write_text("_udf_param_0 + 1\n")
+    return _Completed()
+
+
+def test_cursor_run_records_unknown_model(tmp_path):
+    result = CursorBackend(runner=_sql_runner).run(None, tmp_path)
+    assert result.sql == "_udf_param_0 + 1"
+    assert result.model == "cursor-unknown"
+
+
+def test_coco_run_records_unknown_model(tmp_path):
+    result = CocoBackend(runner=_sql_runner).run(None, tmp_path)
+    assert result.sql == "_udf_param_0 + 1"
+    assert result.model == "coco-unknown"
+
+
+def test_claude_run_records_unknown_model_without_json(tmp_path):
+    result = ClaudeBackend(runner=_sql_runner).run(None, tmp_path)
+    assert result.model == "claude-unknown"
+
+
+def test_run_records_configured_model(tmp_path):
+    conf.set_value(conf.MODEL_CURSOR, "gpt-x-1")
+    result = CursorBackend(runner=_sql_runner).run(None, tmp_path)
+    assert result.model == "gpt-x-1"
+
+
 def test_parse_sql_wins(tmp_path):
     (tmp_path / "OUT.sql").write_text("_udf_param_0 + 1\n")
     (tmp_path / "OUT.java").write_text("class X {}\n")

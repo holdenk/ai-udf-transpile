@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from ai_udf_transpile import enable, shutdown
+from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.backends.fake import FakeBackend, always_decline, plus_one
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog
 from ai_udf_transpile.keys import canonical_source_from_func
@@ -51,6 +52,40 @@ def test_process_row_fake_decline_marks_failed(tmp_path):
     row = cat.get("k")
     assert row.status == "failed"
     assert "declined" in (row.error or "")
+
+
+class _DecliningReportedBackend:
+    name = "coco"
+
+    def reported_model(self):
+        return "coco-unknown"
+
+    def run(self, job, sandbox):
+        raise BackendDecline("nope")
+
+
+def test_decline_records_reported_model(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    src = canonical_source_from_func(always_decline)
+    cat.insert_pending(
+        udf_key="k",
+        source_text=src,
+        param_names=["x"],
+        input_types=["bigint"],
+        input_categories=["numeric"],
+        return_type="bigint",
+        spark_version="test",
+        closure_fingerprint="",
+        captures={},
+    )
+    assert cat.claim("k", "coco")
+    process_row(
+        cat, cat.get("k"), _DecliningReportedBackend(), spark=None, verify_fn=lambda **k: (True, None)
+    )
+    row = cat.get("k")
+    assert row.status == "failed"
+    assert "declined" in (row.error or "")
+    assert row.model == "coco-unknown"
 
 
 def test_poll_once_claims_one(tmp_path):
