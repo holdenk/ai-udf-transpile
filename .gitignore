@@ -1,3 +1,12 @@
+# Local catalog / Spark droppings
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+spark-warehouse/
+metastore_db/
+derby.log
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

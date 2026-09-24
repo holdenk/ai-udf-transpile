@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: lint and unit (no Spark)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Ruff
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Unit tests
+        env:
+          AI_UDF_TRANSPILE_BACKEND: fake
+          AI_UDF_TRANSPILE_MAX_EXAMPLES: "5"
+        run: pytest -m "not spark" tests/
+
+  spark:
+    name: Spark master package + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MAVEN_OPTS: "-Xmx2g -XX:ReservedCodeCacheSize=512m"
+      SPARK_LOCAL_IP: "127.0.0.1"
+      AI_UDF_TRANSPILE_BACKEND: fake
+      AI_UDF_TRANSPILE_MAX_EXAMPLES: "5"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Checkout Apache Spark master
+        uses: actions/checkout@v4
+        with:
+          repository: apache/spark
+          path: spark
+          ref: master
+      - name: Spark SHA
+        id: spark
+        run: echo "sha=$(git -C spark rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Cache Spark package
+        uses: actions/cache@v4
+        id: spark-cache
+        with:
+          path: |
+            spark/assembly/target
+            spark/sql/core/target
+            spark/sql/catalyst/target
+            spark/core/target
+            spark/common/sketch/target
+            spark/common/kvstore/target
+            spark/common/network-common/target
+            spark/common/network-shuffle/target
+            spark/common/unsafe/target
+            spark/common/utils/target
+            spark/launcher/target
+          key: spark-${{ steps.spark.outputs.sha }}-${{ runner.os }}-java17-sql-core
+      - name: Package Spark (skip tests)
+        if: steps.spark-cache.outputs.cache-hit != 'true'
+        working-directory: spark
+        run: |
+          ./build/mvn -T1C -DskipTests -Phadoop-3 package -pl sql/core,assembly -am
+      - name: Install Python deps
+        run: pip install -e ".[dev]"
+      - name: Pytest with Spark
+        env:
+          SPARK_HOME: ${{ github.workspace }}/spark
+          PYTHONPATH: ${{ github.workspace }}/spark/python
+        run: |
+          export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}'):${PYTHONPATH}"
+          pytest tests/

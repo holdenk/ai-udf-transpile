@@ -1,13 +1,89 @@
-Current state: hopes and dreams
-Next step: proof of concept
+# AI UDF transpile
 
-Idea: Python UDFS can be expensive to evaluate, especially when the core engine is in another language and a data copy is required (like Java for Spark, or Rust for LakeSail) or *parts* of evaluation are happening elsewhere (like nv rapids)
+Partial, non-blocking Python UDF transpilation for Apache Spark. Spark's
+built-in Catalyst transpiler covers simple functions; this plugin asks an
+agent (CoCo / Cursor / Claude, or a deterministic fake backend in CI) to
+rewrite the rest into Catalyst SQL or a Java UDF, then Hypothesis-checks the
+rewrite against the original Python before it is served.
 
-One possible solution is transpilation, taking the Python code and turning it into the other language to avoid the data copy. Even when a data copy is not required, moving Python evaluation into a more performant language can be beneficial.
+Queries never wait on the agent. A miss inserts a `pending` catalog row and
+Spark keeps the interpreted Python UDF. A background worker (inline driver
+thread by default, or `python -m ai_udf_transpile.worker`) fills the cache.
 
-However, creating a complete alternative compiler for Python is *hard* (see Jython). We can do *partial* transpilation, that is transpile *when it makes sense* instead of aiming for 100% success. This is the idea behind https://issues.apache.org/jira/browse/SPARK-54783
+Targets **classic Spark master** (the `AbstractTranspiler` hook landed for
+4.3 / current master). Connect is not supported. This is experimental.
 
-This repo explore taking the idea a step further, using AI to non-deterministically transpile Python which is too complicated for a simple transpiler.
+## Install
 
-Since, as every AI agent should remind you, AI can make mistakes -- we also need mechanisms to detect when transpilation is incorrect. We can do this (to an extend) with automated hypothesis powered tests since we have a reference implementation we _know_ is correct.
-Similarily, if you've ever asked Claude (or Codex or Cursor or ...) to write some code only to come back an hour later and see it still not finished; niavely transpiling and waiting for it to finish (and then testing it) could easily take a one minute job and turn it into hours. Instead we'll kick this off non-blocking.
+```bash
+pip install -e ".[dev]"
+export SPARK_HOME=/path/to/spark-master   # package-only build, tests skipped
+export PYTHONPATH="$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-*-src.zip"
+```
+
+PyPI PySpark is not used for integration tests until 4.3+ is the pinned
+target; CI builds Spark from `apache/spark@master` with `-DskipTests`.
+
+## Usage
+
+```python
+from pyspark.sql import SparkSession
+from ai_udf_transpile import enable, register_impl
+
+spark = SparkSession.builder.getOrCreate()
+spark.conf.set("spark.sql.ansi.enabled", "true")
+enable(spark, backend="fake")  # or coco / cursor / claude / auto
+
+from pyspark.sql.functions import udf
+from pyspark.sql.types import LongType
+
+
+def plus_one(x: int) -> int:
+    return x + 1
+
+
+f = udf(plus_one, LongType())  # first call: Python path; worker may fill cache
+```
+
+Types must be known: every public parameter needs a recognized annotation
+(`int` / `float` / `str` / `bool` / `bytes`) and `udf(..., returnType)` must
+be an atomic Spark type. Untyped UDFs are ignored by this plugin (Spark's
+built-in `catalyst` transpiler may still try them).
+
+Human-provided rewrite (skips the agent):
+
+```python
+register_impl(
+    spark,
+    plus_one,
+    kind="catalyst",
+    catalyst_sql="_udf_param_0 + 1",
+    return_type=LongType(),
+)
+```
+
+Standalone worker when `inlineWorker` is false:
+
+```bash
+python -m ai_udf_transpile.worker --sqlite-path /tmp/ai_udf_transpile.sqlite --backend fake
+```
+
+## Catalog
+
+Default catalog is **SQLite** (real `UPDATE` CAS). Optional `catalog=delta`
+requires Delta Lake on the classpath. Vanilla Hive/Parquet tables cannot
+`UPDATE` a row and are not used.
+
+Failed rewrites cool down for 24h (`failCooldownSeconds`) and stop retrying
+after `maxRetries` (default 3).
+
+## Tests
+
+```bash
+pytest -m "not spark" tests/   # no JVM
+pytest tests/                  # plus classic SparkSession tests
+```
+
+CI uses `backend=fake` with a handful of annotated fixtures (`plus_one`,
+`is_none_branch`, `both_positive`, `greet`). Live CoCo/Cursor/Claude CLIs
+are not invoked in default GHA.
