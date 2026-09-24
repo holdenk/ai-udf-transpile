@@ -105,7 +105,7 @@ def _inputs_allowed(in_cats: list[str], spark: Any) -> bool:
 
 def _maybe_wrap_sampling(spark: Any, key: str, in_cats: list[str]) -> None:
     """Wrap the UDF-under-construction's func so real rows land in the samples table."""
-    if spark is None or "string" not in in_cats:
+    if spark is None or not ({"string", "map"} & set(in_cats)):
         return
     try:
         if not conf.get_bool(conf.SAMPLING, spark, True):
