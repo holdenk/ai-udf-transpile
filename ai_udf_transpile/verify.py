@@ -199,8 +199,6 @@ def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_
     fields = [
         StructField(f"_udf_param_{i}", _spark_type(input_types[i]), True) for i in range(len(input_types))
     ]
-    schema = StructType(fields + [StructField("_unused", _spark_type(return_type), True)])
-    # Schema must match values; drop the dummy if we can create without it.
     schema = StructType(fields)
     row_kwargs = {f"_udf_param_{i}": args[i] for i in range(len(args))}
     df = spark.createDataFrame([Row(**row_kwargs)], schema=schema)

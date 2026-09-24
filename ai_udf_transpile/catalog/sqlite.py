@@ -332,9 +332,6 @@ class SqliteCatalog:
             )
 
     def reclaim_stale(self, timeout_seconds: int, max_retries: int) -> int:
-        cutoff = iso_now()
-        # Compare ISO timestamps lexicographically after computing the cutoff
-        # string from now - timeout.
         from datetime import datetime, timedelta, timezone
 
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)).strftime(

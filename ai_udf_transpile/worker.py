@@ -15,7 +15,8 @@ import time
 from typing import Any, Callable, Optional
 
 from ai_udf_transpile import conf
-from ai_udf_transpile.backends import BackendDecline, BackendError, get_backend
+from ai_udf_transpile.backends import get_backend
+from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.catalog import Catalog, open_catalog
 from ai_udf_transpile.sandbox import make_sandbox
 from ai_udf_transpile.targets import TranspileResult
@@ -89,7 +90,7 @@ def process_row(
         except Exception:
             logger.exception("failed to mark declined row %s", key)
         logger.info("backend declined key=%s: %s", key[:12], exc)
-    except (BackendError, Exception) as exc:
+    except Exception as exc:
         try:
             catalog.mark_failed(key, f"{type(exc).__name__}: {exc}")
         except Exception:
