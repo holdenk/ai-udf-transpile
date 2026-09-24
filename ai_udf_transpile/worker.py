@@ -77,6 +77,11 @@ def process_row(
             result.binary = compiled.jar_bytes
             result.class_name = compiled.class_name
         max_examples = conf.get_int(conf.MAX_EXAMPLES, spark, int(conf.default_max_examples()))
+        samples: list = []
+        try:
+            samples = catalog.samples_for(key)
+        except Exception:
+            logger.debug("samples_for failed for %s", key[:12], exc_info=True)
         ok, err = verify_fn(
             source_text=row.source_text,
             captures=row.captures,
@@ -85,6 +90,7 @@ def process_row(
             return_type=row.return_type,
             spark=spark,
             max_examples=max_examples,
+            samples=samples,
         )
         if ok:
             catalog.mark_success(key, result, origin, hypothesis_passed=True)

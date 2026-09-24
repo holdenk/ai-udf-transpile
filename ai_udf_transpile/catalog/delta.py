@@ -397,3 +397,12 @@ class DeltaCatalog:
 
     def count(self) -> int:
         return int(self.spark.sql(f"SELECT COUNT(*) AS n FROM {self.table}").collect()[0][0])
+
+    def record_samples(self, udf_key: str, samples: list[list]) -> None:
+        # Executor-side capture writes to the sqlite file directly; for Delta
+        # there is no executor-reachable path, so sampling is a no-op and
+        # verification falls back to the built-in string examples.
+        return
+
+    def samples_for(self, udf_key: str, limit: int = 32) -> list[list]:
+        return []

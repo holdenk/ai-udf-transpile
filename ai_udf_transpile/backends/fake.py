@@ -34,6 +34,14 @@ def backwards(name: str) -> str:
     return name[::-1]
 
 
+def widget_name(payload: str) -> str:
+    import json
+
+    if payload is None:
+        return None
+    return json.loads(payload).get("widget")
+
+
 def always_decline(x: int) -> int:
     import os
 
@@ -63,6 +71,7 @@ FIXTURES: dict[str, TranspileResult] = {
     ),
     canonical_source_from_func(both_positive): _result("_udf_param_0 > 0 AND _udf_param_1 > 0"),
     canonical_source_from_func(greet): _result("concat('hi ', _udf_param_0)"),
+    canonical_source_from_func(widget_name): _result("get_json_object(_udf_param_0, '$.widget')"),
     canonical_source_from_func(backwards): TranspileResult(
         kind=KIND_JAVA_UDF,
         java_source=BACKWARDS_JAVA,

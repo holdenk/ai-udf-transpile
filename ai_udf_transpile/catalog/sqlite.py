@@ -53,6 +53,14 @@ CREATE TABLE IF NOT EXISTS cache (
 )
 """
 
+_SAMPLES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS samples (
+    udf_key TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    created_at TEXT
+)
+"""
+
 
 def _row_from_sql(raw: sqlite3.Row) -> CacheRow:
     hyp = raw["hypothesis_passed"]
@@ -98,6 +106,7 @@ class SqliteCatalog:
         self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute(_SCHEMA)
+        self._conn.execute(_SAMPLES_SCHEMA)
         self._migrate()
 
     def _migrate(self) -> None:
@@ -398,3 +407,24 @@ class SqliteCatalog:
         with self._lock:
             cur = self._conn.execute("SELECT COUNT(*) FROM cache")
             return int(cur.fetchone()[0])
+
+    def record_samples(self, udf_key: str, samples: list[list]) -> None:
+        from ai_udf_transpile.sampling import record_samples
+
+        record_samples(self.path, udf_key, samples)
+
+    def samples_for(self, udf_key: str, limit: int = 32) -> list[list]:
+        from ai_udf_transpile.sampling import decode_args
+
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT args_json FROM samples WHERE udf_key = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (udf_key, int(limit)),
+            )
+            out = []
+            for (text,) in cur.fetchall():
+                decoded = decode_args(text)
+                if decoded is not None:
+                    out.append(decoded)
+            return out
