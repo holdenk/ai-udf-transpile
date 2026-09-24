@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import threading
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from ai_udf_transpile import conf
+from ai_udf_transpile.catalog import HIT, MISS, WAIT
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog
+from ai_udf_transpile.targets import TranspileResult
+
+
+def _pending(cat: SqliteCatalog, key: str = "k1") -> None:
+    cat.insert_pending(
+        udf_key=key,
+        source_text="def f(x: int) -> int:\n    return x + 1",
+        param_names=["x"],
+        input_types=["bigint"],
+        input_categories=["numeric"],
+        return_type="bigint",
+        spark_version="test",
+        closure_fingerprint="",
+        captures={},
+    )
+
+
+def test_insert_pending_rejects_missing_types(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    with pytest.raises(ValueError):
+        cat.insert_pending(
+            udf_key="k",
+            source_text="def f(x): return x",
+            param_names=["x"],
+            input_types=[],
+            input_categories=[],
+            return_type="",
+            spark_version="t",
+            closure_fingerprint="",
+            captures={},
+        )
+
+
+def test_cas_two_threads_one_winner(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    barrier = threading.Barrier(2)
+    winners: list[bool] = []
+    lock = threading.Lock()
+
+    def claim() -> None:
+        barrier.wait()
+        won = cat.claim("k1", "fake")
+        with lock:
+            winners.append(won)
+
+    t1 = threading.Thread(target=claim)
+    t2 = threading.Thread(target=claim)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert winners.count(True) == 1
+    assert winners.count(False) == 1
+    row = cat.get("k1")
+    assert row is not None
+    assert row.status == "running"
+    assert row.attempt_count == 1
+
+
+def test_failed_cooldown_does_not_requeue(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "fake")
+    cat.mark_failed("k1", "nope")
+    kind, row = cat.lookup("k1")
+    assert kind == WAIT
+    assert row is not None
+    assert row.status == "failed"
+    # Second lookup still wait (no extra pending insert from lookup)
+    kind2, _ = cat.lookup("k1")
+    assert kind2 == WAIT
+
+
+def test_failed_after_cooldown_requeues_when_retries_remain(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "fake")
+    cat.mark_failed("k1", "nope")
+    # Pretend the failure was yesterday and we still have retry budget.
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    cat._conn.execute("UPDATE cache SET failed_at = ?, attempt_count = 1 WHERE udf_key = 'k1'", (old,))
+    kind, row = cat.lookup("k1")
+    assert kind == WAIT
+    assert row is not None
+    assert row.status == "pending"
+
+
+def test_max_retries_exhausted_stays_failed(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "fake")
+    cat.mark_failed("k1", "nope")
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    max_retries = int(conf.DEFAULTS[conf.MAX_RETRIES])
+    cat._conn.execute(
+        "UPDATE cache SET failed_at = ?, attempt_count = ? WHERE udf_key = 'k1'",
+        (old, max_retries),
+    )
+    kind, row = cat.lookup("k1")
+    assert kind == WAIT
+    assert row is not None
+    assert row.status == "failed"
+
+
+def test_success_is_a_hit(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "fake")
+    cat.mark_success(
+        "k1",
+        TranspileResult(kind="catalyst", sql="_udf_param_0 + 1"),
+        origin="fake",
+    )
+    kind, row = cat.lookup("k1")
+    assert kind == HIT
+    assert row is not None
+    assert row.catalyst_sql == "_udf_param_0 + 1"
+
+
+def test_miss_on_empty(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    kind, row = cat.lookup("missing")
+    assert kind == MISS
+    assert row is None
