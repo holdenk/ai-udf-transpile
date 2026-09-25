@@ -192,6 +192,20 @@ def _strategy_for(spark_type: str):
                 st.none(),
                 st.dictionaries(st.text(max_size=8), st.text(max_size=16), max_size=4),
             )
+    if t.startswith("array<") and t.endswith(">") and t[6:-1].strip() == "string":
+        # Membership-test UDFs (x in lst) care about short lists of short
+        # strings. Elements are never None: python's `None in [None]` is True
+        # while SQL array_contains(arr, NULL) is NULL, and null elements in
+        # the constant membership lists these UDFs close over / receive do
+        # not occur -- a real sample containing one fails verification
+        # closed, which is the honest outcome.
+        return st.one_of(
+            st.none(),
+            st.lists(
+                st.text(alphabet=st.characters(blacklist_categories=("Cs", "Cn")), max_size=8),
+                max_size=5,
+            ),
+        )
     raise VerifyFailed(f"unsupported input type for verify: {spark_type}")
 
 
@@ -424,6 +438,7 @@ def hypothesis_check(
         values and a fixed set of structured strings run as @example first.
         """
         from ai_udf_transpile.sampling import (
+            BUILTIN_ARRAY_EXAMPLES,
             BUILTIN_MAP_EXAMPLES,
             BUILTIN_STRING_EXAMPLES,
             BUILTIN_TIMESTAMP_EXAMPLES,
@@ -447,6 +462,9 @@ def hypothesis_check(
             elif stype.startswith("map<"):
                 for m in BUILTIN_MAP_EXAMPLES:
                     examples.append(tuple(dict(m) if j == i else None for j in range(arity)))
+            elif stype.startswith("array<"):
+                for a in BUILTIN_ARRAY_EXAMPLES:
+                    examples.append(tuple(list(a) if j == i else None for j in range(arity)))
             elif stype in {"timestamp", "timestamp_ntz"}:
                 for ts in BUILTIN_TIMESTAMP_EXAMPLES:
                     examples.append(tuple(ts if j == i else None for j in range(arity)))
@@ -455,6 +473,10 @@ def hypothesis_check(
             # across params (e.g. a valid timestamp start AND a 'nan'
             # duration), which is where coercion guards get exercised -- a
             # rewrite missing an isnan guard passes vacuously without them.
+            # The product explodes combinatorially (10 strings x 10 strings x
+            # 5 arrays x 5 arrays = 2500 for a 4-param UDF), so enumerate
+            # diagonally (by index sum): every param's values appear within
+            # the first few combos instead of being truncated lexicographically.
             import itertools
 
             per_param: list[list] = []
@@ -464,12 +486,18 @@ def hypothesis_check(
                     per_param.append(list(CROSS_STRING_EXAMPLES))
                 elif stype.startswith("map<"):
                     per_param.append([dict(m) for m in BUILTIN_MAP_EXAMPLES])
+                elif stype.startswith("array<"):
+                    per_param.append([list(a) for a in BUILTIN_ARRAY_EXAMPLES])
                 elif stype in {"timestamp", "timestamp_ntz"}:
                     per_param.append(list(BUILTIN_TIMESTAMP_EXAMPLES))
                 else:
                     per_param.append([None])
-            for combo in itertools.product(*per_param):
-                examples.append(tuple(combo))
+            index_combos = sorted(
+                itertools.product(*(range(len(p)) for p in per_param)),
+                key=lambda c: (sum(c), c),
+            )
+            for combo in index_combos:
+                examples.append(tuple(per_param[i][idx] for i, idx in enumerate(combo)))
         return examples[:160]
 
     check = _run

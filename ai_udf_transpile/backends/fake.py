@@ -80,6 +80,35 @@ def scatter_to_seconds(start: str, duration: str) -> list[str]:
         return ret
 
 
+def BSPIn(old_lac: str, new_lac: str, lac_lst_bsp: list[str], lac_lst_mid: list[str]) -> int:
+    # Modernized from the pasted UDF: `old_lac in lac_lst_bsp & new_lac in
+    # lac_lst_mid` parses as `old_lac in (lac_lst_bsp & new_lac) in
+    # lac_lst_mid` (& binds tighter than `in`, and comparisons chain), which
+    # raises TypeError (list & str) on EVERY row. `and` is the intent.
+    # Nulls: None in list is False (-> 0); x in None raises (sql may return).
+    if old_lac in lac_lst_bsp and new_lac in lac_lst_mid:
+        return 1
+    return 0
+
+
+def EBRIn(old_lac: str, new_lac: str, lac_lst_ebr: list[str], lac_lst_mid: list[str]) -> int:
+    if old_lac in lac_lst_ebr and new_lac in lac_lst_mid:
+        return 1
+    return 0
+
+
+def BSPOut(old_lac: str, new_lac: str, lac_lst_bsp: list[str], lac_lst_mid: list[str]) -> int:
+    if old_lac in lac_lst_mid and new_lac in lac_lst_bsp:
+        return 1
+    return 0
+
+
+def EBROut(old_lac: str, new_lac: str, lac_lst_ebr: list[str], lac_lst_mid: list[str]) -> int:
+    if old_lac in lac_lst_mid and new_lac in lac_lst_ebr:
+        return 1
+    return 0
+
+
 def always_decline(x: int) -> int:
     import os
 
@@ -140,6 +169,23 @@ FIXTURES: dict[str, TranspileResult] = {
         kind=KIND_JAVA_UDF,
         java_source=BACKWARDS_JAVA,
         class_name="ai_udf.Backwards",
+    ),
+    # In-UDFs check old in the first list and new in the second; Out-UDFs swap.
+    canonical_source_from_func(BSPIn): _result(
+        "CASE WHEN array_contains(_udf_param_2, _udf_param_0) "
+        "AND array_contains(_udf_param_3, _udf_param_1) THEN 1 ELSE 0 END"
+    ),
+    canonical_source_from_func(EBRIn): _result(
+        "CASE WHEN array_contains(_udf_param_2, _udf_param_0) "
+        "AND array_contains(_udf_param_3, _udf_param_1) THEN 1 ELSE 0 END"
+    ),
+    canonical_source_from_func(BSPOut): _result(
+        "CASE WHEN array_contains(_udf_param_3, _udf_param_0) "
+        "AND array_contains(_udf_param_2, _udf_param_1) THEN 1 ELSE 0 END"
+    ),
+    canonical_source_from_func(EBROut): _result(
+        "CASE WHEN array_contains(_udf_param_3, _udf_param_0) "
+        "AND array_contains(_udf_param_2, _udf_param_1) THEN 1 ELSE 0 END"
     ),
 }
 
