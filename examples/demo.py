@@ -158,6 +158,26 @@ def uses_helper(x: int) -> int:
     return plus_one(x)
 
 
+def kms_encrypt(text: str, key_id: str) -> str:
+    # The canonical untranspilable UDF: an AWS KMS Encrypt call per row.
+    # There is no Catalyst equivalent -- the ciphertext comes from the
+    # service and is non-deterministic (the same plaintext encrypts
+    # differently every call), so any backend SQL "rewrite" is a
+    # hallucination. In an environment without boto3/credentials the python
+    # side raises on every example, which is the vacuous-pass trap: "python
+    # raise + sql value allowed" would accept ANY rewrite, so verification
+    # requires at least one successful python evaluation and fails closed.
+    import base64
+
+    import boto3
+
+    if text is None:
+        return None
+    client = boto3.client("kms", region_name="us-west-2")
+    resp = client.encrypt(KeyId=key_id, Plaintext=text.encode("utf-8"))
+    return base64.b64encode(resp["CiphertextBlob"]).decode("utf-8")
+
+
 def always_decline(x: int) -> int:
     import os
 
@@ -446,6 +466,34 @@ def main() -> int:
     before = catalog.count()
     UserDefinedFunction(always_decline, LongType())
     print(f"always_decline second call: catalog rows {before} -> {catalog.count()} (cooldown, no re-queue)")
+
+    # boto3 KMS encryption: untranspilable by nature (service call per row,
+    # non-deterministic ciphertext). The type gate queues it (it is fully
+    # annotated), the fake backend declines, and even a hallucinated rewrite
+    # fails closed: python raises on every example in an environment without
+    # boto3/credentials, and verification requires at least one successful
+    # python evaluation -- otherwise "python raise + sql value allowed"
+    # would accept ANY sql vacuously.
+    UserDefinedFunction(kms_encrypt, StringType())
+    cur = catalog._conn.execute("SELECT udf_key FROM cache WHERE source_text LIKE '%kms_encrypt%'")
+    found = cur.fetchone()
+    if found:
+        row = wait_for_status(catalog, found[0], "failed", timeout=60)
+        print(
+            f"kms_encrypt (boto3 KMS per row): status={row.status} origin={row.origin} "
+            f"backend={row.backend} error={row.error!r} (no fixture -> failed, cooldown applies)"
+        )
+    try:
+        register_impl(
+            spark,
+            kms_encrypt,
+            kind="catalyst",
+            catalyst_sql="base64(_udf_param_0)",  # hallucinated "encryption"
+            return_type=StringType(),
+        )
+        print("BUG: hallucinated KMS rewrite was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected hallucinated KMS rewrite (fail-closed): {str(exc)[:110]}...")
 
     print()
     print("=== WRONG REWRITE REJECTED BY HYPOTHESIS ===")
