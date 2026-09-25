@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pyspark.sql import SparkSession  # noqa: E402
-from pyspark.sql.types import BooleanType, LongType, StringType  # noqa: E402
+from pyspark.sql.types import ArrayType, BooleanType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, register_impl, shutdown  # noqa: E402
@@ -61,6 +61,30 @@ def timestamp_to_epoch(t: datetime) -> str:
     if t is None:
         return "nan"
     return t.strftime("%s")
+
+
+def scatter_to_seconds(start: str, duration: str) -> list[str]:
+    # Every failure path (null/short/unparseable start, non-numeric/NaN/inf/
+    # negative duration) returns [] via the bare except, and the loop is
+    # range(duration + 1) -- off-by-one bait. First array<string> return: the
+    # SQL keeps _udf_param_N refs outside the transform lambda (placeholder
+    # substitution does not descend into higher-order function lambdas).
+    import datetime
+
+    ret = []
+    try:
+        start = str(start)
+        duration = int(float(duration))
+        if len(start) < 19:
+            return ret
+        start = start[:19]
+        start_struct = datetime.datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
+        for i in range(duration + 1):
+            cur = (start_struct + datetime.timedelta(seconds=i)).strftime("%Y-%m-%d %H:%M:%S")
+            ret.append(cur)
+        return ret
+    except Exception:
+        return ret
 
 
 def backwards(name: str) -> str:
@@ -228,6 +252,28 @@ def main() -> int:
         f"distinct_count={stamped.distinct().count()} (NULL -> 'nan', like the pandas original)"
     )
 
+    sc = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        sc = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
+        if sc.transpiled:
+            break
+        time.sleep(1.0)
+    starts = spark.createDataFrame(
+        [
+            ("2015-01-01 00:00:00", "2"),
+            ("2015-12-31 23:59:59", "2"),  # year rollover
+            ("2015-01-01", "5"),  # short start -> []
+            (None, "2"),  # null start -> []
+        ],
+        ["start", "duration"],
+    )
+    print(
+        f"scatter_to_seconds (array<string> return): transpiled={bool(sc.transpiled)} "
+        f"results={[r[0] for r in starts.select(sc('start', 'duration')).collect()]} "
+        "(failure paths -> [], never NULL)"
+    )
+
     print()
     print("=== REAL-ROW SAMPLING (string inputs feed Hypothesis) ===")
     # First call is a cache miss: it runs as a Python UDF, and the real string
@@ -369,6 +415,73 @@ def main() -> int:
         print("BUG: naive instr was accepted")
     except ValueError as exc:
         print(f"register_impl rejected naive instr for contains_ingredient: {exc}")
+
+    # Guard-complete but wrong rewrites of scatter_to_seconds, so only the
+    # specific trap remains (a guard-less variant would be caught by the
+    # built-in examples before the interesting part is even reached).
+    scatter_faithful = (
+        "CASE WHEN _udf_param_0 IS NULL THEN array() "
+        "WHEN length(_udf_param_0) < 19 THEN array() "
+        "WHEN try_to_timestamp(substr(_udf_param_0, 1, 19), 'yyyy-MM-dd HH:mm:ss') IS NULL "
+        "THEN array() "
+        "WHEN try_cast(_udf_param_1 AS DOUBLE) IS NULL THEN array() "
+        "WHEN isnan(try_cast(_udf_param_1 AS DOUBLE)) THEN array() "
+        "WHEN abs(try_cast(_udf_param_1 AS DOUBLE)) = cast('inf' AS DOUBLE) THEN array() "
+        "WHEN cast(int(try_cast(_udf_param_1 AS DOUBLE)) AS INT) < 0 THEN array() "
+        "ELSE transform(sequence("
+        "try_to_timestamp(substr(_udf_param_0, 1, 19), 'yyyy-MM-dd HH:mm:ss'), "
+        "timestampadd(SECOND, cast(int(try_cast(_udf_param_1 AS DOUBLE)) AS INT), "
+        "try_to_timestamp(substr(_udf_param_0, 1, 19), 'yyyy-MM-dd HH:mm:ss')), "
+        "interval 1 second), x -> date_format(x, 'yyyy-MM-dd HH:mm:ss')) END"
+    )
+    # The range(duration + 1) off-by-one: this rewrite stops one second short.
+    # Caught by the cross-combined built-ins (a valid timestamp start paired
+    # with a parseable duration -- the one-param-at-a-time built-ins never
+    # produce that pair), with the real rows recorded earlier as a second
+    # layer of defense.
+    scatter_off_by_one = scatter_faithful.replace(
+        "timestampadd(SECOND, cast(int(try_cast(_udf_param_1 AS DOUBLE)) AS INT),",
+        "timestampadd(SECOND, cast(int(try_cast(_udf_param_1 AS DOUBLE)) AS INT) - 1,",
+    )
+    try:
+        register_impl(
+            spark,
+            scatter_to_seconds,
+            kind="catalyst",
+            catalyst_sql=scatter_off_by_one,
+            return_type=ArrayType(StringType()),
+        )
+        print("BUG: off-by-one scatter_to_seconds was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected off-by-one scatter_to_seconds: {exc}")
+
+    # Value-correct but undeliverable: this transform lambda closes over
+    # _udf_param_0, and TranspiledPythonUDF placeholder substitution does not
+    # descend into lambda bodies -- the query would fail at analysis with
+    # UNRESOLVED_COLUMN. Hypothesis (which binds params as plain columns)
+    # passes it; the reconstruction smoke test does not.
+    scatter_lambda_closing = scatter_faithful.replace(
+        "ELSE transform(sequence("
+        "try_to_timestamp(substr(_udf_param_0, 1, 19), 'yyyy-MM-dd HH:mm:ss'), "
+        "timestampadd(SECOND, cast(int(try_cast(_udf_param_1 AS DOUBLE)) AS INT), "
+        "try_to_timestamp(substr(_udf_param_0, 1, 19), 'yyyy-MM-dd HH:mm:ss')), "
+        "interval 1 second), x -> date_format(x, 'yyyy-MM-dd HH:mm:ss'))",
+        "ELSE transform(sequence(0, cast(int(try_cast(_udf_param_1 AS DOUBLE)) AS INT)), "
+        "i -> date_format(timestampadd(SECOND, i, "
+        "try_to_timestamp(substr(_udf_param_0, 1, 19), 'yyyy-MM-dd HH:mm:ss')), "
+        "'yyyy-MM-dd HH:mm:ss'))",
+    )
+    try:
+        register_impl(
+            spark,
+            scatter_to_seconds,
+            kind="catalyst",
+            catalyst_sql=scatter_lambda_closing,
+            return_type=ArrayType(StringType()),
+        )
+        print("BUG: lambda-closing scatter_to_seconds was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected lambda-closing scatter_to_seconds: {str(exc)[:140]}...")
 
     print()
     print("=== INPUT-CATEGORY GATE (int/float only vs int/float/string) ===")

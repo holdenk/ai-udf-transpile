@@ -61,6 +61,25 @@ def widget_name(payload: str) -> str:
     return json.loads(payload).get("widget")
 
 
+def scatter_to_seconds(start: str, duration: str) -> list[str]:
+    import datetime
+
+    ret = []
+    try:
+        start = str(start)
+        duration = int(float(duration))
+        if len(start) < 19:
+            return ret
+        start = start[:19]
+        start_struct = datetime.datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
+        for i in range(duration + 1):
+            cur = (start_struct + datetime.timedelta(seconds=i)).strftime("%Y-%m-%d %H:%M:%S")
+            ret.append(cur)
+        return ret
+    except Exception:
+        return ret
+
+
 def always_decline(x: int) -> int:
     import os
 
@@ -98,6 +117,25 @@ FIXTURES: dict[str, TranspileResult] = {
         "coalesce(cast(unix_timestamp(date_trunc('SECOND', _udf_param_0)) as string), 'nan')"
     ),
     canonical_source_from_func(widget_name): _result("get_json_object(_udf_param_0, '$.widget')"),
+    # NOTE: the _udf_param_N refs stay OUTSIDE the transform lambda -- Spark's
+    # TranspiledPythonUDF placeholder substitution does not descend into
+    # higher-order function lambda bodies, so the lambda closes over only its
+    # own argument and literals.
+    canonical_source_from_func(scatter_to_seconds): _result(
+        "CASE WHEN _udf_param_0 IS NULL THEN array() "
+        "WHEN length(_udf_param_0) < 19 THEN array() "
+        "WHEN try_to_timestamp(substr(_udf_param_0, 1, 19), 'yyyy-MM-dd HH:mm:ss') IS NULL THEN array() "
+        "WHEN try_cast(_udf_param_1 AS DOUBLE) IS NULL THEN array() "
+        "WHEN isnan(try_cast(_udf_param_1 AS DOUBLE)) THEN array() "
+        "WHEN abs(try_cast(_udf_param_1 AS DOUBLE)) = cast('inf' AS DOUBLE) THEN array() "
+        "WHEN cast(int(try_cast(_udf_param_1 AS DOUBLE)) AS INT) < 0 THEN array() "
+        "ELSE transform(sequence("
+        "try_to_timestamp(substr(_udf_param_0, 1, 19), 'yyyy-MM-dd HH:mm:ss'), "
+        "timestampadd(SECOND, cast(int(try_cast(_udf_param_1 AS DOUBLE)) AS INT), "
+        "try_to_timestamp(substr(_udf_param_0, 1, 19), 'yyyy-MM-dd HH:mm:ss')), "
+        "interval 1 second), "
+        "x -> date_format(x, 'yyyy-MM-dd HH:mm:ss')) END"
+    ),
     canonical_source_from_func(backwards): TranspileResult(
         kind=KIND_JAVA_UDF,
         java_source=BACKWARDS_JAVA,

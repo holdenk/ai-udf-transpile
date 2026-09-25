@@ -103,12 +103,25 @@ def input_spark_types(function_ast: ast.FunctionDef, public_params: list[str]) -
     return types
 
 
+def _is_atomic_simple(simple: str) -> bool:
+    return any(simple == p or simple.startswith(p + "(") for p in ATOMIC_RETURN_PREFIXES)
+
+
+def _is_supported_return_simple(simple: str) -> bool:
+    if _is_atomic_simple(simple):
+        return True
+    # array of an atomic (e.g. array<string>) -- scatter-style UDFs.
+    if simple.startswith("array<") and simple.endswith(">"):
+        return _is_atomic_simple(simple[6:-1].strip())
+    return False
+
+
 def return_spark_type(return_type: Any) -> Optional[str]:
     if return_type is None:
         return None
     if isinstance(return_type, str):
         simple = return_type.strip().lower()
-        if any(simple == p or simple.startswith(p + "(") for p in ATOMIC_RETURN_PREFIXES):
+        if _is_supported_return_simple(simple):
             return return_type.strip()
         return None
     simple_fn = getattr(return_type, "simpleString", None)
@@ -117,7 +130,7 @@ def return_spark_type(return_type: Any) -> Optional[str]:
             simple = str(simple_fn())
         except Exception:
             simple = ""
-        if any(simple.lower() == p or simple.lower().startswith(p + "(") for p in ATOMIC_RETURN_PREFIXES):
+        if _is_supported_return_simple(simple.lower()):
             return simple
     name = type(return_type).__name__
     if name in _ATOMIC_RETURN_TYPE_NAMES:
