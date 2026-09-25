@@ -21,6 +21,7 @@ from pyspark.sql.types import LongType, StringType
 from pyspark.sql.udf import UserDefinedFunction
 
 from ai_udf_transpile import conf, enable
+from ai_udf_transpile.backends.fake import upper_useragent  # importable by executors
 from ai_udf_transpile.transpiler import get_catalog
 
 LIVE = os.environ.get("AI_UDF_LIVE") == "1"
@@ -92,3 +93,24 @@ def test_live_backend_greet(spark, sqlite_path, backend):
     assert second.transpiled
     df = spark.createDataFrame([("bo",), (None,)], ["name"])
     assert [r[0] for r in df.select(second("name")).collect()] == ["hi bo", None]
+
+
+@pytest.mark.parametrize("backend", sorted(BACKENDS))
+def test_live_backend_upper_useragent(spark, sqlite_path, backend):
+    """SPARK-21935's UDF against a real backend: upper(col) must verify."""
+    if shutil.which(BACKENDS[backend]) is None:
+        pytest.skip(f"{BACKENDS[backend]} not on PATH")
+    conf.set_value(conf.CLI_TIMEOUT, "600")
+    enable(spark, sqlite_path=sqlite_path, backend=backend, inline_worker=True)
+    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+
+    agents = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "curl/7.68.0"]
+    df = spark.createDataFrame([(a,) for a in agents], ["ua"])
+    first = UserDefinedFunction(upper_useragent, StringType())
+    assert not first.transpiled
+    assert [r[0] for r in df.select(first("ua")).collect()] == [a.upper() for a in agents]
+
+    _wait_success(get_catalog())
+    second = UserDefinedFunction(upper_useragent, StringType())
+    assert second.transpiled
+    assert [r[0] for r in df.select(second("ua")).collect()] == [a.upper() for a in agents]

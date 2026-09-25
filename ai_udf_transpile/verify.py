@@ -152,7 +152,15 @@ def _strategy_for(spark_type: str):
             st.floats(allow_nan=False, allow_infinity=False, width=32),
         )
     if t == "string":
-        return st.one_of(st.none(), st.text(max_size=16))
+        # Exclude surrogates (invalid in Spark strings) and codepoints
+        # unassigned in this Python's Unicode: the JVM may run a newer
+        # Unicode and case-map them (e.g. U+A7D5 -> U+A7D4 on JDKs with
+        # Unicode 16 vs Python 3.13's 15.1), a version skew no rewrite can
+        # control. Assigned-char mappings are stable per Unicode policy.
+        return st.one_of(
+            st.none(),
+            st.text(alphabet=st.characters(blacklist_categories=("Cs", "Cn")), max_size=16),
+        )
     if t in {"boolean", "bool"}:
         return st.one_of(st.none(), st.booleans())
     if t == "binary":
