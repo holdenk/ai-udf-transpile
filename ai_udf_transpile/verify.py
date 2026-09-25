@@ -192,20 +192,46 @@ def _strategy_for(spark_type: str):
                 st.none(),
                 st.dictionaries(st.text(max_size=8), st.text(max_size=16), max_size=4),
             )
-    if t.startswith("array<") and t.endswith(">") and t[6:-1].strip() == "string":
-        # Membership-test UDFs (x in lst) care about short lists of short
-        # strings. Elements are never None: python's `None in [None]` is True
-        # while SQL array_contains(arr, NULL) is NULL, and null elements in
-        # the constant membership lists these UDFs close over / receive do
-        # not occur -- a real sample containing one fails verification
-        # closed, which is the honest outcome.
-        return st.one_of(
-            st.none(),
-            st.lists(
-                st.text(alphabet=st.characters(blacklist_categories=("Cs", "Cn")), max_size=8),
-                max_size=5,
-            ),
-        )
+    if t.startswith("array<") and t.endswith(">"):
+        inner = t[6:-1].strip()
+        if inner == "string":
+            # Membership-test UDFs (x in lst) care about short lists of short
+            # strings. Elements are never None: python's `None in [None]` is
+            # True while SQL array_contains(arr, NULL) is NULL, and null
+            # elements in the constant membership lists these UDFs close over
+            # / receive do not occur -- a real sample containing one fails
+            # verification closed, which is the honest outcome.
+            return st.one_of(
+                st.none(),
+                st.lists(
+                    st.text(alphabet=st.characters(blacklist_categories=("Cs", "Cn")), max_size=8),
+                    max_size=5,
+                ),
+            )
+        if inner == "array<string>":
+            # Flatten-style UDFs iterate the inner lists, so inner lists are
+            # never None (python raises TypeError on `for x in None`, and a
+            # python raise allows any sql result -- no signal either way).
+            # But ELEMENTS may be None: python passes them through and
+            # Spark's flatten preserves them, while explode/collect_list and
+            # filter-style rewrites drop them -- null elements are where
+            # those rewrites die.
+            return st.one_of(
+                st.none(),
+                st.lists(
+                    st.lists(
+                        st.one_of(
+                            st.none(),
+                            st.text(
+                                alphabet=st.characters(blacklist_categories=("Cs", "Cn")),
+                                max_size=8,
+                            ),
+                        ),
+                        max_size=4,
+                    ),
+                    max_size=4,
+                ),
+            )
     raise VerifyFailed(f"unsupported input type for verify: {spark_type}")
 
 
@@ -440,6 +466,7 @@ def hypothesis_check(
         from ai_udf_transpile.sampling import (
             BUILTIN_ARRAY_EXAMPLES,
             BUILTIN_MAP_EXAMPLES,
+            BUILTIN_NESTED_ARRAY_EXAMPLES,
             BUILTIN_STRING_EXAMPLES,
             BUILTIN_TIMESTAMP_EXAMPLES,
             CROSS_STRING_EXAMPLES,
@@ -462,6 +489,9 @@ def hypothesis_check(
             elif stype.startswith("map<"):
                 for m in BUILTIN_MAP_EXAMPLES:
                     examples.append(tuple(dict(m) if j == i else None for j in range(arity)))
+            elif stype.startswith("array<array<"):
+                for a in BUILTIN_NESTED_ARRAY_EXAMPLES:
+                    examples.append(tuple([list(x) for x in a] if j == i else None for j in range(arity)))
             elif stype.startswith("array<"):
                 for a in BUILTIN_ARRAY_EXAMPLES:
                     examples.append(tuple(list(a) if j == i else None for j in range(arity)))
@@ -486,6 +516,8 @@ def hypothesis_check(
                     per_param.append(list(CROSS_STRING_EXAMPLES))
                 elif stype.startswith("map<"):
                     per_param.append([dict(m) for m in BUILTIN_MAP_EXAMPLES])
+                elif stype.startswith("array<array<"):
+                    per_param.append([[list(x) for x in a] for a in BUILTIN_NESTED_ARRAY_EXAMPLES])
                 elif stype.startswith("array<"):
                     per_param.append([list(a) for a in BUILTIN_ARRAY_EXAMPLES])
                 elif stype in {"timestamp", "timestamp_ntz"}:

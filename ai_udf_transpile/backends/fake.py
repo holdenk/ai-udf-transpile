@@ -101,6 +101,15 @@ def EBROut(prev_lac: str, cur_lac: str, ebr_lacs: list[str], mid_lacs: list[str]
     return 1 if prev_lac in mid_lacs and cur_lac in ebr_lacs else 0
 
 
+def flatlist(groups: list[list[str]]) -> list[str]:
+    # Rewritten from a contributed UDF (`def flatlist(s): fl = [item for
+    # sublist in s for item in sublist]; return fl`, registered as
+    # ArrayType(StringType())). flatten() is faithful: it preserves order,
+    # duplicates, and null elements; a null outer or inner array raises
+    # TypeError in python, where verification allows any sql result.
+    return [item for sub in groups for item in sub]
+
+
 def always_decline(x: int) -> int:
     import os
 
@@ -179,6 +188,8 @@ FIXTURES: dict[str, TranspileResult] = {
         "CASE WHEN array_contains(_udf_param_3, _udf_param_0) "
         "AND array_contains(_udf_param_2, _udf_param_1) THEN 1 ELSE 0 END"
     ),
+    # flatten preserves order, duplicates, and null elements -- all verified.
+    canonical_source_from_func(flatlist): _result("flatten(_udf_param_0)"),
 }
 
 

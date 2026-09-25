@@ -81,6 +81,14 @@ def _annotation_mapping(annotation: Optional[ast.AST]) -> Optional[tuple[str, st
     }:
         if annotation_name(annotation.slice) == "str":
             return ("array", "array<string>")
+        # list[list[str]] -> array<array<string>> (flatten-style UDFs).
+        inner = annotation.slice
+        if (
+            isinstance(inner, ast.Subscript)
+            and annotation_name(inner.value) in {"list", "List"}
+            and annotation_name(inner.slice) == "str"
+        ):
+            return ("array", "array<array<string>>")
     return None
 
 
