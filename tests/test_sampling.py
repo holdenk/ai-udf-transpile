@@ -20,11 +20,11 @@ from ai_udf_transpile.verify import hypothesis_check
 pytestmark = pytest.mark.spark
 
 WIDGET = (
-    "def widget_name(payload: str) -> str:\n"
+    "def widget_name(doc: str) -> str:\n"
     "    import json\n"
-    "    if payload is None:\n"
+    "    if doc is None:\n"
     "        return None\n"
-    "    return json.loads(payload).get('widget')\n"
+    "    return json.loads(doc).get('widget')\n"
 )
 
 # Wrong key: '$.gadget' never exists, so SQL returns NULL everywhere.

@@ -44,65 +44,59 @@ def upper_useragent(useragent: str) -> str:
     return useragent.upper()
 
 
-def contains_ingredient(recipe: str, ingredient: str) -> bool:
-    # The boolean NULL trap: python returns False for a NULL recipe, so the
+def contains_ingredient(text: str, needle: str) -> bool:
+    # The boolean NULL trap: python returns False for a NULL input, so the
     # rewrite must coalesce -- instr(...) > 0 alone returns NULL, which only
     # "looks gucci" inside WHERE clauses.
-    if recipe is not None:
-        return ingredient in recipe.lower()
-    return False
+    return text is not None and needle in text.lower()
 
 
-def timestamp_to_epoch(t: datetime) -> str:
+def timestamp_to_epoch(ts: datetime) -> str:
     # Scalar modernization of the pandas_udf t.dt.strftime("%s").apply(str)
     # over NYC taxi tpep_pickup_datetime: on NaT the pandas version yields
     # NaN and .apply(str) makes it 'nan' -- a faithful rewrite must too.
     # Also: python drops microseconds *before* epoch conversion, so the SQL
     # needs date_trunc('SECOND', ...) or pre-1970 fractional times are 1s off.
-    if t is None:
-        return "nan"
-    return t.strftime("%s")
+    return "nan" if ts is None else ts.strftime("%s")
 
 
-def scatter_to_seconds(start: str, duration: str) -> list[str]:
+def scatter_to_seconds(start_text: str, dur_text: str) -> list[str]:
     # Every failure path (null/short/unparseable start, non-numeric/NaN/inf/
     # negative duration) returns [] via the bare except, and the loop is
-    # range(duration + 1) -- off-by-one bait. First array<string> return: the
+    # range(0, secs + 1) -- off-by-one bait. First array<string> return: the
     # SQL keeps _udf_param_N refs outside the transform lambda (placeholder
     # substitution does not descend into higher-order function lambdas).
     import datetime
 
-    ret = []
+    out = []
     try:
-        start = str(start)
-        duration = int(float(duration))
-        if len(start) < 19:
-            return ret
-        start = start[:19]
-        start_struct = datetime.datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
-        for i in range(duration + 1):
-            cur = (start_struct + datetime.timedelta(seconds=i)).strftime("%Y-%m-%d %H:%M:%S")
-            ret.append(cur)
-        return ret
+        start_text = str(start_text)
+        secs = int(float(dur_text))
+        if len(start_text) < 19:
+            return out
+        start_text = start_text[:19]
+        parsed = datetime.datetime.strptime(start_text, "%Y-%m-%d %H:%M:%S")
+        for i in range(0, secs + 1):
+            stamp = (parsed + datetime.timedelta(seconds=i)).strftime("%Y-%m-%d %H:%M:%S")
+            out.append(stamp)
+        return out
     except Exception:
-        return ret
+        return out
 
 
 LAC_BSP = ["14503", "13403", "11518", "1452", "1343", "1518"]
 LAC_MID = ["14506", "1462"]
 
 
-def BSPIn(old_lac: str, new_lac: str, lac_lst_bsp: list[str], lac_lst_mid: list[str]) -> int:
-    # Modernized from a pasted telecom UDF written as
+def BSPIn(prev_lac: str, cur_lac: str, bsp_lacs: list[str], mid_lacs: list[str]) -> int:
+    # Rewritten from a pasted telecom UDF whose condition was written as
     #   old_lac in lac_lst_bsp & new_lac in lac_lst_mid
     # which raises TypeError on EVERY row: `&` binds tighter than `in` and
     # comparisons chain, so it parses as
     #   old_lac in (lac_lst_bsp & new_lac) in lac_lst_mid   # list & str -> TypeError
     # `and` is the intent. First array<string> *input* params: the lists
     # arrive as F.array(F.lit(...)) columns at the call site.
-    if old_lac in lac_lst_bsp and new_lac in lac_lst_mid:
-        return 1
-    return 0
+    return 1 if prev_lac in bsp_lacs and cur_lac in mid_lacs else 0
 
 
 def backwards(name: str) -> str:
@@ -111,12 +105,12 @@ def backwards(name: str) -> str:
     return name[::-1]
 
 
-def widget_name(payload: str) -> str:
+def widget_name(doc: str) -> str:
     import json
 
-    if payload is None:
+    if doc is None:
         return None
-    return json.loads(payload).get("widget")
+    return json.loads(doc).get("widget")
 
 
 def both_positive(x: int, y: int) -> bool:
@@ -129,22 +123,22 @@ def is_none_branch(x: int) -> int:
     return x
 
 
-def pymap_to_json(inp: dict[str, str]) -> str:
+def pymap_to_json(mapping: dict[str, str]) -> str:
     import ast
     import json
 
-    if inp is None:
+    if mapping is None:
         return None
-    new = {}
-    for k, v in inp.items():
+    out = {}
+    for key, val in mapping.items():
         try:
-            new[k] = json.loads(v)
+            out[key] = json.loads(val)
         except Exception:
             try:
-                new[k] = ast.literal_eval(v)
+                out[key] = ast.literal_eval(val)
             except Exception:
-                new[k] = v
-    return json.dumps(new)
+                out[key] = val
+    return json.dumps(out)
 
 
 def untyped(x):
