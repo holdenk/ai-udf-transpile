@@ -75,6 +75,12 @@ def _annotation_mapping(annotation: Optional[ast.AST]) -> Optional[tuple[str, st
         elts = slice_.elts if isinstance(slice_, ast.Tuple) else [slice_]
         if len(elts) == 2 and all(annotation_name(e) == "str" for e in elts):
             return ("map", "map<string,string>")
+    if isinstance(annotation, ast.Subscript) and annotation_name(annotation.value) in {
+        "list",
+        "List",
+    }:
+        if annotation_name(annotation.slice) == "str":
+            return ("array", "array<string>")
     return None
 
 

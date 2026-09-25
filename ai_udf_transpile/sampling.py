@@ -59,6 +59,16 @@ CROSS_STRING_EXAMPLES: tuple[str, ...] = (
     "not json",
 )
 
+# Deterministic lists always tried for array<string>-typed params: empty,
+# singletons, and a multi-element list with an empty-string member.
+BUILTIN_ARRAY_EXAMPLES: tuple[list, ...] = (
+    [],
+    [""],
+    ["0"],
+    ["a", "b"],
+    ["14503", "13403", "11518"],  # LAC-style codes (membership-test UDFs)
+)
+
 # Deterministic maps always tried for map<string,string>-typed params: values
 # that are valid JSON, valid Python literals, both, or neither.
 BUILTIN_MAP_EXAMPLES: tuple[dict, ...] = (
@@ -109,6 +119,9 @@ def _encode(value: Any) -> Any:
         # map<string,string> args are real values, tagged so they cannot be
         # confused with the __bytes__ / __repr__ marker dicts.
         return {"__map__": [[_encode(k), _encode(v)] for k, v in value.items()]}
+    if isinstance(value, (list, tuple)):
+        # array<string> args (pyspark hands array columns to the UDF as lists).
+        return {"__array__": [_encode(v) for v in value]}
     return {"__repr__": repr(value)[:200]}
 
 
@@ -136,6 +149,11 @@ def decode_args(text: str) -> Optional[list]:
 
             try:
                 out.append(_dt.datetime.fromisoformat(item["__datetime__"]))
+            except Exception:
+                return None
+        elif isinstance(item, dict) and "__array__" in item:
+            try:
+                out.append([v for v in item["__array__"]])
             except Exception:
                 return None
         elif isinstance(item, dict):

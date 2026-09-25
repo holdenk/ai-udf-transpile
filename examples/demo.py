@@ -22,7 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pyspark.sql import SparkSession  # noqa: E402
-from pyspark.sql.types import ArrayType, BooleanType, LongType, StringType  # noqa: E402
+from pyspark.sql import functions as F  # noqa: E402
+from pyspark.sql.types import ArrayType, BooleanType, IntegerType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, register_impl, shutdown  # noqa: E402
@@ -85,6 +86,23 @@ def scatter_to_seconds(start: str, duration: str) -> list[str]:
         return ret
     except Exception:
         return ret
+
+
+LAC_BSP = ["14503", "13403", "11518", "1452", "1343", "1518"]
+LAC_MID = ["14506", "1462"]
+
+
+def BSPIn(old_lac: str, new_lac: str, lac_lst_bsp: list[str], lac_lst_mid: list[str]) -> int:
+    # Modernized from a pasted telecom UDF written as
+    #   old_lac in lac_lst_bsp & new_lac in lac_lst_mid
+    # which raises TypeError on EVERY row: `&` binds tighter than `in` and
+    # comparisons chain, so it parses as
+    #   old_lac in (lac_lst_bsp & new_lac) in lac_lst_mid   # list & str -> TypeError
+    # `and` is the intent. First array<string> *input* params: the lists
+    # arrive as F.array(F.lit(...)) columns at the call site.
+    if old_lac in lac_lst_bsp and new_lac in lac_lst_mid:
+        return 1
+    return 0
 
 
 def backwards(name: str) -> str:
@@ -272,6 +290,37 @@ def main() -> int:
         f"scatter_to_seconds (array<string> return): transpiled={bool(sc.transpiled)} "
         f"results={[r[0] for r in starts.select(sc('start', 'duration')).collect()]} "
         "(failure paths -> [], never NULL)"
+    )
+
+    # Array inputs are gated out by default; opt in for the LAC-membership UDF.
+    conf.set_value(conf.INPUT_CATEGORIES, "numeric,string,bool,binary,map,timestamp,array", spark)
+    lac = spark.createDataFrame(
+        [
+            ("14503", "14506"),  # in bsp, in mid -> 1
+            ("14503", "99999"),  # in bsp, not mid -> 0
+            ("99999", "14506"),  # not bsp, in mid -> 0
+            (None, "14506"),  # null old_lac -> 0
+        ],
+        ["OLD_LAC", "NEW_LAC"],
+    )
+    # Same call-site shape as the original: the lists arrive as array columns.
+    lac = lac.withColumn("bsp", F.array(*[F.lit(x) for x in LAC_BSP]))
+    lac = lac.withColumn("mid", F.array(*[F.lit(x) for x in LAC_MID]))
+    bi = UserDefinedFunction(BSPIn, IntegerType())
+    first_rows = [r[0] for r in lac.select(bi("OLD_LAC", "NEW_LAC", "bsp", "mid")).collect()]
+    print(
+        f"BSPIn: first call transpiled={bool(bi.transpiled)} results={first_rows} "
+        "(miss -> Python, rows sampled)"
+    )
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        bi = UserDefinedFunction(BSPIn, IntegerType())
+        if bi.transpiled:
+            break
+        time.sleep(1.0)
+    print(
+        f"BSPIn (array<string> inputs): transpiled={bool(bi.transpiled)} "
+        f"results={[r[0] for r in lac.select(bi('OLD_LAC', 'NEW_LAC', 'bsp', 'mid')).collect()]}"
     )
 
     print()
@@ -482,6 +531,53 @@ def main() -> int:
         print("BUG: lambda-closing scatter_to_seconds was accepted")
     except ValueError as exc:
         print(f"register_impl rejected lambda-closing scatter_to_seconds: {str(exc)[:140]}...")
+
+    # BSPIn traps, in increasing subtlety. (a) Bare boolean without the CASE:
+    # array_contains(arr, NULL) is NULL, but the python returns 0 on null
+    # input -- caught by the built-in null examples.
+    try:
+        register_impl(
+            spark,
+            BSPIn,
+            kind="catalyst",
+            catalyst_sql="array_contains(_udf_param_2, _udf_param_0) "
+            "AND array_contains(_udf_param_3, _udf_param_1)",
+            return_type=IntegerType(),
+        )
+        print("BUG: bare-boolean BSPIn was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected bare-boolean BSPIn (NULL vs 0): {exc}")
+
+    # (b) OR instead of AND -- caught by the cross-combined built-ins (an
+    # old_lac that is in the list paired with a new_lac that is not).
+    try:
+        register_impl(
+            spark,
+            BSPIn,
+            kind="catalyst",
+            catalyst_sql="CASE WHEN array_contains(_udf_param_2, _udf_param_0) "
+            "OR array_contains(_udf_param_3, _udf_param_1) THEN 1 ELSE 0 END",
+            return_type=IntegerType(),
+        )
+        print("BUG: OR-instead-of-AND BSPIn was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected OR-instead-of-AND BSPIn: {exc}")
+
+    # (c) Swapped list params -- value-plausible (same shape, same functions),
+    # caught only because the first BSPIn call above recorded the real rows
+    # as samples: on ("14503", "14506") the swap flips 1 -> 0.
+    try:
+        register_impl(
+            spark,
+            BSPIn,
+            kind="catalyst",
+            catalyst_sql="CASE WHEN array_contains(_udf_param_3, _udf_param_0) "
+            "AND array_contains(_udf_param_2, _udf_param_1) THEN 1 ELSE 0 END",
+            return_type=IntegerType(),
+        )
+        print("BUG: swapped-lists BSPIn was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected swapped-lists BSPIn (caught by recorded samples): {exc}")
 
     print()
     print("=== INPUT-CATEGORY GATE (int/float only vs int/float/string) ===")
