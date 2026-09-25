@@ -97,9 +97,7 @@ def test_register_impl_rejects_naive_instr(spark, sqlite_path):
 def test_end_to_end_transpile_with_null_recipe(spark, sqlite_path):
     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
-    df = spark.createDataFrame(
-        [(r[0], r[1]) for r in RECIPE_SAMPLES], ["recipe", "ingredient"]
-    )
+    df = spark.createDataFrame([(r[0], r[1]) for r in RECIPE_SAMPLES], ["recipe", "ingredient"])
     expected = [contains_ingredient(r[0], r[1]) for r in RECIPE_SAMPLES]
 
     first = UserDefinedFunction(contains_ingredient, BooleanType())

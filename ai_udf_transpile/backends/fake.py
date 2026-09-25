@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from ai_udf_transpile.backends.base import BackendDecline
@@ -36,6 +37,14 @@ def contains_ingredient(recipe: str, ingredient: str) -> bool:
     if recipe is not None:
         return ingredient in recipe.lower()
     return False
+
+
+def timestamp_to_epoch(t: datetime) -> str:
+    # Scalar modernization of the pandas_udf t.dt.strftime("%s").apply(str):
+    # on NaT the pandas version yields NaN and .apply(str) makes it 'nan'.
+    if t is None:
+        return "nan"
+    return t.strftime("%s")
 
 
 def backwards(name: str) -> str:
@@ -84,6 +93,9 @@ FIXTURES: dict[str, TranspileResult] = {
     canonical_source_from_func(upper_useragent): _result("upper(_udf_param_0)"),
     canonical_source_from_func(contains_ingredient): _result(
         "coalesce(instr(lower(_udf_param_0), _udf_param_1) > 0, false)"
+    ),
+    canonical_source_from_func(timestamp_to_epoch): _result(
+        "coalesce(cast(unix_timestamp(date_trunc('SECOND', _udf_param_0)) as string), 'nan')"
     ),
     canonical_source_from_func(widget_name): _result("get_json_object(_udf_param_0, '$.widget')"),
     canonical_source_from_func(backwards): TranspileResult(

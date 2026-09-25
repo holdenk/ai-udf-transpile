@@ -13,6 +13,8 @@ ANNOTATION_MAP: dict[str, tuple[str, str]] = {
     "str": ("string", "string"),
     "bool": ("bool", "boolean"),
     "bytes": ("binary", "binary"),
+    # `datetime` and `datetime.datetime` both resolve to the name "datetime".
+    "datetime": ("timestamp", "timestamp"),
 }
 
 ATOMIC_RETURN_PREFIXES = (

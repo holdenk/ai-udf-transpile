@@ -52,6 +52,23 @@ BUILTIN_MAP_EXAMPLES: tuple[dict, ...] = (
     {"k": "null"},
 )
 
+
+def _builtin_timestamps() -> tuple:
+    import datetime as dt
+
+    return (
+        None,  # NULL handling is where timestamp rewrites diverge
+        dt.datetime(1970, 1, 1),  # epoch zero
+        dt.datetime(1960, 6, 1),  # pre-1970: negative epoch
+        dt.datetime(2038, 1, 19, 3, 14, 7),  # 32-bit time_t rollover
+        dt.datetime(2016, 2, 29),  # leap day
+        dt.datetime(2015, 1, 1),
+    )
+
+
+# Deterministic timestamps always tried for timestamp-typed params.
+BUILTIN_TIMESTAMP_EXAMPLES: tuple = _builtin_timestamps()
+
 _MAX_STORED_SAMPLES = 64
 
 _process_lock = threading.Lock()
@@ -59,10 +76,14 @@ _process_seen: dict[str, int] = {}
 
 
 def _encode(value: Any) -> Any:
+    import datetime as _dt
+
     if isinstance(value, bytes):
         return {"__bytes__": value.hex()}
     if isinstance(value, (int, float, bool, str)) or value is None:
         return value
+    if isinstance(value, _dt.datetime):
+        return {"__datetime__": value.isoformat()}
     if isinstance(value, dict):
         # map<string,string> args are real values, tagged so they cannot be
         # confused with the __bytes__ / __repr__ marker dicts.
@@ -87,6 +108,13 @@ def decode_args(text: str) -> Optional[list]:
         elif isinstance(item, dict) and "__map__" in item:
             try:
                 out.append({k: v for k, v in item["__map__"]})
+            except Exception:
+                return None
+        elif isinstance(item, dict) and "__datetime__" in item:
+            import datetime as _dt
+
+            try:
+                out.append(_dt.datetime.fromisoformat(item["__datetime__"]))
             except Exception:
                 return None
         elif isinstance(item, dict):
