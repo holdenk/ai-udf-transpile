@@ -110,6 +110,29 @@ def flatlist(groups: list[list[str]]) -> list[str]:
     return [item for sub in groups for item in sub]
 
 
+def kms_encrypt(text: str, key_id: str) -> str:
+    # The canonical untranspilable UDF: an AWS KMS Encrypt call per row.
+    # There is no Catalyst equivalent -- the ciphertext comes from the
+    # service and is non-deterministic (the same plaintext encrypts
+    # differently every call), so any backend SQL "rewrite" is a
+    # hallucination. In an environment without boto3/credentials the python
+    # side raises on every example, which is the vacuous-pass trap: "python
+    # raise + sql value allowed" would accept ANY rewrite, so verification
+    # requires at least one successful python evaluation and fails closed.
+    # (A module-level client would be marginally faster but is a closure
+    # capture the keyer cannot fingerprint; per-call construction also keeps
+    # this UDF self-contained for executors.)
+    import base64
+
+    import boto3
+
+    if text is None:
+        return None
+    client = boto3.client("kms", region_name="us-west-2")
+    resp = client.encrypt(KeyId=key_id, Plaintext=text.encode("utf-8"))
+    return base64.b64encode(resp["CiphertextBlob"]).decode("utf-8")
+
+
 def always_decline(x: int) -> int:
     import os
 

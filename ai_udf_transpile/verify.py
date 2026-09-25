@@ -428,6 +428,7 @@ def hypothesis_check(
 
     strategies = [_strategy_for(t) for t in input_types]
     mismatch: list[str] = []
+    py_successes = [0]  # a rewrite is only verified if python succeeds somewhere
 
     def _run(args: tuple) -> None:
         py_exc: Optional[BaseException] = None
@@ -440,6 +441,8 @@ def hypothesis_check(
         except Exception as exc:  # Python UDF raised
             py_exc = exc
             py_value = _SENTINEL_RAISED
+        else:
+            py_successes[0] += 1
         try:
             sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type)
             sql_exc = None
@@ -549,4 +552,10 @@ def hypothesis_check(
         return False, f"hypothesis failed: {exc}"
     if mismatch:
         return False, mismatch[0]
+    if py_successes[0] == 0:
+        # python raised on EVERY example (e.g. a boto3/KMS UDF in an
+        # environment without credentials): under "python raise + sql value
+        # is allowed" any rewrite would pass vacuously. No signal -> fail
+        # closed.
+        return False, "python raised on every example; no signal to verify against"
     return True, None
