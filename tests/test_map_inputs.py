@@ -29,22 +29,22 @@ from ai_udf_transpile.verify import hypothesis_check
 pytestmark = pytest.mark.spark
 
 
-def pymap_to_json(inp: dict[str, str]) -> str:
+def pymap_to_json(mapping: dict[str, str]) -> str:
     import ast
     import json
 
-    if inp is None:
+    if mapping is None:
         return None
-    new = {}
-    for k, v in inp.items():
+    out = {}
+    for key, val in mapping.items():
         try:
-            new[k] = json.loads(v)
+            out[key] = json.loads(val)
         except Exception:
             try:
-                new[k] = ast.literal_eval(v)
+                out[key] = ast.literal_eval(val)
             except Exception:
-                new[k] = v
-    return json.dumps(new)
+                out[key] = val
+    return json.dumps(out)
 
 
 def value_for_a(inp: dict[str, str]) -> str:
@@ -136,22 +136,22 @@ def test_decode_args_map_roundtrip():
 def test_map_samples_captured_end_to_end(spark, sqlite_path):
     # Local def: cloudpickle ships it to executors by value (a module-level
     # test function pickles by reference and the executor cannot import it).
-    def pymap(inp: dict[str, str]) -> str:
+    def pymap(mapping: dict[str, str]) -> str:
         import ast
         import json
 
-        if inp is None:
+        if mapping is None:
             return None
-        new = {}
-        for k, v in inp.items():
+        out = {}
+        for key, val in mapping.items():
             try:
-                new[k] = json.loads(v)
+                out[key] = json.loads(val)
             except Exception:
                 try:
-                    new[k] = ast.literal_eval(v)
+                    out[key] = ast.literal_eval(val)
                 except Exception:
-                    new[k] = v
-        return json.dumps(new)
+                    out[key] = val
+        return json.dumps(out)
 
     conf.set_value(conf.INPUT_CATEGORIES, "numeric,string,bool,binary,map")
     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)

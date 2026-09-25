@@ -33,18 +33,15 @@ def upper_useragent(useragent: str) -> str:
     return useragent.upper()
 
 
-def contains_ingredient(recipe: str, ingredient: str) -> bool:
-    if recipe is not None:
-        return ingredient in recipe.lower()
-    return False
+def contains_ingredient(text: str, needle: str) -> bool:
+    # Rewritten from a contributed UDF (recipe/ingredient): None -> False.
+    return text is not None and needle in text.lower()
 
 
-def timestamp_to_epoch(t: datetime) -> str:
+def timestamp_to_epoch(ts: datetime) -> str:
     # Scalar modernization of the pandas_udf t.dt.strftime("%s").apply(str):
     # on NaT the pandas version yields NaN and .apply(str) makes it 'nan'.
-    if t is None:
-        return "nan"
-    return t.strftime("%s")
+    return "nan" if ts is None else ts.strftime("%s")
 
 
 def backwards(name: str) -> str:
@@ -53,60 +50,55 @@ def backwards(name: str) -> str:
     return name[::-1]
 
 
-def widget_name(payload: str) -> str:
+def widget_name(doc: str) -> str:
     import json
 
-    if payload is None:
+    if doc is None:
         return None
-    return json.loads(payload).get("widget")
+    return json.loads(doc).get("widget")
 
 
-def scatter_to_seconds(start: str, duration: str) -> list[str]:
+def scatter_to_seconds(start_text: str, dur_text: str) -> list[str]:
     import datetime
 
-    ret = []
+    out = []
     try:
-        start = str(start)
-        duration = int(float(duration))
-        if len(start) < 19:
-            return ret
-        start = start[:19]
-        start_struct = datetime.datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
-        for i in range(duration + 1):
-            cur = (start_struct + datetime.timedelta(seconds=i)).strftime("%Y-%m-%d %H:%M:%S")
-            ret.append(cur)
-        return ret
+        start_text = str(start_text)
+        secs = int(float(dur_text))
+        if len(start_text) < 19:
+            return out
+        start_text = start_text[:19]
+        parsed = datetime.datetime.strptime(start_text, "%Y-%m-%d %H:%M:%S")
+        for i in range(0, secs + 1):
+            stamp = (parsed + datetime.timedelta(seconds=i)).strftime("%Y-%m-%d %H:%M:%S")
+            out.append(stamp)
+        return out
     except Exception:
-        return ret
+        return out
 
 
-def BSPIn(old_lac: str, new_lac: str, lac_lst_bsp: list[str], lac_lst_mid: list[str]) -> int:
-    # Modernized from the pasted UDF: `old_lac in lac_lst_bsp & new_lac in
-    # lac_lst_mid` parses as `old_lac in (lac_lst_bsp & new_lac) in
-    # lac_lst_mid` (& binds tighter than `in`, and comparisons chain), which
-    # raises TypeError (list & str) on EVERY row. `and` is the intent.
-    # Nulls: None in list is False (-> 0); x in None raises (sql may return).
-    if old_lac in lac_lst_bsp and new_lac in lac_lst_mid:
-        return 1
-    return 0
+# The BSP/EBR fixtures below are rewrites of contributed telecom UDFs. The
+# pasted original of BSPIn was `old_lac in lac_lst_bsp & new_lac in
+# lac_lst_mid`, which parses as `old_lac in (lac_lst_bsp & new_lac) in
+# lac_lst_mid` (& binds tighter than `in`, and comparisons chain) and raises
+# TypeError (list & str) on EVERY row; `and` was the intent.
+# Nulls: None in list is False (-> 0); x in None raises (sql may return).
 
 
-def EBRIn(old_lac: str, new_lac: str, lac_lst_ebr: list[str], lac_lst_mid: list[str]) -> int:
-    if old_lac in lac_lst_ebr and new_lac in lac_lst_mid:
-        return 1
-    return 0
+def BSPIn(prev_lac: str, cur_lac: str, bsp_lacs: list[str], mid_lacs: list[str]) -> int:
+    return 1 if prev_lac in bsp_lacs and cur_lac in mid_lacs else 0
 
 
-def BSPOut(old_lac: str, new_lac: str, lac_lst_bsp: list[str], lac_lst_mid: list[str]) -> int:
-    if old_lac in lac_lst_mid and new_lac in lac_lst_bsp:
-        return 1
-    return 0
+def EBRIn(prev_lac: str, cur_lac: str, ebr_lacs: list[str], mid_lacs: list[str]) -> int:
+    return 1 if prev_lac in ebr_lacs and cur_lac in mid_lacs else 0
 
 
-def EBROut(old_lac: str, new_lac: str, lac_lst_ebr: list[str], lac_lst_mid: list[str]) -> int:
-    if old_lac in lac_lst_mid and new_lac in lac_lst_ebr:
-        return 1
-    return 0
+def BSPOut(prev_lac: str, cur_lac: str, bsp_lacs: list[str], mid_lacs: list[str]) -> int:
+    return 1 if prev_lac in mid_lacs and cur_lac in bsp_lacs else 0
+
+
+def EBROut(prev_lac: str, cur_lac: str, ebr_lacs: list[str], mid_lacs: list[str]) -> int:
+    return 1 if prev_lac in mid_lacs and cur_lac in ebr_lacs else 0
 
 
 def always_decline(x: int) -> int:

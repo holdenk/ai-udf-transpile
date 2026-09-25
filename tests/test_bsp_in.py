@@ -154,10 +154,10 @@ def _record_samples(spark, sqlite_path):
     conf.set_value(conf.INPUT_CATEGORIES, ARRAY_CATEGORIES)
     df = spark.createDataFrame(
         [(s[0], s[1], s[2], s[3]) for s in BSP_SAMPLES],
-        ["OLD_LAC", "NEW_LAC", "lac_lst_bsp", "lac_lst_mid"],
+        ["OLD_LAC", "NEW_LAC", "bsp_lacs", "mid_lacs"],
     )
     sampling_udf = UserDefinedFunction(BSPIn, IntegerType())
-    df.select(sampling_udf("OLD_LAC", "NEW_LAC", "lac_lst_bsp", "lac_lst_mid")).collect()
+    df.select(sampling_udf("OLD_LAC", "NEW_LAC", "bsp_lacs", "mid_lacs")).collect()
 
 
 def test_register_impl_rejects_swapped(spark, sqlite_path):
