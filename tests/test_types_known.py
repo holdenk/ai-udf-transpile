@@ -37,7 +37,15 @@ def test_missing_return_type_declines():
 
 def test_non_atomic_return_declines():
     fn = _fn("def f(x: int) -> int:\n    return x")
-    assert types_known(fn, ["x"], "array<int>") is False
+    assert types_known(fn, ["x"], "struct<a:int>") is False
+    assert types_known(fn, ["x"], "map<string,string>") is False
+    assert return_spark_type("array<struct<a:int>>") is None
+
+
+def test_array_of_atomic_return_accepted():
+    fn = _fn("def f(x: int) -> int:\n    return x")
+    assert types_known(fn, ["x"], "array<int>") is True
+    assert return_spark_type("array<string>") == "array<string>"
 
 
 def test_return_type_from_simpleString_object():

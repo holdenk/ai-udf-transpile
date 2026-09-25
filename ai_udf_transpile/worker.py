@@ -20,7 +20,7 @@ from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.catalog import Catalog, open_catalog
 from ai_udf_transpile.sandbox import make_sandbox
 from ai_udf_transpile.targets import TranspileResult
-from ai_udf_transpile.verify import hypothesis_check
+from ai_udf_transpile.verify import hypothesis_check, smoke_test_reconstruction
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,21 @@ def process_row(
         )
         if ok:
             catalog.mark_success(key, result, origin, hypothesis_passed=True)
+            # Value-equivalence is not enough: the rewrite must also survive
+            # the real TranspiledPythonUDF reconstruction path (e.g. param
+            # refs inside higher-order function lambdas do not get
+            # substituted and would take the user's query down at analysis).
+            smoke_err = smoke_test_reconstruction(
+                spark,
+                source_text=row.source_text,
+                captures=row.captures,
+                input_types=row.input_types,
+                return_type=row.return_type,
+            )
+            if smoke_err:
+                catalog.mark_failed(key, smoke_err, origin=origin, model=model)
+                logger.info("transpile failed (reconstruction) key=%s: %s", key[:12], smoke_err)
+                return
             logger.info(
                 "transpile success key=%s origin=%s model=%s kind=%s",
                 key[:12],

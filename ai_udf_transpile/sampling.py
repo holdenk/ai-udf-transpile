@@ -34,8 +34,29 @@ BUILTIN_STRING_EXAMPLES: tuple[str, ...] = (
     "[]",
     '{"a": 1}',
     "not json",
+    "nan",  # float-parseable: catches rewrites missing isnan guards
+    "inf",  # float-parseable: int(float('inf')) raises in Python
+    "2015-01-01 00:00:00",  # valid '%Y-%m-%d %H:%M:%S' timestamp
     "é",
     "ß",  # full case mapping (SS): catches ASCII-only upper rewrites
+)
+
+# Small subset cross-combined across params for multi-param UDFs: the built-ins
+# above vary one param at a time (others NULL), so a pair like (valid
+# timestamp, 'nan') is never tried -- exactly the region where coercion guards
+# (isnan, length gates, strict parsing) get exercised. Kept small: the cross
+# product is quadratic.
+CROSS_STRING_EXAMPLES: tuple[str, ...] = (
+    "2015-01-01 00:00:00",
+    "2015-01-01",  # date-only: strict strptime rejects, lenient parse accepts
+    "0",
+    "3.9",
+    "-1",
+    "1e5",
+    "nan",
+    "inf",
+    "",
+    "not json",
 )
 
 # Deterministic maps always tried for map<string,string>-typed params: values

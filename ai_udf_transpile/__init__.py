@@ -214,6 +214,16 @@ def register_impl(
 
     hyp: Optional[bool] = None
     if verify:
+        # Verify against any real rows recorded for this UDF, like the worker
+        # does: for multi-param UDFs the built-in examples vary one param at a
+        # time, so without samples whole input regions (e.g. a valid timestamp
+        # string AND a parseable duration) are never exercised and a wrong
+        # rewrite can pass vacuously.
+        samples: list = []
+        try:
+            samples = catalog.samples_for(key)
+        except Exception:
+            pass
         ok, err = hypothesis_check(
             source_text=source,
             captures=captures,
@@ -223,6 +233,7 @@ def register_impl(
             spark=spark,
             max_examples=conf.get_int(conf.MAX_EXAMPLES, spark, int(conf.default_max_examples())),
             func=func,
+            samples=samples,
         )
         if not ok:
             if catalog.get(key) is None:
@@ -255,6 +266,23 @@ def register_impl(
         origin=ORIGIN,
         hypothesis_passed=hyp,
     )
+    # Even a value-equivalent rewrite can fail when reconstructed through the
+    # real TranspiledPythonUDF path (e.g. param refs inside higher-order
+    # function lambdas are not substituted), which would take the user's query
+    # down at analysis. Smoke-test reconstruction and fail closed.
+    from ai_udf_transpile.verify import smoke_test_reconstruction
+
+    smoke_err = smoke_test_reconstruction(
+        spark,
+        source_text=source,
+        captures=captures,
+        input_types=in_types,
+        return_type=out_type,
+        func=func,
+    )
+    if smoke_err:
+        catalog.mark_failed(key, smoke_err, origin=ORIGIN)
+        raise ValueError(f"register_impl reconstruction failed: {smoke_err}")
     return key
 
 

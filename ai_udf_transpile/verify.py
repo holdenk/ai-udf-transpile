@@ -6,8 +6,12 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import linecache
+import logging
 import textwrap
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 STDLIB_ALLOWLIST = frozenset(
     {
@@ -120,7 +124,14 @@ def exec_udf_source(
     for name in collect_imported_module_names(source_text):
         if name in STDLIB_ALLOWLIST and name not in ns:
             ns[name] = importlib.import_module(name)
-    exec(textwrap.dedent(source_text), ns, ns)  # noqa: S102 — isolated verify sandbox
+    dedented = textwrap.dedent(source_text)
+    # Compile under a pseudo-filename registered with linecache so
+    # inspect.getsource works on the exec'd function -- Spark's transpiler
+    # hook reads source that way, and the reconstruction smoke test rebuilds
+    # the UDF from exactly this text.
+    filename = f"<ai_udf_verify_{abs(hash(dedented))}>"
+    linecache.cache[filename] = (len(dedented), None, dedented.splitlines(True), filename)
+    exec(compile(dedented, filename, "exec"), ns, ns)  # noqa: S102 — isolated verify sandbox
     return ns
 
 
@@ -202,6 +213,10 @@ def _spark_type(simple: str):
     if t.startswith("map<") and t.endswith(">"):
         key_t, _, val_t = t[4:-1].partition(",")
         return MapType(_spark_type(key_t), _spark_type(val_t))
+    if t.startswith("array<") and t.endswith(">"):
+        from pyspark.sql.types import ArrayType
+
+        return ArrayType(_spark_type(t[6:-1]))
     if t == "timestamp":
         from pyspark.sql.types import TimestampType
 
@@ -239,6 +254,68 @@ def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_
     row_kwargs = {f"_udf_param_{i}": args[i] for i in range(len(args))}
     df = spark.createDataFrame([Row(**row_kwargs)], schema=schema)
     return df.selectExpr(f"({sql}) AS result").collect()[0][0]
+
+
+def smoke_test_reconstruction(
+    spark: Any,
+    *,
+    source_text: str,
+    captures: Optional[dict[str, Any]],
+    input_types: list[str],
+    return_type: str,
+    func: Any = None,
+) -> Optional[str]:
+    """Force the cached rewrite through the real TranspiledPythonUDF path on an
+    empty DataFrame; return an error string if plan analysis fails, else None.
+
+    hypothesis_check evaluates candidate SQL with the params bound as ordinary
+    columns, where outer references inside higher-order function lambdas
+    resolve fine -- but the TranspiledPythonUDF placeholder substitution does
+    not descend into lambda bodies, so a verified rewrite can still fail
+    analysis (UNRESOLVED_COLUMN _udf_param_N) when it reaches a real query,
+    taking the whole query down instead of falling back. The catalog row must
+    already be written (success) so the UDF-construction hook reconstructs it;
+    on any failure here the caller flips the row back to failed.
+
+    Only the final analysis step produces an error: harness problems (no func,
+    hook declined, nothing reconstructed) return None -- no opinion.
+    """
+    if spark is None:
+        return None
+    try:
+        from pyspark.sql.types import StructField, StructType
+        from pyspark.sql.udf import UserDefinedFunction
+
+        from ai_udf_transpile.transpiler import register_transpiler
+
+        register_transpiler()
+        try:
+            spark.conf.set("spark.sql.experimental.optimizer.transpilePyUDFs", "true")
+            current = spark.conf.get("spark.sql.experimental.optimizer.pyTranspilers", "") or ""
+            if "ai" not in current.split(","):
+                spark.conf.set(
+                    "spark.sql.experimental.optimizer.pyTranspilers",
+                    ",".join([x for x in current.split(",") if x] + ["ai"]),
+                )
+        except Exception:
+            logger.debug("could not enable transpile confs for smoke test", exc_info=True)
+        f = func
+        if f is None:
+            f = load_python_udf(source_text, captures)
+        fields = [StructField(f"arg{i}", _spark_type(t), True) for i, t in enumerate(input_types)]
+        df = spark.createDataFrame([], StructType(fields))
+        udf = UserDefinedFunction(f, _spark_type(return_type))
+        transpiled = list(getattr(udf, "transpiled", None) or [])
+        if not transpiled:
+            return None  # hook declined / nothing reconstructed: nothing to break
+    except Exception:
+        logger.debug("smoke test harness could not construct the UDF", exc_info=True)
+        return None
+    try:
+        df.select(udf(*[f"arg{i}" for i in range(len(input_types))])).schema
+    except Exception as exc:
+        return f"verified rewrite fails plan analysis when reconstructed: {exc}"
+    return None
 
 
 def _java_udf_expr(
@@ -350,6 +427,7 @@ def hypothesis_check(
             BUILTIN_MAP_EXAMPLES,
             BUILTIN_STRING_EXAMPLES,
             BUILTIN_TIMESTAMP_EXAMPLES,
+            CROSS_STRING_EXAMPLES,
         )
 
         examples: list[tuple] = []
@@ -372,7 +450,27 @@ def hypothesis_check(
             elif stype in {"timestamp", "timestamp_ntz"}:
                 for ts in BUILTIN_TIMESTAMP_EXAMPLES:
                     examples.append(tuple(ts if j == i else None for j in range(arity)))
-        return examples[:64]
+        if arity >= 2:
+            # One-param-at-a-time built-ins never combine interesting values
+            # across params (e.g. a valid timestamp start AND a 'nan'
+            # duration), which is where coercion guards get exercised -- a
+            # rewrite missing an isnan guard passes vacuously without them.
+            import itertools
+
+            per_param: list[list] = []
+            for spark_type in input_types:
+                stype = spark_type.strip().lower()
+                if stype == "string":
+                    per_param.append(list(CROSS_STRING_EXAMPLES))
+                elif stype.startswith("map<"):
+                    per_param.append([dict(m) for m in BUILTIN_MAP_EXAMPLES])
+                elif stype in {"timestamp", "timestamp_ntz"}:
+                    per_param.append(list(BUILTIN_TIMESTAMP_EXAMPLES))
+                else:
+                    per_param.append([None])
+            for combo in itertools.product(*per_param):
+                examples.append(tuple(combo))
+        return examples[:160]
 
     check = _run
     for ex in _explicit_examples():
