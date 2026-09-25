@@ -28,6 +28,10 @@ def greet(name: str) -> str:
     return "hi " + name
 
 
+def upper_useragent(useragent: str) -> str:
+    return useragent.upper()
+
+
 def backwards(name: str) -> str:
     if name is None:
         return None
@@ -71,6 +75,7 @@ FIXTURES: dict[str, TranspileResult] = {
     ),
     canonical_source_from_func(both_positive): _result("_udf_param_0 > 0 AND _udf_param_1 > 0"),
     canonical_source_from_func(greet): _result("concat('hi ', _udf_param_0)"),
+    canonical_source_from_func(upper_useragent): _result("upper(_udf_param_0)"),
     canonical_source_from_func(widget_name): _result("get_json_object(_udf_param_0, '$.widget')"),
     canonical_source_from_func(backwards): TranspileResult(
         kind=KIND_JAVA_UDF,

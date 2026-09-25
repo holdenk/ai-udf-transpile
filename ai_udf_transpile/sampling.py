@@ -35,6 +35,7 @@ BUILTIN_STRING_EXAMPLES: tuple[str, ...] = (
     '{"a": 1}',
     "not json",
     "é",
+    "ß",  # full case mapping (SS): catches ASCII-only upper rewrites
 )
 
 # Deterministic maps always tried for map<string,string>-typed params: values

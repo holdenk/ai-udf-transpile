@@ -36,6 +36,12 @@ def greet(name: str) -> str:
     return "hi " + name
 
 
+def upper_useragent(useragent: str) -> str:
+    # SPARK-21935: this exact UDF OOM'd executors via Python worker memory
+    # overhead; as Catalyst SQL there is no Python worker at all.
+    return useragent.upper()
+
+
 def backwards(name: str) -> str:
     if name is None:
         return None
@@ -146,6 +152,19 @@ def main() -> int:
     names = spark.createDataFrame([("bo",), ("holden",)], ["name"])
     greet_rows = [r[0] for r in names.select(g("name")).collect()]
     print(f"greet: transpiled={bool(g.transpiled)} results={greet_rows}")
+
+    ua = UserDefinedFunction(upper_useragent, StringType())
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        ua = UserDefinedFunction(upper_useragent, StringType())
+        if ua.transpiled:
+            break
+        time.sleep(1.0)
+    uas = spark.createDataFrame([("Mozilla/5.0 (Windows NT 10.0; Win64; x64)",)], ["ua"])
+    print(
+        f"upper_useragent (SPARK-21935): transpiled={bool(ua.transpiled)} "
+        f"results={[r[0] for r in uas.select(ua('ua')).collect()]}"
+    )
 
     print()
     print("=== REAL-ROW SAMPLING (string inputs feed Hypothesis) ===")
