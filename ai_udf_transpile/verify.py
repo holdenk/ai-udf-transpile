@@ -165,6 +165,15 @@ def _strategy_for(spark_type: str):
         return st.one_of(st.none(), st.booleans())
     if t == "binary":
         return st.one_of(st.none(), st.binary(max_size=16))
+    if t in {"timestamp", "timestamp_ntz"}:
+        import datetime as _dt
+
+        # Naive datetimes, 1900-2100: covers pre-1970 (negative epochs) and
+        # the 2038 boundary without platform strftime corner cases.
+        return st.one_of(
+            st.none(),
+            st.datetimes(min_value=_dt.datetime(1900, 1, 1), max_value=_dt.datetime(2100, 12, 31)),
+        )
     if t.startswith("map<") and t.endswith(">"):
         key_t, _, val_t = t[4:-1].partition(",")
         if key_t.strip() == "string" and val_t.strip() == "string":
@@ -193,6 +202,14 @@ def _spark_type(simple: str):
     if t.startswith("map<") and t.endswith(">"):
         key_t, _, val_t = t[4:-1].partition(",")
         return MapType(_spark_type(key_t), _spark_type(val_t))
+    if t == "timestamp":
+        from pyspark.sql.types import TimestampType
+
+        return TimestampType()
+    if t == "timestamp_ntz":
+        from pyspark.sql.types import TimestampNTZType
+
+        return TimestampNTZType()
     return {
         "tinyint": ByteType(),
         "byte": ByteType(),
@@ -329,7 +346,11 @@ def hypothesis_check(
         strings and so does the SQL side -- a vacuous match), so real sampled
         values and a fixed set of structured strings run as @example first.
         """
-        from ai_udf_transpile.sampling import BUILTIN_MAP_EXAMPLES, BUILTIN_STRING_EXAMPLES
+        from ai_udf_transpile.sampling import (
+            BUILTIN_MAP_EXAMPLES,
+            BUILTIN_STRING_EXAMPLES,
+            BUILTIN_TIMESTAMP_EXAMPLES,
+        )
 
         examples: list[tuple] = []
         arity = len(input_types)
@@ -348,6 +369,9 @@ def hypothesis_check(
             elif stype.startswith("map<"):
                 for m in BUILTIN_MAP_EXAMPLES:
                     examples.append(tuple(dict(m) if j == i else None for j in range(arity)))
+            elif stype in {"timestamp", "timestamp_ntz"}:
+                for ts in BUILTIN_TIMESTAMP_EXAMPLES:
+                    examples.append(tuple(ts if j == i else None for j in range(arity)))
         return examples[:64]
 
     check = _run

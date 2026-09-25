@@ -12,6 +12,7 @@ Run with a packaged Spark master:
 
 from __future__ import annotations
 
+import datetime
 import os
 import sys
 import tempfile
@@ -49,6 +50,17 @@ def contains_ingredient(recipe: str, ingredient: str) -> bool:
     if recipe is not None:
         return ingredient in recipe.lower()
     return False
+
+
+def timestamp_to_epoch(t: datetime) -> str:
+    # Scalar modernization of the pandas_udf t.dt.strftime("%s").apply(str)
+    # over NYC taxi tpep_pickup_datetime: on NaT the pandas version yields
+    # NaN and .apply(str) makes it 'nan' -- a faithful rewrite must too.
+    # Also: python drops microseconds *before* epoch conversion, so the SQL
+    # needs date_trunc('SECOND', ...) or pre-1970 fractional times are 1s off.
+    if t is None:
+        return "nan"
+    return t.strftime("%s")
 
 
 def backwards(name: str) -> str:
@@ -190,6 +202,30 @@ def main() -> int:
         f"contains_ingredient: transpiled={bool(ci.transpiled)} "
         f"results={[r[0] for r in recipes.select(ci('recipe', 'ingredient')).collect()]} "
         "(NULL recipe -> False, never NULL)"
+    )
+
+    # Timestamp inputs are gated out by default; opt in for this one.
+    conf.set_value(conf.INPUT_CATEGORIES, "numeric,string,bool,binary,map,timestamp", spark)
+    te = UserDefinedFunction(timestamp_to_epoch, StringType())
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        te = UserDefinedFunction(timestamp_to_epoch, StringType())
+        if te.transpiled:
+            break
+        time.sleep(1.0)
+    pickups = spark.createDataFrame(
+        [
+            (datetime.datetime(2015, 1, 1, 0, 12, 0),),
+            (datetime.datetime(1969, 12, 31, 23, 59, 59),),
+            (None,),
+        ],
+        ["tpep_pickup_datetime"],
+    )
+    stamped = pickups.select(te("tpep_pickup_datetime").alias("timestamp_copy"))
+    print(
+        f"timestamp_to_epoch: transpiled={bool(te.transpiled)} "
+        f"results={[r[0] for r in stamped.collect()]} "
+        f"distinct_count={stamped.distinct().count()} (NULL -> 'nan', like the pandas original)"
     )
 
     print()

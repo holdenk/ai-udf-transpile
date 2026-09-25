@@ -90,12 +90,39 @@ def _bound_names(function_ast: ast.FunctionDef, public_params: list[str]) -> set
 
 
 def free_names(function_ast: ast.FunctionDef, public_params: list[str]) -> set[str]:
+    """Names the UDF body loads from its closure/globals.
+
+    Annotations are compile-time metadata (never evaluated at runtime under
+    ``from __future__ import annotations``, and only at def time otherwise),
+    so a ``t: datetime`` annotation must not turn ``datetime`` into a
+    capture. Default values are runtime-relevant and are still visited.
+    """
     bound = _bound_names(function_ast, public_params)
     names: set[str] = set()
-    for node in ast.walk(function_ast):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            if node.id not in bound:
+
+    class _Visitor(ast.NodeVisitor):
+        def visit_arg(self, node: ast.arg) -> None:
+            return  # skip arg.annotation
+
+        def _visit_function(self, node: ast.AST) -> None:
+            for dec in node.decorator_list:
+                self.visit(dec)
+            self.visit(node.args)  # arg nodes skip annotations; defaults visited
+            for stmt in node.body:
+                self.visit(stmt)
+            # skip node.returns
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, ast.Load) and node.id not in bound:
                 names.add(node.id)
+
+    _Visitor().visit(function_ast)
     return names
 
 
