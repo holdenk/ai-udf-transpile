@@ -199,3 +199,16 @@
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+-----------------------------------------------------------------------
+
+NOTE: Certain user-defined functions (UDFs) included in this project for
+testing, fixtures, and demonstration purposes -- for example those under
+tests/, examples/, and the fake backend fixtures in
+ai_udf_transpile/backends/fake.py -- are derived from real-world UDFs
+contributed by users of this tool. Those UDFs may be covered by their own
+licenses and/or copyrights held by their respective owners, and are
+included here solely for testing and illustration. The Apache License,
+Version 2.0 above applies to the ai-udf-transpile project itself and does
+not necessarily grant rights to those contributed UDFs beyond their
+incidental use within this project's test and example suites.
