@@ -42,6 +42,15 @@ def upper_useragent(useragent: str) -> str:
     return useragent.upper()
 
 
+def contains_ingredient(recipe: str, ingredient: str) -> bool:
+    # The boolean NULL trap: python returns False for a NULL recipe, so the
+    # rewrite must coalesce -- instr(...) > 0 alone returns NULL, which only
+    # "looks gucci" inside WHERE clauses.
+    if recipe is not None:
+        return ingredient in recipe.lower()
+    return False
+
+
 def backwards(name: str) -> str:
     if name is None:
         return None
@@ -164,6 +173,23 @@ def main() -> int:
     print(
         f"upper_useragent (SPARK-21935): transpiled={bool(ua.transpiled)} "
         f"results={[r[0] for r in uas.select(ua('ua')).collect()]}"
+    )
+
+    ci = UserDefinedFunction(contains_ingredient, BooleanType())
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        ci = UserDefinedFunction(contains_ingredient, BooleanType())
+        if ci.transpiled:
+            break
+        time.sleep(1.0)
+    recipes = spark.createDataFrame(
+        [("2 cups flour, 1 tsp salt", "salt"), ("100% whole wheat", "%"), (None, "salt")],
+        ["recipe", "ingredient"],
+    )
+    print(
+        f"contains_ingredient: transpiled={bool(ci.transpiled)} "
+        f"results={[r[0] for r in recipes.select(ci('recipe', 'ingredient')).collect()]} "
+        "(NULL recipe -> False, never NULL)"
     )
 
     print()
@@ -293,6 +319,20 @@ def main() -> int:
         print("BUG: naive to_json was accepted")
     except ValueError as exc:
         print(f"register_impl rejected naive to_json for pymap_to_json (map input): {exc}")
+
+    # The boolean NULL trap: fine inside WHERE (NULL filters like false),
+    # wrong as a selected column.
+    try:
+        register_impl(
+            spark,
+            contains_ingredient,
+            kind="catalyst",
+            catalyst_sql="instr(lower(_udf_param_0), _udf_param_1) > 0",
+            return_type=BooleanType(),
+        )
+        print("BUG: naive instr was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected naive instr for contains_ingredient: {exc}")
 
     print()
     print("=== INPUT-CATEGORY GATE (int/float only vs int/float/string) ===")
