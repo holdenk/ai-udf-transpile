@@ -99,6 +99,15 @@ def BSPIn(prev_lac: str, cur_lac: str, bsp_lacs: list[str], mid_lacs: list[str])
     return 1 if prev_lac in bsp_lacs and cur_lac in mid_lacs else 0
 
 
+def flatlist(groups: list[list[str]]) -> list[str]:
+    # Rewritten from a contributed UDF (`def flatlist(s): fl = [item for
+    # sublist in s for item in sublist]; return fl`, registered via
+    # F.udf(flatlist, ArrayType(StringType()))). flatten() is faithful: it
+    # preserves order, duplicates, and null elements; a null outer or inner
+    # array raises TypeError in python (verify allows any sql result there).
+    return [item for sub in groups for item in sub]
+
+
 def backwards(name: str) -> str:
     if name is None:
         return None
@@ -315,6 +324,32 @@ def main() -> int:
     print(
         f"BSPIn (array<string> inputs): transpiled={bool(bi.transpiled)} "
         f"results={[r[0] for r in lac.select(bi('OLD_LAC', 'NEW_LAC', 'bsp', 'mid')).collect()]}"
+    )
+
+    # First nested array input: array<array<string>> -> array<string>.
+    nested = spark.createDataFrame(
+        [
+            ([["a", "b"], ["c"]],),
+            ([["a", None], ["b"]],),  # null element survives
+            ([["x", "y"], ["x"]],),  # duplicate survives
+        ],
+        "s array<array<string>>",
+    )
+    fl = UserDefinedFunction(flatlist, ArrayType(StringType()))
+    first_rows = [r[0] for r in nested.select(fl("s")).collect()]
+    print(
+        f"flatlist: first call transpiled={bool(fl.transpiled)} results={first_rows} "
+        "(miss -> Python, rows sampled)"
+    )
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        fl = UserDefinedFunction(flatlist, ArrayType(StringType()))
+        if fl.transpiled:
+            break
+        time.sleep(1.0)
+    print(
+        f"flatlist (array<array<string>> input): transpiled={bool(fl.transpiled)} "
+        f"results={[r[0] for r in nested.select(fl('s')).collect()]}"
     )
 
     print()
@@ -572,6 +607,34 @@ def main() -> int:
         print("BUG: swapped-lists BSPIn was accepted")
     except ValueError as exc:
         print(f"register_impl rejected swapped-lists BSPIn (caught by recorded samples): {exc}")
+
+    # flatlist traps. (a) array_distinct drops duplicates -- caught by the
+    # built-in nested example [['x', 'y'], ['x']].
+    try:
+        register_impl(
+            spark,
+            flatlist,
+            kind="catalyst",
+            catalyst_sql="array_distinct(flatten(_udf_param_0))",
+            return_type=ArrayType(StringType()),
+        )
+        print("BUG: array_distinct flatlist was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected array_distinct flatlist (duplicates): {exc}")
+
+    # (b) Filtering out nulls drops elements python passes through (flatten
+    # preserves them) -- caught by the built-in [['a', None], []].
+    try:
+        register_impl(
+            spark,
+            flatlist,
+            kind="catalyst",
+            catalyst_sql="filter(flatten(_udf_param_0), x -> x IS NOT NULL)",
+            return_type=ArrayType(StringType()),
+        )
+        print("BUG: null-filtering flatlist was accepted")
+    except ValueError as exc:
+        print(f"register_impl rejected null-filtering flatlist: {exc}")
 
     print()
     print("=== INPUT-CATEGORY GATE (int/float only vs int/float/string) ===")

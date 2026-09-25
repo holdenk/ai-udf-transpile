@@ -69,6 +69,19 @@ BUILTIN_ARRAY_EXAMPLES: tuple[list, ...] = (
     ["14503", "13403", "11518"],  # LAC-style codes (membership-test UDFs)
 )
 
+# Deterministic lists-of-lists for array<array<string>> params: empties at
+# both levels, a duplicate across inners (kills array_distinct rewrites), a
+# null element (flatten preserves it; explode/collect_list-style rewrites
+# drop it), and LAC-style codes.
+BUILTIN_NESTED_ARRAY_EXAMPLES: tuple[list, ...] = (
+    [],
+    [[]],
+    [["a"]],
+    [["a", "b"], ["c"]],
+    [["x", "y"], ["x"]],
+    [["a", None], []],
+)
+
 # Deterministic maps always tried for map<string,string>-typed params: values
 # that are valid JSON, valid Python literals, both, or neither.
 BUILTIN_MAP_EXAMPLES: tuple[dict, ...] = (
@@ -125,6 +138,39 @@ def _encode(value: Any) -> Any:
     return {"__repr__": repr(value)[:200]}
 
 
+class _Undecodable(Exception):
+    """A sample value we cannot faithfully reconstruct (e.g. __repr__)."""
+
+
+def _decode_value(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    if "__bytes__" in item:
+        try:
+            return bytes.fromhex(item["__bytes__"])
+        except Exception:
+            raise _Undecodable
+    if "__map__" in item:
+        try:
+            return {_decode_value(k): _decode_value(v) for k, v in item["__map__"]}
+        except Exception:
+            raise _Undecodable
+    if "__datetime__" in item:
+        import datetime as _dt
+
+        try:
+            return _dt.datetime.fromisoformat(item["__datetime__"])
+        except Exception:
+            raise _Undecodable
+    if "__array__" in item:
+        # Recurse: array<array<string>> args encode as nested markers.
+        try:
+            return [_decode_value(v) for v in item["__array__"]]
+        except Exception:
+            raise _Undecodable
+    raise _Undecodable  # __repr__ placeholders are not real values
+
+
 def decode_args(text: str) -> Optional[list]:
     try:
         data = json.loads(text)
@@ -132,35 +178,10 @@ def decode_args(text: str) -> Optional[list]:
         return None
     if not isinstance(data, list):
         return None
-    out = []
-    for item in data:
-        if isinstance(item, dict) and "__bytes__" in item:
-            try:
-                out.append(bytes.fromhex(item["__bytes__"]))
-            except Exception:
-                return None
-        elif isinstance(item, dict) and "__map__" in item:
-            try:
-                out.append({k: v for k, v in item["__map__"]})
-            except Exception:
-                return None
-        elif isinstance(item, dict) and "__datetime__" in item:
-            import datetime as _dt
-
-            try:
-                out.append(_dt.datetime.fromisoformat(item["__datetime__"]))
-            except Exception:
-                return None
-        elif isinstance(item, dict) and "__array__" in item:
-            try:
-                out.append([v for v in item["__array__"]])
-            except Exception:
-                return None
-        elif isinstance(item, dict):
-            return None  # __repr__ placeholders are not real values
-        else:
-            out.append(item)
-    return out
+    try:
+        return [_decode_value(item) for item in data]
+    except _Undecodable:
+        return None
 
 
 def record_samples(sqlite_path: str, udf_key: str, samples: list[list]) -> None:
