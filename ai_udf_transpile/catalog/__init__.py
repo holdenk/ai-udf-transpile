@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
 
 from ai_udf_transpile import conf
 from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileJob, TranspileResult
+
+logger = logging.getLogger(__name__)
 
 # lookup() results
 HIT = "hit"
@@ -80,6 +83,9 @@ class CacheRow:
     claimed_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    # Local SQLite staging flag: set once this success row has been appended
+    # to the configured write-back table. Not a shared-table column.
+    written_back_at: Optional[str] = None
 
     def reconstructable(self) -> bool:
         if self.status != "success":
@@ -192,7 +198,22 @@ def open_catalog(spark: Any = None, *, sqlite_path: Optional[str] = None) -> Cat
         path = sqlite_path or conf.get_value(conf.SQLITE_PATH, spark, "")
         if not path:
             raise ValueError("sqlite catalog requires spark.sql.experimental.aiUdfTranspile.sqlitePath")
-        return SqliteCatalog(path)
+        catalog: Catalog = SqliteCatalog(path)
+        table = conf.get_value(conf.WRITEBACK_TABLE, spark, conf.DEFAULTS[conf.WRITEBACK_TABLE]).strip()
+        if table:
+            if spark is None:
+                logger.warning(
+                    "writeback table %s configured but no SparkSession; write-back disabled", table
+                )
+            else:
+                from ai_udf_transpile.catalog.writeback import WritebackCatalog
+
+                fmt = conf.get_value(conf.WRITEBACK_FORMAT, spark, conf.DEFAULTS[conf.WRITEBACK_FORMAT])
+                threshold = conf.get_int(
+                    conf.WRITEBACK_THRESHOLD, spark, int(conf.DEFAULTS[conf.WRITEBACK_THRESHOLD])
+                )
+                catalog = WritebackCatalog(catalog, spark, table, fmt.strip().lower(), threshold)
+        return catalog
     if kind == "delta":
         from ai_udf_transpile.catalog.delta import DeltaCatalog
 

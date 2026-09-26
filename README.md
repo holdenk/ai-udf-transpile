@@ -72,7 +72,15 @@ python -m ai_udf_transpile.worker --sqlite-path /tmp/ai_udf_transpile.sqlite --b
 
 Default catalog is **SQLite** (real `UPDATE` CAS). Optional `catalog=delta`
 requires Delta Lake on the classpath. Vanilla Hive/Parquet tables cannot
-`UPDATE` a row and are not used.
+`UPDATE` a row, so they are never the primary catalog — but a parquet (or
+iceberg) table can be a **write-back target**: set
+`spark.sql.experimental.aiUdfTranspile.writebackTable` (plus optional
+`writebackFormat=parquet|iceberg` and `writebackThreshold`, default 32) and
+verified successes stage in SQLite, then append to the shared table once the
+threshold accumulates. Lookups fall through to the table, so a fresh process
+(new SQLite file) is served verified rewrites without running a backend.
+Write-back is append-only (reads dedupe by latest `updated_at`), carries
+successes only, and is fail-open: a misconfigured table never breaks UDFs.
 
 Failed rewrites cool down for 24h (`failCooldownSeconds`) and stop retrying
 after `maxRetries` (default 3).

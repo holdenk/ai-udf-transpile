@@ -31,6 +31,9 @@ MODEL_CLAUDE = PREFIX + "model.claude"
 INPUT_CATEGORIES = PREFIX + "inputCategories"
 SAMPLING = PREFIX + "sampling"
 MAX_SAMPLES = PREFIX + "maxSamples"
+WRITEBACK_TABLE = PREFIX + "writebackTable"
+WRITEBACK_FORMAT = PREFIX + "writebackFormat"
+WRITEBACK_THRESHOLD = PREFIX + "writebackThreshold"
 
 DEFAULTS: dict[str, str] = {
     CATALOG: "sqlite",
@@ -48,6 +51,12 @@ DEFAULTS: dict[str, str] = {
     INPUT_CATEGORIES: "numeric,string,bool,binary",
     SAMPLING: "true",
     MAX_SAMPLES: "8",
+    # Empty = local SQLite only. When set, verified success rows are appended
+    # to this parquet/iceberg table once writebackThreshold staged rows
+    # accumulate, and lookups fall through to it.
+    WRITEBACK_TABLE: "",
+    WRITEBACK_FORMAT: "parquet",
+    WRITEBACK_THRESHOLD: "32",
 }
 
 # Side channel so tests and the worker thread can read values even if the JVM
