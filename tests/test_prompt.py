@@ -27,3 +27,10 @@ def test_default_prompt_covers_hard_won_rules():
     # Verification notice and side-effect decline guidance.
     assert "differentially tested" in prompt
     assert "boto3" in prompt
+    # Battery-verified lookalike traps: floored modulo, banker's rounding,
+    # regex split, 1-based substr, weekday numbering, casefold, float str.
+    assert "pmod" in prompt and "bround" in prompt
+    assert "split(s, '\\\\.')" in prompt
+    assert "1-based" in prompt and "dayofweek" in prompt
+    assert "casefold" in prompt and "1e+16" in prompt
+    assert "1_000" in prompt and "trim" in prompt

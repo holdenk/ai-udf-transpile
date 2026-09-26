@@ -108,6 +108,39 @@ def flatlist(groups: list[list[str]]) -> list[str]:
     return [item for sub in groups for item in sub]
 
 
+def mod_bucket(value: int, modulus: int) -> int:
+    # Adversarial pack: python `%` floors (result takes the divisor's sign);
+    # Spark `%` truncates toward zero and pmod only matches python for
+    # POSITIVE divisors (7 % -3 == -2 in python, pmod gives 1). The faithful
+    # rewrite is the truncated remainder plus a sign-correction CASE.
+    return value % modulus
+
+
+def round_half(x: float) -> int:
+    # python round is banker's rounding (round(2.5) == 2); Spark round is
+    # half-up. The faithful rewrite is cast(bround(x) as bigint) -- an int
+    # cast overflows on 1e16 where python returns 10000000000000000.
+    return round(x)
+
+
+def weekday_of(t: datetime) -> int:
+    # python weekday(): Monday=0; Spark dayofweek: Sunday=1. Faithful:
+    # pmod(dayofweek(t) + 5, 7).
+    return t.weekday()
+
+
+def split_dot(s: str) -> list[str]:
+    # Spark's split takes a REGEX: split(s, '.') turns 'a.b' into four empty
+    # strings. Faithful: split(s, '\\.') with the dot escaped.
+    return s.split(".")
+
+
+def zfill3(s: str) -> str:
+    # python zfill never truncates and pads after a +/- sign; lpad truncates
+    # ('abcd' -> 'abc') and pads before the sign ('-5' -> '0-5').
+    return s.zfill(3)
+
+
 def backwards(name: str) -> str:
     if name is None:
         return None
@@ -370,6 +403,90 @@ def main() -> int:
     print(
         f"flatlist (array<array<string>> input): transpiled={bool(fl.transpiled)} "
         f"results={[r[0] for r in nested.select(fl('s')).collect()]}"
+    )
+
+    print()
+    print("=== ADVERSARIAL PACK (python/Spark lookalikes, battery-verified rewrites) ===")
+    # Each of these has a tempting naive rewrite that verification REJECTS:
+    #   x % y        -> Spark `%` truncates, python floors (pmod fails for y<0)
+    #   round(x)     -> Spark round is half-up, python is banker's
+    #   t.weekday()  -> dayofweek is Sunday=1, python is Monday=0
+    #   s.split('.') -> Spark split takes a regex; '.' matches everything
+    #   s.zfill(3)   -> lpad truncates and pads before the sign
+    mods = spark.createDataFrame(
+        [(7, 3), (-7, 3), (7, -3), (-7, -3)],
+        "value bigint, modulus bigint",
+    )
+    mb = UserDefinedFunction(mod_bucket, LongType())
+    first_rows = [r[0] for r in mods.select(mb("value", "modulus")).collect()]
+    print(f"mod_bucket: first call transpiled={bool(mb.transpiled)} results={first_rows} (miss -> Python)")
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        mb = UserDefinedFunction(mod_bucket, LongType())
+        if mb.transpiled:
+            break
+        time.sleep(1.0)
+    print(
+        f"mod_bucket (floored modulo): transpiled={bool(mb.transpiled)} "
+        f"results={[r[0] for r in mods.select(mb('value', 'modulus')).collect()]} "
+        "(naive `%` and pmod both rejected)"
+    )
+
+    halves = spark.createDataFrame([(0.5,), (2.5,), (3.5,), (-2.5,), (1e16,)], ["x"])
+    rh = UserDefinedFunction(round_half, LongType())
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        rh = UserDefinedFunction(round_half, LongType())
+        if rh.transpiled:
+            break
+        time.sleep(1.0)
+    print(
+        f"round_half (banker's rounding): transpiled={bool(rh.transpiled)} "
+        f"results={[r[0] for r in halves.select(rh('x')).collect()]} "
+        "(half-up round rejected; bround + bigint cast)"
+    )
+
+    days = spark.createDataFrame(
+        [(datetime.datetime(2026, 9, 21),), (datetime.datetime(2026, 9, 27),)],  # Monday, Sunday
+        ["t"],
+    )
+    wd = UserDefinedFunction(weekday_of, LongType())
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        wd = UserDefinedFunction(weekday_of, LongType())
+        if wd.transpiled:
+            break
+        time.sleep(1.0)
+    print(
+        f"weekday_of (Monday=0): transpiled={bool(wd.transpiled)} "
+        f"results={[r[0] for r in days.select(wd('t')).collect()]} (bare dayofweek rejected)"
+    )
+
+    dots = spark.createDataFrame([("a.b",), ("no.dot.here.really",), ("plain",)], ["s"])
+    sd = UserDefinedFunction(split_dot, ArrayType(StringType()))
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        sd = UserDefinedFunction(split_dot, ArrayType(StringType()))
+        if sd.transpiled:
+            break
+        time.sleep(1.0)
+    print(
+        f"split_dot (regex trap): transpiled={bool(sd.transpiled)} "
+        f"results={[r[0] for r in dots.select(sd('s')).collect()]} "
+        "(unescaped '.' splits into empty strings -- rejected)"
+    )
+
+    zins = spark.createDataFrame([("5",), ("-5",), ("+7",), ("abcd",)], ["s"])
+    zf = UserDefinedFunction(zfill3, StringType())
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        zf = UserDefinedFunction(zfill3, StringType())
+        if zf.transpiled:
+            break
+        time.sleep(1.0)
+    print(
+        f"zfill3 (sign-aware, never truncates): transpiled={bool(zf.transpiled)} "
+        f"results={[r[0] for r in zins.select(zf('s')).collect()]} (bare lpad rejected)"
     )
 
     print()
