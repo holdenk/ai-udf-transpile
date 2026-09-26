@@ -384,6 +384,26 @@ def _java_udf_expr(
     return f"{fname}({args})"
 
 
+_INT_RETURN_RANGES = {
+    "int": (-(2**31), 2**31 - 1),
+    "bigint": (-(2**63), 2**63 - 1),
+}
+
+
+def _representable(value: Any, return_type: str) -> bool:
+    """Whether a python result fits the declared Spark return type.
+
+    A python UDF whose result does not fit its declared return type fails at
+    execution too (e.g. ``round(1e37)`` returns a 38-digit int that no bigint
+    column can hold), so the value is out of contract: the sql side may do
+    anything there, including raise ANSI overflow on the final cast.
+    """
+    rng = _INT_RETURN_RANGES.get(return_type)
+    if rng is not None and isinstance(value, int) and not isinstance(value, bool):
+        return rng[0] <= value <= rng[1]
+    return True
+
+
 def hypothesis_check(
     *,
     source_text: str,
@@ -443,6 +463,11 @@ def hypothesis_check(
             py_value = _SENTINEL_RAISED
         else:
             py_successes[0] += 1
+            if not _representable(py_value, return_type):
+                # Out of contract: executing the python UDF with the declared
+                # return type would fail as well, so the sql side may do
+                # anything (ANSI overflow on cast(bround(1e37) as bigint)).
+                return
         try:
             sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type)
             sql_exc = None
@@ -468,6 +493,8 @@ def hypothesis_check(
         """
         from ai_udf_transpile.sampling import (
             BUILTIN_ARRAY_EXAMPLES,
+            BUILTIN_DOUBLE_EXAMPLES,
+            BUILTIN_INT_EXAMPLES,
             BUILTIN_MAP_EXAMPLES,
             BUILTIN_NESTED_ARRAY_EXAMPLES,
             BUILTIN_STRING_EXAMPLES,
@@ -489,6 +516,12 @@ def hypothesis_check(
             if stype == "string":
                 for text in BUILTIN_STRING_EXAMPLES:
                     examples.append(tuple(text if j == i else None for j in range(arity)))
+            elif stype in {"bigint", "long", "int", "integer", "smallint", "tinyint"}:
+                for n in BUILTIN_INT_EXAMPLES:
+                    examples.append(tuple(n if j == i else None for j in range(arity)))
+            elif stype in {"double", "float"}:
+                for n in BUILTIN_DOUBLE_EXAMPLES:
+                    examples.append(tuple(n if j == i else None for j in range(arity)))
             elif stype.startswith("map<"):
                 for m in BUILTIN_MAP_EXAMPLES:
                     examples.append(tuple(dict(m) if j == i else None for j in range(arity)))
@@ -517,6 +550,10 @@ def hypothesis_check(
                 stype = spark_type.strip().lower()
                 if stype == "string":
                     per_param.append(list(CROSS_STRING_EXAMPLES))
+                elif stype in {"bigint", "long", "int", "integer", "smallint", "tinyint"}:
+                    per_param.append(list(BUILTIN_INT_EXAMPLES))
+                elif stype in {"double", "float"}:
+                    per_param.append(list(BUILTIN_DOUBLE_EXAMPLES))
                 elif stype.startswith("map<"):
                     per_param.append([dict(m) for m in BUILTIN_MAP_EXAMPLES])
                 elif stype.startswith("array<array<"):

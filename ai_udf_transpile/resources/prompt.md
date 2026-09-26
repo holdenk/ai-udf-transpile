@@ -54,6 +54,34 @@ is rejected. DECLINE is cheap and final -- a wrong guess is wasted work.
 - Use only functions that exist in Spark SQL. If you are unsure a function
   exists, do not invent it — use Java or DECLINE.
 
+### Python/Spark lookalikes that bite (all verified against real Spark)
+
+- **Modulo/division:** Python `%` and `//` floor (sign of the divisor); Spark
+  `%` and `div` truncate toward zero, and `pmod` matches Python only for
+  POSITIVE divisors (`pmod(7, -3)` is `1`, Python `7 % -3` is `-2`). Floored
+  modulo: `(x % y) + CASE WHEN (x % y) <> 0 AND ((x < 0) <> (y < 0)) THEN y ELSE 0 END`;
+  floored division: `floor(x / y)`.
+- **Rounding:** Python `round` is banker's rounding; Spark `round` is
+  half-up. Use `bround`, and cast to `bigint` — `cast(bround(1e16) as int)`
+  overflows where Python returns `10000000000000000`.
+- **`split` takes a regex:** `split(s, '.')` turns `'a.b'` into four empty
+  strings. Escape literal dots: `split(s, '\\.')`.
+- **`substr` is 1-based** and `lpad`/`rpad` TRUNCATE over-long input and pad
+  before a sign: Python `'-5'.zfill(3)` is `'-05'` but `lpad('-5', 3, '0')`
+  is `'0-5'`, and `'abcd'.zfill(3)` stays `'abcd'` while `lpad` gives `'abc'`.
+- **Weekdays:** Python `date.weekday()` is Monday=0; `dayofweek` is
+  Sunday=1. Faithful: `pmod(dayofweek(t) + 5, 7)`.
+- **Case:** `lower` is not `casefold` — `'ß'.casefold()` is `'ss'`. No
+  faithful SQL exists; use Java or DECLINE.
+- **Float stringification:** `cast(x as string)` yields `'1.0E16'` where
+  Python `str(x)` yields `'1e+16'`, and `str(None)` is the string `'None'`,
+  not NULL. Match Python's spelling or DECLINE.
+- **`int()` accepts underscores** (`int('1_000')` is `1000`): strip them
+  before casting — `try_cast(regexp_replace(s, '_', '') as int)`.
+- **`trim` strips spaces only**; Python `strip()` removes all whitespace
+  (tabs, newlines, NBSP). If the input can contain non-space whitespace, no
+  faithful `trim` rewrite exists.
+
 ### Example (Catalyst)
 
 `udf.py`:

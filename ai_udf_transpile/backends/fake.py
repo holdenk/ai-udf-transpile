@@ -110,6 +110,34 @@ def flatlist(groups: list[list[str]]) -> list[str]:
     return [item for sub in groups for item in sub]
 
 
+def mod_bucket(value: int, modulus: int) -> int:
+    # python `%` floors (the result takes the divisor's sign); Spark `%`
+    # truncates toward zero, and pmod only matches for positive divisors.
+    return value % modulus
+
+
+def round_half(x: float) -> int:
+    # python round is banker's rounding (round(2.5) == 2, round(3.5) == 4);
+    # Spark round is half-up -- bround is the banker's one.
+    return round(x)
+
+
+def weekday_of(t: datetime) -> int:
+    # python weekday(): Monday=0; Spark dayofweek: Sunday=1.
+    return t.weekday()
+
+
+def split_dot(s: str) -> list[str]:
+    # Spark's split takes a REGEX: an unescaped '.' matches every character.
+    return s.split(".")
+
+
+def zfill3(s: str) -> str:
+    # python zfill never truncates and pads after a +/- sign; lpad truncates
+    # and pads before the sign.
+    return s.zfill(3)
+
+
 def kms_encrypt(text: str, key_id: str) -> str:
     # The canonical untranspilable UDF: an AWS KMS Encrypt call per row.
     # There is no Catalyst equivalent -- the ciphertext comes from the
@@ -213,6 +241,25 @@ FIXTURES: dict[str, TranspileResult] = {
     ),
     # flatten preserves order, duplicates, and null elements -- all verified.
     canonical_source_from_func(flatlist): _result("flatten(_udf_param_0)"),
+    # Adversarial pack: the faithful forms behind python/Spark lookalikes.
+    # Floored modulo: truncated remainder plus a sign correction.
+    canonical_source_from_func(mod_bucket): _result(
+        "(_udf_param_0 % _udf_param_1) + CASE WHEN (_udf_param_0 % _udf_param_1) <> 0 "
+        "AND ((_udf_param_0 < 0) <> (_udf_param_1 < 0)) THEN _udf_param_1 ELSE 0 END"
+    ),
+    # Banker's rounding; bigint so 1e16 does not overflow (int32 would raise).
+    canonical_source_from_func(round_half): _result("cast(bround(_udf_param_0) as bigint)"),
+    # dayofweek Sunday=1 -> python weekday() Monday=0.
+    canonical_source_from_func(weekday_of): _result("pmod(dayofweek(_udf_param_0) + 5, 7)"),
+    # Literal dot, not regex any-char.
+    canonical_source_from_func(split_dot): _result("split(_udf_param_0, '\\\\.')"),
+    # Sign-aware, never truncating.
+    canonical_source_from_func(zfill3): _result(
+        "CASE WHEN length(_udf_param_0) >= 3 THEN _udf_param_0 "
+        "WHEN substr(_udf_param_0, 1, 1) IN ('-', '+') "
+        "THEN concat(substr(_udf_param_0, 1, 1), lpad(substr(_udf_param_0, 2), 2, '0')) "
+        "ELSE lpad(_udf_param_0, 3, '0') END"
+    ),
 }
 
 

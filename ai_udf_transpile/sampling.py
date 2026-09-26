@@ -39,7 +39,19 @@ BUILTIN_STRING_EXAMPLES: tuple[str, ...] = (
     "2015-01-01 00:00:00",  # valid '%Y-%m-%d %H:%M:%S' timestamp
     "é",
     "ß",  # full case mapping (SS): catches ASCII-only upper rewrites
+    "a.b",  # regex metachar: catches unescaped split(s, '.') rewrites
+    "1_000",  # python int() accepts underscores; casts reject them
+    "-5",  # sign: catches lpad-for-zfill rewrites ('0-5' vs '-05')
 )
+
+# Deterministic numerics always tried for numeric-typed params: sign mixes
+# (truncation vs flooring), banker's-rounding halves, and a value that
+# overflows int32 on cast.
+BUILTIN_INT_EXAMPLES: tuple[int, ...] = (0, 1, -1, 7, -7, 3, -3, 2**31 - 1, -(2**31))
+# 1e37: python round(1e37) returns a 38-digit int no bigint column can hold --
+# out of contract for an `-> int` UDF, so verification skips the comparison
+# (a real python UDF execution would fail to fit the value into LongType too).
+BUILTIN_DOUBLE_EXAMPLES: tuple[float, ...] = (0.0, 1.0, -1.0, 0.5, 2.5, -2.5, 3.5, 1e16, 1e37)
 
 # Small subset cross-combined across params for multi-param UDFs: the built-ins
 # above vary one param at a time (others NULL), so a pair like (valid
