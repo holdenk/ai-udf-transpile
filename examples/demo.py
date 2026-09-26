@@ -821,6 +821,59 @@ def main() -> int:
         f"catalog rows {before} -> {catalog.count()} (queued for the backend)"
     )
 
+    print()
+    print("=== WRITE-BACK TO A SHARED PARQUET TABLE (staged SQLite -> parquet, hybrid reads) ===")
+    # With writebackTable configured, verified successes stage in local SQLite
+    # and are appended to the shared table once writebackThreshold of them
+    # accumulate; lookups fall through to the table, so a fresh process (new
+    # SQLite file) gets verified rewrites at first definition -- no backend run.
+    shutdown()
+    wb_table = "default.ai_udf_demo_writeback"
+    spark.sql(f"DROP TABLE IF EXISTS {wb_table}")
+    conf.set_value(conf.WRITEBACK_TABLE, wb_table)
+    conf.set_value(conf.WRITEBACK_THRESHOLD, "2")
+    enable(
+        spark,
+        sqlite_path=os.path.join(tempfile.mkdtemp(prefix="ai-udf-demo-wb-"), "cache.sqlite"),
+        backend="fake",
+        inline_worker=True,
+    )
+    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    wb_df = spark.createDataFrame([(1,), (2,)], ["x"])
+    for func in (plus_one, is_none_branch):
+        u = UserDefinedFunction(func, LongType())
+        deadline = time.time() + 120
+        while time.time() < deadline and not u.transpiled:
+            time.sleep(1.0)
+            u = UserDefinedFunction(func, LongType())
+        print(
+            f"{func.__name__}: transpiled={bool(u.transpiled)} "
+            f"results={[r[0] for r in wb_df.select(u('x')).collect()]}"
+        )
+    n = 0
+    deadline = time.time() + 60
+    while time.time() < deadline and n < 2:  # the flush runs on the worker thread
+        n = spark.sql(f"SELECT COUNT(*) FROM {wb_table}").collect()[0][0]
+        time.sleep(1.0)
+    print(f"shared table {wb_table}: {n} verified rows (flushed after 2 staged successes)")
+
+    # Fresh-process view: brand-new SQLite file, same shared table.
+    shutdown()
+    conf.set_value(conf.WRITEBACK_TABLE, wb_table)
+    enable(
+        spark,
+        sqlite_path=os.path.join(tempfile.mkdtemp(prefix="ai-udf-demo-wb-reader-"), "cache.sqlite"),
+        backend="fake",
+        inline_worker=True,
+    )
+    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    u = UserDefinedFunction(plus_one, LongType())
+    print(
+        f"plus_one on a fresh catalog: transpiled={bool(u.transpiled)} at FIRST definition "
+        f"(served from the shared table) results={[r[0] for r in wb_df.select(u('x')).collect()]}"
+    )
+    spark.sql(f"DROP TABLE IF EXISTS {wb_table}")
+
     shutdown()
     spark.stop()
     return 0

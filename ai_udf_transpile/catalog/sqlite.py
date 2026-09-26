@@ -92,6 +92,7 @@ def _row_from_sql(raw: sqlite3.Row) -> CacheRow:
         claimed_at=raw["claimed_at"],
         created_at=raw["created_at"],
         updated_at=raw["updated_at"],
+        written_back_at=raw["written_back_at"] if "written_back_at" in keys else None,
     )
 
 
@@ -115,6 +116,8 @@ class SqliteCatalog:
             cols = {row[1] for row in self._conn.execute("PRAGMA table_info(cache)")}
             if "model" not in cols:
                 self._conn.execute("ALTER TABLE cache ADD COLUMN model TEXT")
+            if "written_back_at" not in cols:
+                self._conn.execute("ALTER TABLE cache ADD COLUMN written_back_at TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -407,6 +410,24 @@ class SqliteCatalog:
         with self._lock:
             cur = self._conn.execute("SELECT COUNT(*) FROM cache")
             return int(cur.fetchone()[0])
+
+    def staged_successes(self) -> list[CacheRow]:
+        """Verified rows not yet appended to the write-back table (if any)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM cache WHERE status = 'success' AND written_back_at IS NULL"
+            )
+            return [_row_from_sql(raw) for raw in cur.fetchall()]
+
+    def mark_written_back(self, udf_keys: list[str]) -> None:
+        if not udf_keys:
+            return
+        now = iso_now()
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE cache SET written_back_at = ? WHERE udf_key = ?",
+                [(now, key) for key in udf_keys],
+            )
 
     def record_samples(self, udf_key: str, samples: list[list]) -> None:
         from ai_udf_transpile.sampling import record_samples
