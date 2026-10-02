@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai_udf_transpile import enable, shutdown
+from ai_udf_transpile import conf, enable, shutdown
 from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.backends.fake import FakeBackend, always_decline, plus_one
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog
@@ -31,6 +31,28 @@ def test_process_row_fake_success(tmp_path):
     assert row.status == "success"
     assert row.catalyst_sql == "_udf_param_0 + 1"
     assert row.origin == "fake"
+
+
+def test_process_row_records_the_tolerance_it_checked(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    src = canonical_source_from_func(plus_one)
+    cat.insert_pending(
+        udf_key="k",
+        source_text=src,
+        param_names=["x"],
+        input_types=["bigint"],
+        input_categories=["numeric"],
+        return_type="bigint",
+        spark_version="test",
+        closure_fingerprint="",
+        captures={},
+    )
+    assert cat.claim("k", "fake")
+    conf.set_value(conf.TOLERANCE, "0.01")
+    process_row(cat, cat.get("k"), FakeBackend(), spark=None, verify_fn=lambda **k: (True, None))
+    row = cat.get("k")
+    assert row.status == "success"
+    assert row.tolerance == 0.01
 
 
 def test_process_row_fake_decline_marks_failed(tmp_path):

@@ -17,10 +17,15 @@ from typing import Any, Callable, Optional
 from ai_udf_transpile import conf
 from ai_udf_transpile.backends import get_backend
 from ai_udf_transpile.backends.base import BackendDecline
-from ai_udf_transpile.catalog import Catalog, open_catalog
+from ai_udf_transpile.catalog import Catalog, configured_tolerance, open_catalog, publish_verified
 from ai_udf_transpile.sandbox import make_sandbox
 from ai_udf_transpile.targets import TranspileResult
-from ai_udf_transpile.verify import hypothesis_check, smoke_test_reconstruction
+from ai_udf_transpile.verify import (
+    hypothesis_check,
+    rejected_rewrite,
+    smoke_test_reconstruction,
+    sql_reconstruction_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +86,11 @@ def process_row(
             with make_sandbox(job) as sandbox:
                 result = backend.run(job, sandbox)
         model = result.model
+        rejected = rejected_rewrite(result)
+        if rejected:
+            catalog.mark_failed(key, rejected, origin=origin, model=model or _reported_model(backend))
+            logger.info("transpile rejected key=%s: %s", key[:12], rejected)
+            return
         if result.kind == "java_udf" and result.java_source and not result.binary and spark is not None:
             from ai_udf_transpile.javac import compile_java
 
@@ -88,6 +98,7 @@ def process_row(
             result.binary = compiled.jar_bytes
             result.class_name = compiled.class_name
         max_examples = conf.get_int(conf.MAX_EXAMPLES, spark, int(conf.default_max_examples()))
+        tolerance = configured_tolerance(spark)
         samples: list = []
         try:
             samples = catalog.samples_for(key)
@@ -102,14 +113,23 @@ def process_row(
             spark=spark,
             max_examples=max_examples,
             samples=samples,
+            tolerance=tolerance,
         )
         if ok:
-            catalog.mark_success(key, result, origin, hypothesis_passed=True)
-            # Value-equivalence is not enough: the rewrite must also survive
-            # the real TranspiledPythonUDF reconstruction path (e.g. param
-            # refs inside higher-order function lambdas do not get
-            # substituted and would take the user's query down at analysis).
-            smoke_err = smoke_test_reconstruction(
+            # Provisional until the smoke test passes, so a concurrent query
+            # does not pick up a rewrite that fails plan analysis.
+            catalog.mark_success(
+                key, result, origin, hypothesis_passed=True, visible=False, tolerance=tolerance
+            )
+            # The reconstruction hook reads the process-global catalog/session.
+            # The standalone worker does not go through enable(), so pin both
+            # or the smoke test no-ops and a bad rewrite is promoted.
+            from ai_udf_transpile.transpiler import set_catalog, set_session
+
+            set_catalog(catalog)
+            if spark is not None:
+                set_session(spark)
+            smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
                 spark,
                 source_text=row.source_text,
                 captures=row.captures,
@@ -120,6 +140,8 @@ def process_row(
                 catalog.mark_failed(key, smoke_err, origin=origin, model=model)
                 logger.info("transpile failed (reconstruction) key=%s: %s", key[:12], smoke_err)
                 return
+            catalog.promote_success(key)
+            publish_verified(catalog, key)
             logger.info(
                 "transpile success key=%s origin=%s model=%s kind=%s",
                 key[:12],

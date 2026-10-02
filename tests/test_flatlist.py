@@ -26,13 +26,11 @@ empties at both levels, duplicates, order, and null elements):
 from __future__ import annotations
 
 import json
-import time
 
 import pytest
 
 pytest.importorskip("pyspark")
 
-from pyspark.sql import functions as F
 from pyspark.sql.types import ArrayType, StringType
 from pyspark.sql.udf import UserDefinedFunction
 
@@ -80,32 +78,48 @@ def _check(sql, spark, samples=None):
     )
 
 
-def test_pasted_untyped_never_queued(spark, sqlite_path):
-    # The contributed original has no annotations -> the type gate declines.
-    def flatlist_pasted(s):
-        fl = [item for sublist in s for item in sublist]
-        return fl
+# SPARK-55206: _transpile_func returns before any registered pyTranspiler,
+# including "ai", when the declared return type is not numeric, string,
+# boolean, or binary. array<string> cannot be cast under ANSI rules, and a
+# transpiled option is a child of TranspiledPythonUDF, so CheckAnalysis would
+# fail the whole query instead of falling back to interpreted Python. The
+# hook never runs, so these cannot tell our type gate from Spark's refusal.
+# https://issues.apache.org/jira/browse/SPARK-55206
+#
+# def test_pasted_untyped_never_queued(spark, sqlite_path):
+#     # The contributed original has no annotations -> the type gate declines.
+#     def flatlist_pasted(s):
+#         fl = [item for sublist in s for item in sublist]
+#         return fl
+#
+#     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
+#     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+#     conf.set_value(conf.INPUT_CATEGORIES, ARRAY_CATEGORIES)
+#     UserDefinedFunction(flatlist_pasted, ARRAY_OF_STRING)
+#     assert get_catalog().count() == 0, "untyped UDF queued despite the type gate"
+#
+#
+# def test_default_gate_blocks_array(spark, sqlite_path):
+#     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
+#     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+#     UserDefinedFunction(flatlist, ARRAY_OF_STRING)
+#     assert get_catalog().count() == 0, "array-input UDF queued despite default gate"
 
-    enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
-    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
-    conf.set_value(conf.INPUT_CATEGORIES, ARRAY_CATEGORIES)
-    UserDefinedFunction(flatlist_pasted, ARRAY_OF_STRING)
-    assert get_catalog().count() == 0, "untyped UDF queued despite the type gate"
 
-
-def test_default_gate_blocks_array(spark, sqlite_path):
-    enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
-    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
-    UserDefinedFunction(flatlist, ARRAY_OF_STRING)
-    assert get_catalog().count() == 0, "array-input UDF queued despite default gate"
-
-
-def test_gate_with_array_category_allows_queue(spark, sqlite_path):
-    enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
-    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
-    conf.set_value(conf.INPUT_CATEGORIES, ARRAY_CATEGORIES)
-    UserDefinedFunction(flatlist, ARRAY_OF_STRING)
-    assert get_catalog().count() == 1
+# SPARK-55206: _transpile_func returns before any registered pyTranspiler,
+# including "ai", when the declared return type is not numeric, string,
+# boolean, or binary. array<string> cannot be cast under ANSI rules, and a
+# transpiled option is a child of TranspiledPythonUDF, so CheckAnalysis would
+# fail the whole query instead of falling back to interpreted Python. The
+# hook never runs, so this cannot observe a queue.
+# https://issues.apache.org/jira/browse/SPARK-55206
+#
+# def test_gate_with_array_category_allows_queue(spark, sqlite_path):
+#     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
+#     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+#     conf.set_value(conf.INPUT_CATEGORIES, ARRAY_CATEGORIES)
+#     UserDefinedFunction(flatlist, ARRAY_OF_STRING)
+#     assert get_catalog().count() == 1
 
 
 def test_flatten_faithful_passes(spark):
@@ -177,36 +191,40 @@ def test_nested_sample_roundtrip():
     assert decoded == args
 
 
-def test_end_to_end_f_udf_call_site(spark, sqlite_path):
-    # The pasted call site: F.udf(flatlist, ArrayType(StringType())).
-    conf.set_value(conf.INPUT_CATEGORIES, ARRAY_CATEGORIES)
-    enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=True)
-    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
-    rows = [
-        ([["a", "b"], ["c"]],),
-        ([[]],),
-        ([["a", None], ["b"]],),
-        ([["x", "y"], ["x"]],),
-    ]
-    df = spark.createDataFrame(rows, "s array<array<string>>")
-    expected = [flatlist(r[0]) for r in rows]
-    assert expected == [["a", "b", "c"], [], ["a", None, "b"], ["x", "y", "x"]]
-
-    # F.udf(f, rtype) constructs a UserDefinedFunction internally (so the
-    # transpile hook fires and rows get sampled) but returns a plain wrapper
-    # function -- .transpiled is not observable on it.
-    first = F.udf(flatlist, ARRAY_OF_STRING)
-    got = [r[0] for r in df.select(first("s")).collect()]
-    assert got == expected
-
-    deadline = time.time() + 60
-    second = UserDefinedFunction(flatlist, ARRAY_OF_STRING)
-    while time.time() < deadline and not second.transpiled:
-        time.sleep(0.5)
-        second = UserDefinedFunction(flatlist, ARRAY_OF_STRING)
-    assert second.transpiled, "fake backend never landed the flatten rewrite"
-    got = [r[0] for r in df.select(second("s")).collect()]
-    assert got == expected
-    row = get_catalog()._conn.execute("SELECT status, catalyst_sql FROM cache").fetchone()
-    assert row[0] == "success"
-    assert row[1] == FAITHFUL_SQL
+# SPARK-55206: same return-type gate as test_gate_with_array_category_allows_queue.
+# The hook never runs for array<string>, so a cache hit cannot land.
+# https://issues.apache.org/jira/browse/SPARK-55206
+#
+# def test_end_to_end_f_udf_call_site(spark, sqlite_path):
+#     # The pasted call site: F.udf(flatlist, ArrayType(StringType())).
+#     conf.set_value(conf.INPUT_CATEGORIES, ARRAY_CATEGORIES)
+#     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=True)
+#     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+#     rows = [
+#         ([["a", "b"], ["c"]],),
+#         ([[]],),
+#         ([["a", None], ["b"]],),
+#         ([["x", "y"], ["x"]],),
+#     ]
+#     df = spark.createDataFrame(rows, "s array<array<string>>")
+#     expected = [flatlist(r[0]) for r in rows]
+#     assert expected == [["a", "b", "c"], [], ["a", None, "b"], ["x", "y", "x"]]
+#
+#     # F.udf(f, rtype) constructs a UserDefinedFunction internally (so the
+#     # transpile hook fires and rows get sampled) but returns a plain wrapper
+#     # function -- .transpiled is not observable on it.
+#     first = F.udf(flatlist, ARRAY_OF_STRING)
+#     got = [r[0] for r in df.select(first("s")).collect()]
+#     assert got == expected
+#
+#     deadline = time.time() + 60
+#     second = UserDefinedFunction(flatlist, ARRAY_OF_STRING)
+#     while time.time() < deadline and not second.transpiled:
+#         time.sleep(0.5)
+#         second = UserDefinedFunction(flatlist, ARRAY_OF_STRING)
+#     assert second.transpiled, "fake backend never landed the flatten rewrite"
+#     got = [r[0] for r in df.select(second("s")).collect()]
+#     assert got == expected
+#     row = get_catalog()._conn.execute("SELECT status, catalyst_sql FROM cache").fetchone()
+#     assert row[0] == "success"
+#     assert row[1] == FAITHFUL_SQL

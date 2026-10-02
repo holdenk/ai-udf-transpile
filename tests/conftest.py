@@ -36,11 +36,33 @@ def _bootstrap_spark_home() -> None:
 _bootstrap_spark_home()
 
 
+def _clear_session_writeback_conf() -> None:
+    """The SparkSession is process-wide. A write-back conf set by one test
+    would otherwise make the next test's enable() open a WritebackCatalog.
+    """
+    try:
+        from pyspark.sql import SparkSession
+    except Exception:
+        return
+    spark = SparkSession.getActiveSession()
+    if spark is None:
+        return
+    from ai_udf_transpile import conf
+
+    for key in (conf.WRITEBACK_TABLE, conf.WRITEBACK_FORMAT, conf.WRITEBACK_THRESHOLD):
+        try:
+            spark.conf.unset(key)
+        except Exception:
+            pass
+
+
 @pytest.fixture(autouse=True)
 def _reset_transpile_state():
     shutdown()
+    _clear_session_writeback_conf()
     yield
     shutdown()
+    _clear_session_writeback_conf()
 
 
 @pytest.fixture

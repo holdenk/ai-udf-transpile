@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
@@ -18,6 +20,32 @@ logger = logging.getLogger(__name__)
 HIT = "hit"
 WAIT = "wait"
 MISS = "miss"
+
+# A row is 'provisional' while reconstruction is still being checked. Lookup
+# serves it only on the thread that asked to see it, so a bad rewrite cannot
+# take down a query running on another thread during that check.
+_provisional = threading.local()
+
+
+def provisional_visible() -> bool:
+    return bool(getattr(_provisional, "on", False))
+
+
+@contextmanager
+def expose_provisional():
+    previous = provisional_visible()
+    _provisional.on = True
+    try:
+        yield
+    finally:
+        _provisional.on = previous
+
+
+def publish_verified(catalog: Any, udf_key: str) -> None:
+    """Append a fully checked success to the write-back table, if this catalog has one."""
+    note = getattr(catalog, "note_verified", None)
+    if callable(note):
+        note(udf_key)
 
 
 def utc_now() -> datetime:
@@ -78,6 +106,9 @@ class CacheRow:
     model: Optional[str] = None
     error: Optional[str] = None
     hypothesis_passed: Optional[bool] = None
+    # Absolute numeric tolerance the rewrite was checked at. None means the
+    # row predates the column and was checked exactly (tolerance 0).
+    tolerance: Optional[float] = None
     attempt_count: int = 0
     failed_at: Optional[str] = None
     claimed_at: Optional[str] = None
@@ -138,7 +169,11 @@ class Catalog(Protocol):
         origin: str,
         *,
         hypothesis_passed: bool = True,
+        visible: bool = True,
+        tolerance: Optional[float] = None,
     ) -> None: ...
+
+    def promote_success(self, udf_key: str) -> None: ...
 
     def mark_failed(
         self,
@@ -164,6 +199,8 @@ class Catalog(Protocol):
         result: TranspileResult,
         origin: str,
         hypothesis_passed: Optional[bool],
+        visible: bool = True,
+        tolerance: Optional[float] = None,
     ) -> None: ...
 
     def reclaim_stale(self, timeout_seconds: int, max_retries: int) -> int: ...
@@ -175,6 +212,30 @@ class Catalog(Protocol):
     def record_samples(self, udf_key: str, samples: list[list]) -> None: ...
 
     def samples_for(self, udf_key: str, limit: int = 32) -> list[list]: ...
+
+
+def configured_tolerance(spark: Any = None) -> float:
+    """Session absolute tolerance. Negative or non-numeric values count as 0."""
+    try:
+        value = conf.get_float(conf.TOLERANCE, spark, float(conf.DEFAULTS[conf.TOLERANCE]))
+    except (TypeError, ValueError):
+        return 0.0
+    if value < 0 or value != value:
+        return 0.0
+    return value
+
+
+def tolerance_serves(tested: Optional[float], spark: Any = None) -> bool:
+    """Whether a rewrite checked at ``tested`` is tight enough for this session.
+
+    Smaller is stricter. A cached rewrite is served only when it was tested at
+    a tolerance less than or equal to the configured one; a looser check is
+    not reused. Missing ``tested`` is 0, the exact checks from before the column.
+    """
+    allowed = configured_tolerance(spark)
+    if tested is None:
+        tested = 0.0
+    return tested <= allowed
 
 
 def cooldown_active(row: CacheRow, spark: Any = None) -> bool:

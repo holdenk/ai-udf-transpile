@@ -64,6 +64,25 @@ def test_python_raise_sql_null_is_allowed(spark):
     assert ok, err
 
 
+def test_tolerance_accepts_a_small_numeric_gap(spark):
+    src = "def ident(x: float) -> float:\n    return x\n"
+    near = _sql("_udf_param_0 + 1e-8")
+    ok, err = _check(src, near, ["double"], "double", spark, max_examples=3)
+    assert not ok
+    assert "mismatch" in (err or "")
+    ok, err = hypothesis_check(
+        source_text=src,
+        captures={},
+        result=near,
+        input_types=["double"],
+        return_type="double",
+        spark=spark,
+        max_examples=3,
+        tolerance=1e-6,
+    )
+    assert ok, err
+
+
 def test_wrong_sql_rejected(spark):
     ok, err = _check(PLUS_ONE, _sql("_udf_param_0 + 2"), ["bigint"], "bigint", spark)
     assert not ok

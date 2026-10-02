@@ -28,7 +28,7 @@ def _table() -> str:
     return f"default.wb_{uuid.uuid4().hex[:12]}"
 
 
-def _success(catalog, name: str, sql: str = "_udf_param_0 + 1") -> str:
+def _success(catalog, name: str, sql: str = "_udf_param_0 + 1", *, verified: bool = True) -> str:
     src = canonical_source_text(f"def {name}(x: int) -> int:\n    return x + 1")
     key = udf_key(src, ["x"], ["bigint"], "bigint", "4.1.0", "fp")
     catalog.upsert_success(
@@ -45,6 +45,8 @@ def _success(catalog, name: str, sql: str = "_udf_param_0 + 1") -> str:
         origin="human",
         hypothesis_passed=True,
     )
+    if verified:
+        catalog.note_verified(key)
     return key
 
 
@@ -194,6 +196,91 @@ def test_open_catalog_without_spark_warns_but_works(sqlite_path, caplog):
     catalog = open_catalog(None, sqlite_path=sqlite_path)
     assert isinstance(catalog, SqliteCatalog)
     assert "write-back disabled" in caplog.text
+
+
+def test_unverified_success_is_not_published(spark, sqlite_path, table):
+    catalog = _enable_wb(spark, sqlite_path, table, threshold="1")
+    key = _success(catalog, "wb_hold", verified=False)
+    assert _remote_count(spark, table) == 0
+    assert catalog._staging.staged_successes() == []
+    kind, row = catalog.lookup(key, spark=spark)
+    assert kind == HIT  # local success is still served
+    assert row.catalyst_sql == "_udf_param_0 + 1"
+    catalog.note_verified(key)
+    assert _remote_count(spark, table) == 1
+
+
+def test_reconstruction_failure_is_not_published(spark, sqlite_path, table, monkeypatch):
+    from ai_udf_transpile.backends.fake import FakeBackend, plus_one
+    from ai_udf_transpile.keys import canonical_source_from_func
+    from ai_udf_transpile.worker import process_row
+
+    monkeypatch.setattr(
+        "ai_udf_transpile.worker.smoke_test_reconstruction",
+        lambda *args, **kwargs: "verified rewrite fails plan analysis",
+    )
+    catalog = _enable_wb(spark, sqlite_path, table, threshold="1")
+    key = "k-smoke"
+    catalog.insert_pending(
+        udf_key=key,
+        source_text=canonical_source_from_func(plus_one),
+        param_names=["x"],
+        input_types=["bigint"],
+        input_categories=["numeric"],
+        return_type="bigint",
+        spark_version="test",
+        closure_fingerprint="",
+        captures={},
+    )
+    assert catalog.claim(key, "fake")
+    process_row(
+        catalog,
+        catalog.get(key),
+        FakeBackend(),
+        spark=spark,
+        verify_fn=lambda **kwargs: (True, None),
+    )
+    row = catalog.get(key)
+    assert row is not None and row.status == "failed"
+    assert "plan analysis" in (row.error or "")
+    assert _remote_count(spark, table) == 0
+    kind, _ = catalog.lookup(key, spark=spark)
+    assert kind != HIT
+
+
+def test_verified_worker_row_is_published(spark, sqlite_path, table, monkeypatch):
+    from ai_udf_transpile.backends.fake import FakeBackend, plus_one
+    from ai_udf_transpile.keys import canonical_source_from_func
+    from ai_udf_transpile.worker import process_row
+
+    monkeypatch.setattr(
+        "ai_udf_transpile.worker.smoke_test_reconstruction",
+        lambda *args, **kwargs: None,
+    )
+    catalog = _enable_wb(spark, sqlite_path, table, threshold="1")
+    key = "k-ok"
+    catalog.insert_pending(
+        udf_key=key,
+        source_text=canonical_source_from_func(plus_one),
+        param_names=["x"],
+        input_types=["bigint"],
+        input_categories=["numeric"],
+        return_type="bigint",
+        spark_version="test",
+        closure_fingerprint="",
+        captures={},
+    )
+    assert catalog.claim(key, "fake")
+    process_row(
+        catalog,
+        catalog.get(key),
+        FakeBackend(),
+        spark=spark,
+        verify_fn=lambda **kwargs: (True, None),
+    )
+    row = catalog.get(key)
+    assert row is not None and row.status == "success"
+    assert _remote_count(spark, table) == 1
 
 
 def test_miss_stays_miss(spark, sqlite_path, table):

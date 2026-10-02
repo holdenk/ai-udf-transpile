@@ -19,6 +19,7 @@ import io
 import logging
 import os
 import re
+import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -72,32 +73,35 @@ def _compile_jdk(spark: Any, java_source: str, class_name: str) -> bytes:
         raise JavaCompileError("no system Java compiler (driver is not a JDK)")
     pkg, _, simple = class_name.rpartition(".")
     tmpdir = tempfile.mkdtemp(prefix="ai_udf_javac_")
-    src_dir = os.path.join(tmpdir, "src", *pkg.split(".")) if pkg else os.path.join(tmpdir, "src")
-    out_dir = os.path.join(tmpdir, "classes")
-    os.makedirs(src_dir)
-    os.makedirs(out_dir)
-    src_file = os.path.join(src_dir, f"{simple}.java")
-    with open(src_file, "w", encoding="utf-8") as handle:
-        handle.write(java_source)
-    file_manager = compiler.getStandardFileManager(None, None, None)
-    units = file_manager.getJavaFileObjectsFromStrings(jvm.java.util.Collections.singletonList(src_file))
-    classpath = jvm.java.lang.System.getProperty("java.class.path")
-    options = jvm.java.util.ArrayList()
-    for opt in ("-classpath", classpath, "-d", out_dir, "-proc:none"):
-        options.add(opt)
-    ok = bool(compiler.getTask(None, file_manager, None, options, None, units).call())
-    if not ok:
-        raise JavaCompileError(f"javac failed for {class_name}")
-    entries: dict[str, bytes] = {}
-    for root, _dirs, files in os.walk(out_dir):
-        for name in files:
-            full = os.path.join(root, name)
-            arc = os.path.relpath(full, out_dir).replace(os.sep, "/")
-            with open(full, "rb") as handle:
-                entries[arc] = handle.read()
-    if not entries:
-        raise JavaCompileError(f"javac produced no classes for {class_name}")
-    return _jar_entries(entries)
+    try:
+        src_dir = os.path.join(tmpdir, "src", *pkg.split(".")) if pkg else os.path.join(tmpdir, "src")
+        out_dir = os.path.join(tmpdir, "classes")
+        os.makedirs(src_dir)
+        os.makedirs(out_dir)
+        src_file = os.path.join(src_dir, f"{simple}.java")
+        with open(src_file, "w", encoding="utf-8") as handle:
+            handle.write(java_source)
+        file_manager = compiler.getStandardFileManager(None, None, None)
+        units = file_manager.getJavaFileObjectsFromStrings(jvm.java.util.Collections.singletonList(src_file))
+        classpath = jvm.java.lang.System.getProperty("java.class.path")
+        options = jvm.java.util.ArrayList()
+        for opt in ("-classpath", classpath, "-d", out_dir, "-proc:none"):
+            options.add(opt)
+        ok = bool(compiler.getTask(None, file_manager, None, options, None, units).call())
+        if not ok:
+            raise JavaCompileError(f"javac failed for {class_name}")
+        entries: dict[str, bytes] = {}
+        for root, _dirs, files in os.walk(out_dir):
+            for name in files:
+                full = os.path.join(root, name)
+                arc = os.path.relpath(full, out_dir).replace(os.sep, "/")
+                with open(full, "rb") as handle:
+                    entries[arc] = handle.read()
+        if not entries:
+            raise JavaCompileError(f"javac produced no classes for {class_name}")
+        return _jar_entries(entries)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _compile_janino(spark: Any, java_source: str) -> bytes:

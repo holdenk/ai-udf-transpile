@@ -16,7 +16,9 @@ from ai_udf_transpile.catalog import (
     iso_now,
     loads_dict,
     loads_list,
+    provisional_visible,
     retries_exhausted,
+    tolerance_serves,
 )
 from ai_udf_transpile.targets import TranspileResult
 
@@ -43,6 +45,15 @@ def _sql_str(value: Optional[str]) -> str:
     if value is None:
         return "NULL"
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _sql_float(value: Optional[float]) -> str:
+    if value is None:
+        return "NULL"
+    number = float(value)
+    if number != number:
+        return "NULL"
+    return repr(number)
 
 
 def _sql_blob_hex(data: Optional[bytes]) -> str:
@@ -79,6 +90,7 @@ def _row_from_spark(rec: Any) -> CacheRow:
         model=as_dict.get("model"),
         error=as_dict.get("error"),
         hypothesis_passed=None if hyp is None else bool(hyp),
+        tolerance=None if as_dict.get("tolerance") is None else float(as_dict["tolerance"]),
         attempt_count=int(as_dict.get("attempt_count") or 0),
         failed_at=as_dict.get("failed_at"),
         claimed_at=as_dict.get("claimed_at"),
@@ -119,6 +131,7 @@ class DeltaCatalog:
                 model STRING,
                 error STRING,
                 hypothesis_passed BOOLEAN,
+                tolerance DOUBLE,
                 attempt_count INT,
                 failed_at STRING,
                 claimed_at STRING,
@@ -137,6 +150,8 @@ class DeltaCatalog:
             return
         if "model" not in cols:
             self.spark.sql(f"ALTER TABLE {self.table} ADD COLUMNS (model STRING)")
+        if "tolerance" not in cols:
+            self.spark.sql(f"ALTER TABLE {self.table} ADD COLUMNS (tolerance DOUBLE)")
 
     def _select(self, udf_key: str) -> Optional[CacheRow]:
         rows = self.spark.sql(
@@ -153,8 +168,23 @@ class DeltaCatalog:
         row = self._select(udf_key)
         if row is None:
             return MISS, None
+        if row.status == "provisional":
+            if provisional_visible():
+                return HIT, row
+            return WAIT, row
         if row.reconstructable():
-            return HIT, row
+            session = spark if spark is not None else self.spark
+            if tolerance_serves(row.tolerance, session):
+                return HIT, row
+            now = iso_now()
+            self.spark.sql(
+                f"""
+                UPDATE {self.table}
+                SET status = 'pending', error = NULL, updated_at = {_sql_str(now)}
+                WHERE udf_key = {_sql_str(udf_key)} AND status = 'success'
+                """
+            )
+            return WAIT, self._select(udf_key)
         if row.status in {"pending", "running"}:
             return WAIT, row
         if row.status == "failed":
@@ -238,12 +268,16 @@ class DeltaCatalog:
         origin: str,
         *,
         hypothesis_passed: bool = True,
+        visible: bool = True,
+        tolerance: Optional[float] = None,
     ) -> None:
         now = iso_now()
+        status = "success" if visible else "provisional"
+        claimed = "NULL" if visible else _sql_str(now)
         self.spark.sql(
             f"""
             UPDATE {self.table} SET
-                status = 'success',
+                status = {_sql_str(status)},
                 target_kind = {_sql_str(result.kind)},
                 catalyst_sql = {_sql_str(result.sql)},
                 impl_source = {_sql_str(result.java_source)},
@@ -253,11 +287,22 @@ class DeltaCatalog:
                 origin = {_sql_str(origin)},
                 model = {_sql_str(result.model)},
                 hypothesis_passed = {str(bool(hypothesis_passed)).upper()},
+                tolerance = {_sql_float(tolerance)},
                 error = NULL,
                 failed_at = NULL,
-                claimed_at = NULL,
+                claimed_at = {claimed},
                 updated_at = {_sql_str(now)}
             WHERE udf_key = {_sql_str(udf_key)}
+            """
+        )
+
+    def promote_success(self, udf_key: str) -> None:
+        now = iso_now()
+        self.spark.sql(
+            f"""
+            UPDATE {self.table}
+            SET status = 'success', claimed_at = NULL, updated_at = {_sql_str(now)}
+            WHERE udf_key = {_sql_str(udf_key)} AND status = 'provisional'
             """
         )
 
@@ -300,11 +345,15 @@ class DeltaCatalog:
         result: TranspileResult,
         origin: str,
         hypothesis_passed: Optional[bool],
+        visible: bool = True,
+        tolerance: Optional[float] = None,
     ) -> None:
         if not return_type or not input_types:
             raise ValueError("upsert_success requires known types")
         now = iso_now()
         hyp = "NULL" if hypothesis_passed is None else str(bool(hypothesis_passed)).upper()
+        status = "success" if visible else "provisional"
+        claimed = "NULL" if visible else _sql_str(now)
         self.spark.sql(
             f"""
             MERGE INTO {self.table} t
@@ -319,7 +368,7 @@ class DeltaCatalog:
                 spark_version = {_sql_str(spark_version)},
                 closure_fingerprint = {_sql_str(closure_fingerprint)},
                 captures_json = {_sql_str(dumps(captures))},
-                status = 'success',
+                status = {_sql_str(status)},
                 target_kind = {_sql_str(result.kind)},
                 catalyst_sql = {_sql_str(result.sql)},
                 impl_source = {_sql_str(result.java_source)},
@@ -329,25 +378,28 @@ class DeltaCatalog:
                 origin = {_sql_str(origin)},
                 model = {_sql_str(result.model)},
                 hypothesis_passed = {hyp},
+                tolerance = {_sql_float(tolerance)},
                 error = NULL,
                 failed_at = NULL,
-                claimed_at = NULL,
+                claimed_at = {claimed},
                 updated_at = {_sql_str(now)}
             WHEN NOT MATCHED THEN INSERT (
                 udf_key, source_text, param_names, input_types, input_categories,
                 return_type, spark_version, closure_fingerprint, captures_json,
                 status, target_kind, catalyst_sql, impl_source, impl_class,
-                impl_entry, impl_binary, origin, model, hypothesis_passed,
-                attempt_count, created_at, updated_at
+                impl_entry, impl_binary, origin, model, hypothesis_passed, tolerance,
+                attempt_count, claimed_at, created_at, updated_at
             ) VALUES (
                 {_sql_str(udf_key)}, {_sql_str(source_text)}, {_sql_str(dumps(param_names))},
                 {_sql_str(dumps(input_types))}, {_sql_str(dumps(input_categories))},
                 {_sql_str(return_type)}, {_sql_str(spark_version)},
                 {_sql_str(closure_fingerprint)}, {_sql_str(dumps(captures))},
-                'success', {_sql_str(result.kind)}, {_sql_str(result.sql)},
+                {_sql_str(status)}, {_sql_str(result.kind)}, {_sql_str(result.sql)},
                 {_sql_str(result.java_source)}, {_sql_str(result.class_name)},
                 {_sql_str(result.entry)}, {_sql_blob_hex(result.binary)},
-                {_sql_str(origin)}, {_sql_str(result.model)}, {hyp}, 0, {_sql_str(now)}, {_sql_str(now)}
+                {_sql_str(origin)}, {_sql_str(result.model)}, {hyp}, {_sql_float(tolerance)},
+                0, {claimed},
+                {_sql_str(now)}, {_sql_str(now)}
             )
             """
         )
@@ -359,14 +411,14 @@ class DeltaCatalog:
             "%Y-%m-%dT%H:%M:%S"
         )
         now = iso_now()
-        before = self.spark.sql(f"SELECT COUNT(*) AS n FROM {self.table} WHERE status = 'running'").collect()[
-            0
-        ][0]
+        before = self.spark.sql(
+            f"SELECT COUNT(*) AS n FROM {self.table} WHERE status IN ('running', 'provisional')"
+        ).collect()[0][0]
         self.spark.sql(
             f"""
             UPDATE {self.table}
             SET status = 'pending', claimed_at = NULL, updated_at = {_sql_str(now)}
-            WHERE status = 'running'
+            WHERE status IN ('running', 'provisional')
               AND (claimed_at IS NULL OR claimed_at < {_sql_str(cutoff)})
               AND attempt_count < {int(max_retries)}
             """
@@ -377,14 +429,14 @@ class DeltaCatalog:
             SET status = 'failed', failed_at = {_sql_str(now)}, claimed_at = NULL,
                 updated_at = {_sql_str(now)},
                 error = COALESCE(error, 'stale running claim exhausted retries')
-            WHERE status = 'running'
+            WHERE status IN ('running', 'provisional')
               AND (claimed_at IS NULL OR claimed_at < {_sql_str(cutoff)})
               AND attempt_count >= {int(max_retries)}
             """
         )
-        after = self.spark.sql(f"SELECT COUNT(*) AS n FROM {self.table} WHERE status = 'running'").collect()[
-            0
-        ][0]
+        after = self.spark.sql(
+            f"SELECT COUNT(*) AS n FROM {self.table} WHERE status IN ('running', 'provisional')"
+        ).collect()[0][0]
         return int(before) - int(after)
 
     def oldest_pending(self) -> Optional[CacheRow]:
