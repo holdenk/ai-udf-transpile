@@ -6,6 +6,18 @@ sampled rows) before anyone trusts it. A rewrite that mismatches on any input
 where Python returns a value is rejected; a rewrite that crashes at analysis
 is rejected. DECLINE is cheap and final -- a wrong guess is wasted work.
 
+## Before you write
+
+- NULL is not False or 0. Wrap comparisons (`coalesce`, `CASE WHEN ... THEN 1 ELSE 0 END`).
+- Do not reference `_udf_param_N` inside a `->` lambda.
+- Python `%` and `//` floor. Spark `%` and `div` truncate. `pmod` is not Python `%` for a negative divisor.
+- `round` is not `bround`. Cast banker's rounding to bigint, not int.
+- `split` is a regex. `substr` is 1-based. `lpad` is not `zfill`.
+- `dayofweek` is Sunday=1. `lower` is not `casefold`.
+- Casts are not Python `int()` or `str()`. An `int` annotation is Spark `bigint`.
+- No `reflect` or `java_method`.
+- If you are not sure, DECLINE.
+
 ## Inputs (authoritative)
 
 - `udf.py` — the function to rewrite.
@@ -36,6 +48,11 @@ is rejected. DECLINE is cheap and final -- a wrong guess is wasted work.
   Python returns `False`/`0` on NULL input, a bare boolean expression is wrong
   (`instr(...) > 0` returns NULL): wrap it — `CASE WHEN ... THEN 1 ELSE 0 END`
   or `coalesce(..., false)`.
+- **`array_contains` is not Python `in`.** It is NULL when the needle is NULL,
+  and NULL when the needle is absent from an array that contains NULL.
+  `CASE WHEN array_contains(arr, v) THEN 1 ELSE 0 END` turns those NULLs into
+  0, which matches `v in arr` being False only when `None` is not an element
+  (`None in [None]` is True). If the array can contain NULL, DECLINE or use Java.
 - **Reproduce Python's failure-path defaults, not NULL.** With
   `except: return []` (or `return "nan"`, `return 0`), unparseable input must
   yield that default. Use `try_cast` / `try_to_timestamp` (NULL on bad input)
@@ -59,25 +76,38 @@ is rejected. DECLINE is cheap and final -- a wrong guess is wasted work.
 - **Modulo/division:** Python `%` and `//` floor (sign of the divisor); Spark
   `%` and `div` truncate toward zero, and `pmod` matches Python only for
   POSITIVE divisors (`pmod(7, -3)` is `1`, Python `7 % -3` is `-2`). Floored
-  modulo: `(x % y) + CASE WHEN (x % y) <> 0 AND ((x < 0) <> (y < 0)) THEN y ELSE 0 END`;
-  floored division: `floor(x / y)`.
+  modulo: `(x % y) + CASE WHEN (x % y) <> 0 AND ((x < 0) <> (y < 0)) THEN y ELSE 0 END`.
+  Floored division: `floor(x / y)` matches Python `//` only while both operands
+  are exactly representable as float64 (integers with magnitude below 2^53).
+  Spark `/` on bigints is double division: `floor(9007199254740995 / 2)` is
+  `4503599627370498`, and Python `//` is `4503599627370497`. Past that, DECLINE.
 - **Rounding:** Python `round` is banker's rounding; Spark `round` is
   half-up. Use `bround`, and cast to `bigint` — `cast(bround(1e16) as int)`
   overflows where Python returns `10000000000000000`.
 - **`split` takes a regex:** `split(s, '.')` turns `'a.b'` into four empty
   strings. Escape literal dots: `split(s, '\\.')`.
-- **`substr` is 1-based** and `lpad`/`rpad` TRUNCATE over-long input and pad
+- **`substr` is 1-based** and takes a length, not an end index. Python
+  `s[1:3]` is `substr(s, 2, 2)`. Negative indexes have no faithful `substr`;
+  DECLINE if the UDF needs them. `lpad`/`rpad` TRUNCATE over-long input and pad
   before a sign: Python `'-5'.zfill(3)` is `'-05'` but `lpad('-5', 3, '0')`
   is `'0-5'`, and `'abcd'.zfill(3)` stays `'abcd'` while `lpad` gives `'abc'`.
+  Faithful `zfill(3)`: `CASE WHEN length(s) >= 3 THEN s WHEN substr(s, 1, 1) IN ('-', '+') THEN concat(substr(s, 1, 1), lpad(substr(s, 2), 2, '0')) ELSE lpad(s, 3, '0') END`.
 - **Weekdays:** Python `date.weekday()` is Monday=0; `dayofweek` is
   Sunday=1. Faithful: `pmod(dayofweek(t) + 5, 7)`.
 - **Case:** `lower` is not `casefold` — `'ß'.casefold()` is `'ss'`. No
   faithful SQL exists; use Java or DECLINE.
 - **Float stringification:** `cast(x as string)` yields `'1.0E16'` where
   Python `str(x)` yields `'1e+16'`, and `str(None)` is the string `'None'`,
-  not NULL. Match Python's spelling or DECLINE.
-- **`int()` accepts underscores** (`int('1_000')` is `1000`): strip them
-  before casting — `try_cast(regexp_replace(s, '_', '') as int)`.
+  not NULL. `str(True)` is `'True'`; `cast(true as string)` is `'true'`.
+  Match Python's spelling or DECLINE.
+- **`int()` accepts underscores** (`int('1_000')` is `1000`) and the
+  annotation `int` is a Spark `bigint`. `try_cast(s as int)` is NULL for
+  `2147483648`, where Python returns that integer, and it rejects underscores.
+  Strip them and cast to bigint:
+  `try_cast(regexp_replace(s, '_', '') as bigint)`. That still returns a
+  number for `1__000`, `_1000`, and `1000_`, where Python raises. Differential
+  testing allows any SQL result when Python raises, so this is not a full
+  `int()` parser — DECLINE if those must fail the same way.
 - **`trim` strips spaces only**; Python `strip()` removes all whitespace
   (tabs, newlines, NBSP). If the input can contain non-space whitespace, no
   faithful `trim` rewrite exists.
@@ -149,5 +179,7 @@ public class Backwards implements UDF1<Object, Object> {
 - The UDF calls a network/service/SDK (boto3, requests), reads the clock or
   randomness, or does I/O: no faithful rewrite exists.
 - You cannot match Python semantics for the declared types with confidence.
+- Never emit `reflect` or `java_method`. They invoke arbitrary JVM methods
+  and are rejected before the rewrite is run.
 
 Match Python semantics for the given types, including NULL (`None`).

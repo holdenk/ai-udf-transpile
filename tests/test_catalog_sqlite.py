@@ -188,8 +188,82 @@ def test_model_column_added_to_existing_db(tmp_path):
         "CREATE TABLE cache (udf_key TEXT PRIMARY KEY, status TEXT NOT NULL, "
         "return_type TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0)"
     )
+    conn.execute("INSERT INTO cache (udf_key, status, return_type) VALUES ('old', 'success', 'bigint')")
     conn.commit()
     conn.close()
     cat = SqliteCatalog(path)  # migration adds model
     cols = {r[1] for r in cat._conn.execute("PRAGMA table_info(cache)")}
     assert "model" in cols
+    assert "publish_ready" in cols
+    ready = cat._conn.execute("SELECT publish_ready FROM cache WHERE udf_key = 'old'").fetchone()
+    assert ready is not None and ready[0] == 1
+    tol = cat._conn.execute("SELECT tolerance FROM cache WHERE udf_key = 'old'").fetchone()
+    assert tol is not None and tol[0] is None
+
+
+def test_missing_tolerance_is_an_exact_check(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "fake")
+    cat.mark_success(
+        "k1",
+        TranspileResult(kind="catalyst", sql="_udf_param_0 + 1"),
+        origin="fake",
+    )
+    assert cat.get("k1").tolerance is None
+    assert cat.lookup("k1")[0] == HIT
+
+
+def test_looser_than_configured_tolerance_is_rechecked(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "fake")
+    cat.mark_success(
+        "k1",
+        TranspileResult(kind="catalyst", sql="_udf_param_0 + 1"),
+        origin="fake",
+        tolerance=1.0,
+    )
+    assert cat.get("k1").tolerance == 1.0
+    conf.set_value(conf.TOLERANCE, "1")
+    assert cat.lookup("k1")[0] == HIT
+    conf.set_value(conf.TOLERANCE, "0.5")
+    kind, row = cat.lookup("k1")
+    assert kind == WAIT
+    assert row is not None and row.status == "pending"
+
+
+def test_provisional_is_hidden_until_promoted(tmp_path):
+    import threading
+
+    from ai_udf_transpile.catalog import expose_provisional
+
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "fake")
+    cat.mark_success(
+        "k1",
+        TranspileResult(kind="catalyst", sql="_udf_param_0 + 1"),
+        origin="fake",
+        visible=False,
+    )
+    kind, row = cat.lookup("k1")
+    assert kind == WAIT
+    assert row is not None and row.status == "provisional"
+    seen: dict[str, str] = {}
+
+    def other() -> None:
+        seen["kind"] = cat.lookup("k1")[0]
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    thread.join()
+    assert seen["kind"] == WAIT
+    with expose_provisional():
+        assert cat.lookup("k1")[0] == HIT
+    assert cat.staged_successes() == []
+    cat.promote_success("k1")
+    assert cat.lookup("k1")[0] == HIT
+    assert cat.staged_successes() == []
+    cat.mark_publish_ready("k1")
+    assert [r.udf_key for r in cat.staged_successes()] == ["k1"]

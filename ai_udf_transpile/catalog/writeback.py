@@ -19,7 +19,7 @@ import logging
 import threading
 from typing import Any, Optional
 
-from ai_udf_transpile.catalog import HIT, CacheRow, dumps
+from ai_udf_transpile.catalog import HIT, CacheRow, dumps, tolerance_serves
 from ai_udf_transpile.catalog.delta import _ident, _row_from_spark, _sql_str
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog
 from ai_udf_transpile.targets import KIND_CATALYST, TranspileResult
@@ -51,6 +51,7 @@ _COLUMNS = [
     "model",
     "error",
     "hypothesis_passed",
+    "tolerance",
     "attempt_count",
     "failed_at",
     "claimed_at",
@@ -64,7 +65,8 @@ _DDL = """
     closure_fingerprint STRING, captures_json STRING, status STRING,
     target_kind STRING, catalyst_sql STRING, impl_source STRING, impl_class STRING,
     impl_entry STRING, impl_binary BINARY, origin STRING, backend STRING,
-    model STRING, error STRING, hypothesis_passed BOOLEAN, attempt_count INT,
+    model STRING, error STRING, hypothesis_passed BOOLEAN, tolerance DOUBLE,
+    attempt_count INT,
     failed_at STRING, claimed_at STRING, created_at STRING, updated_at STRING
 """
 
@@ -92,6 +94,7 @@ def _table_tuple(row: CacheRow) -> tuple:
         row.model,
         row.error,
         row.hypothesis_passed,
+        row.tolerance,
         int(row.attempt_count or 0),
         row.failed_at,
         row.claimed_at,
@@ -115,6 +118,10 @@ class WritebackCatalog:
         self._available = False
         try:
             self._spark.sql(f"CREATE TABLE IF NOT EXISTS {self._table} ({_DDL}) USING {self._format}")
+            try:
+                self._spark.sql(f"ALTER TABLE {self._table} ADD COLUMN tolerance DOUBLE")
+            except Exception:
+                logger.debug("writeback tolerance column already present", exc_info=True)
             self._available = True
         except Exception:
             # e.g. USING iceberg without the iceberg runtime/catalog configured.
@@ -157,6 +164,10 @@ class WritebackCatalog:
                 return BinaryType()
             if name == "hypothesis_passed":
                 return BooleanType()
+            if name == "tolerance":
+                from pyspark.sql.types import DoubleType
+
+                return DoubleType()
             if name == "attempt_count":
                 return IntegerType()
             return StringType()
@@ -205,6 +216,7 @@ class WritebackCatalog:
             result=result,
             origin=remote.origin or "writeback",
             hypothesis_passed=remote.hypothesis_passed,
+            tolerance=remote.tolerance,
         )
         self._staging.mark_written_back([remote.udf_key])
 
@@ -219,7 +231,7 @@ class WritebackCatalog:
         if kind == HIT:
             return kind, row
         remote = self._remote_success(udf_key)
-        if remote is not None and remote.reconstructable():
+        if remote is not None and remote.reconstructable() and tolerance_serves(remote.tolerance, spark):
             if row is None:
                 # Pure miss locally: warm the cache. A pending/running local
                 # row is left alone -- the in-flight worker's success upserts
@@ -240,12 +252,28 @@ class WritebackCatalog:
         origin: str,
         *,
         hypothesis_passed: bool = True,
+        visible: bool = True,
+        tolerance: Optional[float] = None,
     ) -> None:
-        self._staging.mark_success(udf_key, result, origin, hypothesis_passed=hypothesis_passed)
-        self._maybe_flush()
+        # Staging only. note_verified flushes after reconstruction has passed,
+        # so a rewrite that fails the smoke test never reaches the shared table.
+        self._staging.mark_success(
+            udf_key,
+            result,
+            origin,
+            hypothesis_passed=hypothesis_passed,
+            visible=visible,
+            tolerance=tolerance,
+        )
 
     def upsert_success(self, **kwargs: Any) -> None:
         self._staging.upsert_success(**kwargs)
+
+    def promote_success(self, udf_key: str) -> None:
+        self._staging.promote_success(udf_key)
+
+    def note_verified(self, udf_key: str) -> None:
+        self._staging.mark_publish_ready(udf_key)
         self._maybe_flush()
 
     # -- local-only concepts: straight delegation --------------------------

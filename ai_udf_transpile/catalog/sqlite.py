@@ -18,7 +18,9 @@ from ai_udf_transpile.catalog import (
     iso_now,
     loads_dict,
     loads_list,
+    provisional_visible,
     retries_exhausted,
+    tolerance_serves,
 )
 from ai_udf_transpile.targets import TranspileResult
 
@@ -87,6 +89,7 @@ def _row_from_sql(raw: sqlite3.Row) -> CacheRow:
         model=raw["model"] if "model" in keys else None,
         error=raw["error"],
         hypothesis_passed=None if hyp is None else bool(hyp),
+        tolerance=(None if "tolerance" not in keys or raw["tolerance"] is None else float(raw["tolerance"])),
         attempt_count=int(raw["attempt_count"] or 0),
         failed_at=raw["failed_at"],
         claimed_at=raw["claimed_at"],
@@ -118,6 +121,15 @@ class SqliteCatalog:
                 self._conn.execute("ALTER TABLE cache ADD COLUMN model TEXT")
             if "written_back_at" not in cols:
                 self._conn.execute("ALTER TABLE cache ADD COLUMN written_back_at TEXT")
+            if "publish_ready" not in cols:
+                # 0 until reconstruction has passed. Write-back flushes only 1s,
+                # so a success that is still being smoke-tested is not published.
+                # Rows that were already success before this column existed were
+                # the old flush queue; keep them publishable.
+                self._conn.execute("ALTER TABLE cache ADD COLUMN publish_ready INTEGER NOT NULL DEFAULT 0")
+                self._conn.execute("UPDATE cache SET publish_ready = 1 WHERE status = 'success'")
+            if "tolerance" not in cols:
+                self._conn.execute("ALTER TABLE cache ADD COLUMN tolerance REAL")
 
     def close(self) -> None:
         with self._lock:
@@ -137,8 +149,22 @@ class SqliteCatalog:
             row = self._fetch(udf_key)
             if row is None:
                 return MISS, None
+            if row.status == "provisional":
+                if provisional_visible():
+                    return HIT, row
+                return WAIT, row
             if row.reconstructable():
-                return HIT, row
+                if tolerance_serves(row.tolerance, spark):
+                    return HIT, row
+                # Checked more loosely than this session allows. Recheck it.
+                now = iso_now()
+                self._conn.execute(
+                    "UPDATE cache SET status = 'pending', error = NULL, publish_ready = 0, "
+                    "written_back_at = NULL, updated_at = ? "
+                    "WHERE udf_key = ? AND status = 'success'",
+                    (now, udf_key),
+                )
+                return WAIT, self._fetch(udf_key)
             if row.status in {"pending", "running"}:
                 return WAIT, row
             if row.status == "failed":
@@ -226,13 +252,17 @@ class SqliteCatalog:
         origin: str,
         *,
         hypothesis_passed: bool = True,
+        visible: bool = True,
+        tolerance: Optional[float] = None,
     ) -> None:
         now = iso_now()
+        # Hidden until promote_success: lookup on other threads keeps the Python UDF.
+        status = "success" if visible else "provisional"
         with self._lock:
             self._conn.execute(
                 """
                 UPDATE cache SET
-                    status = 'success',
+                    status = ?,
                     target_kind = ?,
                     catalyst_sql = ?,
                     impl_source = ?,
@@ -242,13 +272,17 @@ class SqliteCatalog:
                     origin = ?,
                     model = ?,
                     hypothesis_passed = ?,
+                    tolerance = ?,
                     error = NULL,
                     failed_at = NULL,
-                    claimed_at = NULL,
+                    publish_ready = 0,
+                    written_back_at = NULL,
+                    claimed_at = CASE WHEN ? THEN NULL ELSE COALESCE(claimed_at, ?) END,
                     updated_at = ?
                 WHERE udf_key = ?
                 """,
                 (
+                    status,
                     result.kind,
                     result.sql,
                     result.java_source,
@@ -258,9 +292,34 @@ class SqliteCatalog:
                     origin,
                     result.model,
                     1 if hypothesis_passed else 0,
+                    tolerance,
+                    1 if visible else 0,
+                    now,
                     now,
                     udf_key,
                 ),
+            )
+
+    def promote_success(self, udf_key: str) -> None:
+        """Make a provisional row visible. No-op unless status is provisional."""
+        now = iso_now()
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE cache SET status = 'success', claimed_at = NULL, updated_at = ?
+                WHERE udf_key = ? AND status = 'provisional'
+                """,
+                (now, udf_key),
+            )
+
+    def mark_publish_ready(self, udf_key: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE cache SET publish_ready = 1
+                WHERE udf_key = ? AND status = 'success'
+                """,
+                (udf_key,),
             )
 
     def mark_failed(
@@ -281,6 +340,7 @@ class SqliteCatalog:
                     failed_at = ?,
                     claimed_at = NULL,
                     hypothesis_passed = 0,
+                    publish_ready = 0,
                     origin = COALESCE(?, origin),
                     model = COALESCE(?, model),
                     updated_at = ?
@@ -304,11 +364,15 @@ class SqliteCatalog:
         result: TranspileResult,
         origin: str,
         hypothesis_passed: Optional[bool],
+        visible: bool = True,
+        tolerance: Optional[float] = None,
     ) -> None:
         if not return_type or not input_types:
             raise ValueError("upsert_success requires known types")
         now = iso_now()
         hyp = None if hypothesis_passed is None else (1 if hypothesis_passed else 0)
+        status = "success" if visible else "provisional"
+        claimed = None if visible else now
         with self._lock:
             self._conn.execute(
                 """
@@ -316,9 +380,9 @@ class SqliteCatalog:
                     udf_key, source_text, param_names, input_types, input_categories,
                     return_type, spark_version, closure_fingerprint, captures_json,
                     status, target_kind, catalyst_sql, impl_source, impl_class,
-                    impl_entry, impl_binary, origin, model, hypothesis_passed,
-                    attempt_count, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    impl_entry, impl_binary, origin, model, hypothesis_passed, tolerance,
+                    attempt_count, claimed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(udf_key) DO UPDATE SET
                     source_text = excluded.source_text,
                     param_names = excluded.param_names,
@@ -328,7 +392,7 @@ class SqliteCatalog:
                     spark_version = excluded.spark_version,
                     closure_fingerprint = excluded.closure_fingerprint,
                     captures_json = excluded.captures_json,
-                    status = 'success',
+                    status = excluded.status,
                     target_kind = excluded.target_kind,
                     catalyst_sql = excluded.catalyst_sql,
                     impl_source = excluded.impl_source,
@@ -338,9 +402,12 @@ class SqliteCatalog:
                     origin = excluded.origin,
                     model = excluded.model,
                     hypothesis_passed = excluded.hypothesis_passed,
+                    tolerance = excluded.tolerance,
                     error = NULL,
                     failed_at = NULL,
-                    claimed_at = NULL,
+                    publish_ready = 0,
+                    written_back_at = NULL,
+                    claimed_at = excluded.claimed_at,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -353,6 +420,7 @@ class SqliteCatalog:
                     spark_version,
                     closure_fingerprint,
                     dumps(captures),
+                    status,
                     result.kind,
                     result.sql,
                     result.java_source,
@@ -362,6 +430,8 @@ class SqliteCatalog:
                     origin,
                     result.model,
                     hyp,
+                    tolerance,
+                    claimed,
                     now,
                     now,
                 ),
@@ -379,7 +449,7 @@ class SqliteCatalog:
                 """
                 UPDATE cache
                 SET status = 'pending', claimed_at = NULL, updated_at = ?
-                WHERE status = 'running'
+                WHERE status IN ('running', 'provisional')
                   AND (claimed_at IS NULL OR claimed_at < ?)
                   AND attempt_count < ?
                 """,
@@ -390,7 +460,7 @@ class SqliteCatalog:
                 UPDATE cache
                 SET status = 'failed', failed_at = ?, claimed_at = NULL, updated_at = ?,
                     error = COALESCE(error, 'stale running claim exhausted retries')
-                WHERE status = 'running'
+                WHERE status IN ('running', 'provisional')
                   AND (claimed_at IS NULL OR claimed_at < ?)
                   AND attempt_count >= ?
                 """,
@@ -415,7 +485,8 @@ class SqliteCatalog:
         """Verified rows not yet appended to the write-back table (if any)."""
         with self._lock:
             cur = self._conn.execute(
-                "SELECT * FROM cache WHERE status = 'success' AND written_back_at IS NULL"
+                "SELECT * FROM cache WHERE status = 'success' AND written_back_at IS NULL "
+                "AND publish_ready = 1"
             )
             return [_row_from_sql(raw) for raw in cur.fetchall()]
 

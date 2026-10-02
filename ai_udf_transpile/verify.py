@@ -8,6 +8,7 @@ import importlib
 import inspect
 import linecache
 import logging
+import re
 import textwrap
 from typing import Any, Callable, Optional
 
@@ -40,6 +41,130 @@ STDLIB_ALLOWLIST = frozenset(
 )
 
 _SENTINEL_RAISED = object()
+
+# reflect/java_method run arbitrary JVM methods from a SQL expression.
+# Runtime/ProcessBuilder in a Java UDF runs at class-load, before any row check.
+_FORBIDDEN_SQL = re.compile(r"\b(?:reflect|java_method)\s*\(", re.IGNORECASE)
+_FORBIDDEN_JAVA = re.compile(r"\b(?:Runtime\.getRuntime|ProcessBuilder)\b")
+_PLACEHOLDER = re.compile(r"_udf_param_\d+")
+
+
+def lambda_captured_placeholder(sql: str) -> Optional[str]:
+    """The `_udf_param_N` referenced inside a `->` lambda body, if any.
+
+    TranspiledPythonUDF substitutes placeholders in the expression tree but
+    does not descend into higher-order-function lambdas, so a reference there
+    fails analysis with UNRESOLVED_COLUMN and takes the query down. Spark
+    also refuses to attach a rewrite whose return type is an array, which
+    means the live reconstruction probe never runs for those UDFs — this
+    scan is what still rejects the shape.
+    """
+    depth = 0
+    i = 0
+    quote: Optional[str] = None
+    while i < len(sql):
+        char = sql[i]
+        if quote is not None:
+            if char == quote and (i == 0 or sql[i - 1] != "\\"):
+                quote = None
+            i += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            i += 1
+            continue
+        if char == "(":
+            depth += 1
+            i += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if sql.startswith("->", i):
+            body_depth = depth
+            j = i + 2
+            body_quote: Optional[str] = None
+            while j < len(sql):
+                nxt = sql[j]
+                if body_quote is not None:
+                    if nxt == body_quote and sql[j - 1] != "\\":
+                        body_quote = None
+                    j += 1
+                    continue
+                if nxt in {"'", '"'}:
+                    body_quote = nxt
+                    j += 1
+                    continue
+                if nxt == "(":
+                    depth += 1
+                elif nxt == ")":
+                    depth -= 1
+                    if depth < body_depth:
+                        break
+                j += 1
+            token = _placeholder_outside_strings(sql[i + 2 : j])
+            if token:
+                return token
+            i = j
+            continue
+        i += 1
+    return None
+
+
+def _placeholder_outside_strings(fragment: str) -> Optional[str]:
+    """First `_udf_param_N` that is not inside a SQL string, if any."""
+    quote: Optional[str] = None
+    kept: list[str] = []
+    i = 0
+    while i < len(fragment):
+        char = fragment[i]
+        if quote is not None:
+            if char == quote and fragment[i - 1] != "\\":
+                quote = None
+            i += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            i += 1
+            continue
+        kept.append(char)
+        i += 1
+    match = _PLACEHOLDER.search("".join(kept))
+    return match.group(0) if match else None
+
+
+def lambda_captures_placeholder(sql: str) -> bool:
+    return lambda_captured_placeholder(sql) is not None
+
+
+def sql_reconstruction_error(result: Any) -> Optional[str]:
+    """Analysis failure we can see without asking Spark to attach the rewrite."""
+    token = lambda_captured_placeholder(getattr(result, "sql", None) or "")
+    if token:
+        return (
+            "verified rewrite fails plan analysis when reconstructed: "
+            f"{token} is referenced inside a lambda body"
+        )
+    return None
+
+
+def _sql_for_forbidden_scan(sql: str) -> str:
+    """Drop comments and identifier quotes so `reflect` and reflect/* */( still match."""
+    without_block = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    without_line = re.sub(r"--[^\n]*", " ", without_block)
+    return without_line.replace("`", "")
+
+
+def rejected_rewrite(result: Any) -> Optional[str]:
+    """Return an error if the rewrite must not be compiled or executed."""
+    sql = getattr(result, "sql", None) or ""
+    java = getattr(result, "java_source", None) or ""
+    if _FORBIDDEN_SQL.search(_sql_for_forbidden_scan(sql)):
+        return "rewrite invokes reflect or java_method"
+    if _FORBIDDEN_JAVA.search(java):
+        return "java rewrite uses Runtime.getRuntime or ProcessBuilder"
+    return None
 
 
 class VerifyFailed(Exception):
@@ -188,9 +313,16 @@ def _strategy_for(spark_type: str):
     if t.startswith("map<") and t.endswith(">"):
         key_t, _, val_t = t[4:-1].partition(",")
         if key_t.strip() == "string" and val_t.strip() == "string":
+
+            def _text(max_size: int):
+                return st.text(
+                    alphabet=st.characters(blacklist_categories=("Cs", "Cn")),
+                    max_size=max_size,
+                )
+
             return st.one_of(
                 st.none(),
-                st.dictionaries(st.text(max_size=8), st.text(max_size=16), max_size=4),
+                st.dictionaries(_text(8), _text(16), max_size=4),
             )
     if t.startswith("array<") and t.endswith(">"):
         inner = t[6:-1].strip()
@@ -314,12 +446,34 @@ def smoke_test_reconstruction(
     not descend into lambda bodies, so a verified rewrite can still fail
     analysis (UNRESOLVED_COLUMN _udf_param_N) when it reaches a real query,
     taking the whole query down instead of falling back. The catalog row must
-    already be written (success) so the UDF-construction hook reconstructs it;
-    on any failure here the caller flips the row back to failed.
+    already be written. A provisional row is visible only on this thread, so
+    other queries keep the Python UDF until the caller promotes it.
 
     Only the final analysis step produces an error: harness problems (no func,
     hook declined, nothing reconstructed) return None -- no opinion.
     """
+    from ai_udf_transpile.catalog import expose_provisional
+
+    with expose_provisional():
+        return _smoke_test_reconstruction(
+            spark,
+            source_text=source_text,
+            captures=captures,
+            input_types=input_types,
+            return_type=return_type,
+            func=func,
+        )
+
+
+def _smoke_test_reconstruction(
+    spark: Any,
+    *,
+    source_text: str,
+    captures: Optional[dict[str, Any]],
+    input_types: list[str],
+    return_type: str,
+    func: Any = None,
+) -> Optional[str]:
     if spark is None:
         return None
     try:
@@ -404,6 +558,26 @@ def _representable(value: Any, return_type: str) -> bool:
     return True
 
 
+def _within_tolerance(py_value: Any, sql_value: Any, tolerance: float) -> bool:
+    """Exact match, or absolute numeric distance within ``tolerance``.
+
+    Booleans stay exact (``True == 1`` is already Python's ``==``). Strings,
+    lists, and timestamps are exact: a tolerance does not fuzzy-match them.
+    """
+    if py_value == sql_value:
+        return True
+    if tolerance <= 0:
+        return False
+    if isinstance(py_value, bool) or isinstance(sql_value, bool):
+        return False
+    if not isinstance(py_value, (int, float)) or not isinstance(sql_value, (int, float)):
+        return False
+    try:
+        return abs(float(py_value) - float(sql_value)) <= tolerance
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def hypothesis_check(
     *,
     source_text: str,
@@ -415,8 +589,12 @@ def hypothesis_check(
     max_examples: int = 20,
     func: Any = None,
     samples: Optional[list] = None,
+    tolerance: float = 0.0,
 ) -> tuple[bool, Optional[str]]:
     """Return (ok, error). Analysis failure / mismatch → (False, msg). Never raises to the worker."""
+    rejected = rejected_rewrite(result)
+    if rejected:
+        return False, rejected
     try:
         python_fn = load_python_udf(source_text, captures, func)
     except (NameError, ImportError, SyntaxError, VerifyFailed) as exc:
@@ -481,7 +659,7 @@ def hypothesis_check(
         if py_exc is not None:
             # Spark's own hypothesis policy: python raise + sql value is allowed.
             return
-        if py_value != sql_value:
+        if not _within_tolerance(py_value, sql_value, tolerance):
             mismatch.append(f"mismatch on {args!r}: python={py_value!r} sql={sql_value!r}")
 
     def _explicit_examples() -> list[tuple]:
@@ -493,6 +671,7 @@ def hypothesis_check(
         """
         from ai_udf_transpile.sampling import (
             BUILTIN_ARRAY_EXAMPLES,
+            BUILTIN_BOOL_EXAMPLES,
             BUILTIN_DOUBLE_EXAMPLES,
             BUILTIN_INT_EXAMPLES,
             BUILTIN_MAP_EXAMPLES,
@@ -531,6 +710,9 @@ def hypothesis_check(
             elif stype.startswith("array<"):
                 for a in BUILTIN_ARRAY_EXAMPLES:
                     examples.append(tuple(list(a) if j == i else None for j in range(arity)))
+            elif stype in {"boolean", "bool"}:
+                for b in BUILTIN_BOOL_EXAMPLES:
+                    examples.append(tuple(b if j == i else None for j in range(arity)))
             elif stype in {"timestamp", "timestamp_ntz"}:
                 for ts in BUILTIN_TIMESTAMP_EXAMPLES:
                     examples.append(tuple(ts if j == i else None for j in range(arity)))
@@ -560,6 +742,8 @@ def hypothesis_check(
                     per_param.append([[list(x) for x in a] for a in BUILTIN_NESTED_ARRAY_EXAMPLES])
                 elif stype.startswith("array<"):
                     per_param.append([list(a) for a in BUILTIN_ARRAY_EXAMPLES])
+                elif stype in {"boolean", "bool"}:
+                    per_param.append(list(BUILTIN_BOOL_EXAMPLES))
                 elif stype in {"timestamp", "timestamp_ntz"}:
                     per_param.append(list(BUILTIN_TIMESTAMP_EXAMPLES))
                 else:

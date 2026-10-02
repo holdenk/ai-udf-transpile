@@ -12,6 +12,7 @@ import warnings
 from typing import Any, Callable, Optional
 
 from ai_udf_transpile import conf
+from ai_udf_transpile.catalog import configured_tolerance, publish_verified
 from ai_udf_transpile.keys import (
     canonical_source,
     canonical_source_from_func,
@@ -213,6 +214,7 @@ def register_impl(
         raise ValueError("register_impl needs catalyst_sql or a java_udf payload")
 
     hyp: Optional[bool] = None
+    tolerance = configured_tolerance(spark) if verify else None
     if verify:
         # Verify against any real rows recorded for this UDF, like the worker
         # does: for multi-param UDFs the built-in examples vary one param at a
@@ -234,6 +236,7 @@ def register_impl(
             max_examples=conf.get_int(conf.MAX_EXAMPLES, spark, int(conf.default_max_examples())),
             func=func,
             samples=samples,
+            tolerance=tolerance,
         )
         if not ok:
             if catalog.get(key) is None:
@@ -252,6 +255,8 @@ def register_impl(
             raise ValueError(f"register_impl Hypothesis failed: {err}")
         hyp = True
 
+    # Hidden while the smoke test runs. verify=False is an explicit skip, so
+    # that row is visible immediately.
     catalog.upsert_success(
         udf_key=key,
         source_text=source,
@@ -265,24 +270,28 @@ def register_impl(
         result=result,
         origin=ORIGIN,
         hypothesis_passed=hyp,
+        visible=not verify,
+        tolerance=tolerance,
     )
-    # Even a value-equivalent rewrite can fail when reconstructed through the
-    # real TranspiledPythonUDF path (e.g. param refs inside higher-order
-    # function lambdas are not substituted), which would take the user's query
-    # down at analysis. Smoke-test reconstruction and fail closed.
-    from ai_udf_transpile.verify import smoke_test_reconstruction
+    if verify:
+        # Value-equivalent SQL can still fail when reconstructed through
+        # TranspiledPythonUDF (param refs inside higher-order lambdas are not
+        # substituted) and take the user's query down at analysis.
+        from ai_udf_transpile.verify import smoke_test_reconstruction, sql_reconstruction_error
 
-    smoke_err = smoke_test_reconstruction(
-        spark,
-        source_text=source,
-        captures=captures,
-        input_types=in_types,
-        return_type=out_type,
-        func=func,
-    )
-    if smoke_err:
-        catalog.mark_failed(key, smoke_err, origin=ORIGIN)
-        raise ValueError(f"register_impl reconstruction failed: {smoke_err}")
+        smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
+            spark,
+            source_text=source,
+            captures=captures,
+            input_types=in_types,
+            return_type=out_type,
+            func=func,
+        )
+        if smoke_err:
+            catalog.mark_failed(key, smoke_err, origin=ORIGIN)
+            raise ValueError(f"register_impl reconstruction failed: {smoke_err}")
+        catalog.promote_success(key)
+    publish_verified(catalog, key)
     return key
 
 

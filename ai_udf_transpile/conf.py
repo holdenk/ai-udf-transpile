@@ -23,6 +23,9 @@ BINARY_COCO = PREFIX + "binary.coco"
 BINARY_CURSOR = PREFIX + "binary.cursor"
 BINARY_CLAUDE = PREFIX + "binary.claude"
 MAX_EXAMPLES = PREFIX + "maxExamples"
+# Absolute numeric tolerance used while checking a rewrite, and the loosest
+# tested tolerance a cached rewrite may have and still be served.
+TOLERANCE = PREFIX + "tolerance"
 MAX_RETRIES = PREFIX + "maxRetries"
 FAIL_COOLDOWN = PREFIX + "failCooldownSeconds"
 MODEL_COCO = PREFIX + "model.coco"
@@ -46,6 +49,7 @@ DEFAULTS: dict[str, str] = {
     BINARY_CURSOR: "agent",
     BINARY_CLAUDE: "claude",
     MAX_EXAMPLES: "20",
+    TOLERANCE: "0",
     MAX_RETRIES: "3",
     FAIL_COOLDOWN: "86400",
     INPUT_CATEGORIES: "numeric,string,bool,binary",

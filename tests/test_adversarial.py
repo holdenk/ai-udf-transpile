@@ -6,8 +6,11 @@ Every claim below was battery-tested against a real Spark master build:
 - python `%` floors (sign of divisor); Spark `%` truncates toward zero, and
   pmod only matches python for POSITIVE divisors (pmod(7, -3) == 1 but
   7 % -3 == -2). Faithful: truncated remainder plus a sign correction.
-- python `//` floors; Spark `div` truncates. floor(x / y) matches within the
-  int32-ranged verify strategy (double division is exact below 2**53).
+- python `//` floors; Spark `div` truncates. floor(x / y) matches while both
+  operands are exact in float64 (magnitude below 2**53). Past that it is
+  wrong: floor(9007199254740995 / 2) is 4503599627370498, python // is
+  4503599627370497. Explicit int examples now include 2**31 and 2**40, still
+  below that line; the random strategy stays in int32.
 - python round is banker's; Spark round is half-up. bround is the banker's
   one, and the cast must be bigint: cast(bround(1e16) as int) raises under
   ANSI where python returns 10000000000000000. Past 2**63 the python result
@@ -200,13 +203,42 @@ def test_try_cast_for_int_rejected_underscore(spark):
     assert "mismatch" in (err or "")
 
 
-def test_underscore_tolerant_parse_int_passes(spark):
-    # python raises on malformed input (sql may do anything there), and
-    # stripping underscores first matches python on '1_000'.
+def test_underscore_strip_to_int32_rejected(spark):
+    # '2147483648': python returns it; try_cast(... as int) is NULL.
     ok, err = _check(
-        parse_int, "try_cast(regexp_replace(_udf_param_0, '_', '') as int)", spark, ["string"], "bigint"
+        parse_int,
+        "try_cast(regexp_replace(_udf_param_0, '_', '') as int)",
+        spark,
+        ["string"],
+        "bigint",
+    )
+    assert not ok
+    assert "mismatch" in (err or "")
+
+
+def test_underscore_tolerant_parse_int_passes(spark):
+    # python raises on malformed underscores (sql may do anything there).
+    # Stripping them and casting to bigint matches python on '1_000' and on
+    # values past int32. `as int` does not -- see the test above.
+    ok, err = _check(
+        parse_int,
+        "try_cast(regexp_replace(_udf_param_0, '_', '') as bigint)",
+        spark,
+        ["string"],
+        "bigint",
     )
     assert ok, err
+
+
+def bool_str(flag: bool) -> str:
+    return str(flag)
+
+
+def test_cast_bool_string_rejected(spark):
+    # str(True) is 'True'; cast(true as string) is 'true'.
+    ok, err = _check(bool_str, "cast(_udf_param_0 as string)", spark, ["boolean"], "string")
+    assert not ok
+    assert "mismatch" in (err or "")
 
 
 # --- end to end through the fake backend ------------------------------------

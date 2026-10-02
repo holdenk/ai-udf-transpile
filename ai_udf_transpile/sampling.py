@@ -42,12 +42,29 @@ BUILTIN_STRING_EXAMPLES: tuple[str, ...] = (
     "a.b",  # regex metachar: catches unescaped split(s, '.') rewrites
     "1_000",  # python int() accepts underscores; casts reject them
     "-5",  # sign: catches lpad-for-zfill rewrites ('0-5' vs '-05')
+    "2147483648",  # past int32: try_cast(... as int) is NULL, python int() succeeds
 )
 
 # Deterministic numerics always tried for numeric-typed params: sign mixes
 # (truncation vs flooring), banker's-rounding halves, and a value that
 # overflows int32 on cast.
-BUILTIN_INT_EXAMPLES: tuple[int, ...] = (0, 1, -1, 7, -7, 3, -3, 2**31 - 1, -(2**31))
+# 2**31 and -(2**31)-1 sit outside int32. 2**40 is still exact in float64
+# (the floor(x / y) trick breaks at 2**53, which these examples do not reach).
+BUILTIN_INT_EXAMPLES: tuple[int, ...] = (
+    2**31,
+    -(2**31) - 1,
+    2**40,
+    0,
+    1,
+    -1,
+    7,
+    -7,
+    3,
+    -3,
+    2**31 - 1,
+    -(2**31),
+)
+BUILTIN_BOOL_EXAMPLES: tuple[bool, ...] = (True, False)
 # 1e37: python round(1e37) returns a 38-digit int no bigint column can hold --
 # out of contract for an `-> int` UDF, so verification skips the comparison
 # (a real python UDF execution would fail to fit the value into LongType too).
