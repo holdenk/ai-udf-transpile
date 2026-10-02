@@ -255,8 +255,9 @@ def register_impl(
             raise ValueError(f"register_impl Hypothesis failed: {err}")
         hyp = True
 
-    # Hidden while the smoke test runs. verify=False is an explicit skip, so
-    # that row is visible immediately.
+    # Hidden until promote_success below, regardless of verify: a concurrent
+    # lookup must never observe a HIT before the reconstruction smoke test
+    # has actually passed.
     catalog.upsert_success(
         udf_key=key,
         source_text=source,
@@ -270,27 +271,27 @@ def register_impl(
         result=result,
         origin=ORIGIN,
         hypothesis_passed=hyp,
-        visible=not verify,
+        visible=False,
         tolerance=tolerance,
     )
-    if verify:
-        # Value-equivalent SQL can still fail when reconstructed through
-        # TranspiledPythonUDF (param refs inside higher-order lambdas are not
-        # substituted) and take the user's query down at analysis.
-        from ai_udf_transpile.verify import smoke_test_reconstruction, sql_reconstruction_error
+    # Value-equivalent SQL can still fail when reconstructed through
+    # TranspiledPythonUDF (param refs inside higher-order lambdas are not
+    # substituted) and take the user's query down at analysis. Orthogonal to
+    # Hypothesis value-checking above, so it runs even when verify=False.
+    from ai_udf_transpile.verify import smoke_test_reconstruction, sql_reconstruction_error
 
-        smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
-            spark,
-            source_text=source,
-            captures=captures,
-            input_types=in_types,
-            return_type=out_type,
-            func=func,
-        )
-        if smoke_err:
-            catalog.mark_failed(key, smoke_err, origin=ORIGIN)
-            raise ValueError(f"register_impl reconstruction failed: {smoke_err}")
-        catalog.promote_success(key)
+    smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
+        spark,
+        source_text=source,
+        captures=captures,
+        input_types=in_types,
+        return_type=out_type,
+        func=func,
+    )
+    if smoke_err:
+        catalog.mark_failed(key, smoke_err, origin=ORIGIN)
+        raise ValueError(f"register_impl reconstruction failed: {smoke_err}")
+    catalog.promote_success(key)
     publish_verified(catalog, key)
     return key
 

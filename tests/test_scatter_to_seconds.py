@@ -187,6 +187,22 @@ def test_lambda_closing_param_passes_values_but_fails_reconstruction(spark, sqli
         )
 
 
+def test_lambda_closing_param_fails_reconstruction_even_with_verify_false(spark, sqlite_path):
+    # The reconstruction smoke test guards a structural bug (lambda-body
+    # placeholder substitution), orthogonal to Hypothesis value-checking --
+    # it must still catch this even when verify=False skips the latter.
+    enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
+    with pytest.raises(ValueError, match="reconstruction"):
+        register_impl(
+            spark,
+            scatter_to_seconds,
+            kind="catalyst",
+            catalyst_sql=LAMBDA_CLOSING_SQL,
+            return_type=ArrayType(StringType()),
+            verify=False,
+        )
+
+
 def _record_samples(spark, sqlite_path):
     """Run a sampling-wrapped UDF over the sample rows so register_impl verifies
     against real inputs (built-in examples vary one param at a time, so a valid

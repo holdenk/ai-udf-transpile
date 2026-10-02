@@ -113,3 +113,36 @@ def test_reflect_and_process_builder_rejected_without_spark():
     )
     assert not ok
     assert "ProcessBuilder" in (err or "")
+
+    # Valid Java allows whitespace/comments between tokens of a qualified
+    # name (`Runtime . getRuntime()` compiles), which a literal-string match
+    # would miss entirely.
+    ok, err = hypothesis_check(
+        source_text="def f(x: int) -> int:\n    return x\n",
+        captures={},
+        result=TranspileResult(
+            kind="java_udf",
+            java_source="class T { Object r = Runtime./* get it */getRuntime(); }",
+            class_name="T",
+        ),
+        input_types=["bigint"],
+        return_type="bigint",
+        spark=None,
+    )
+    assert not ok
+    assert "Runtime.getRuntime" in (err or "")
+
+    # A mention inside a comment, with no real call in the code, must not be
+    # a false-positive rejection.
+    from ai_udf_transpile.verify import rejected_rewrite
+
+    assert (
+        rejected_rewrite(
+            TranspileResult(
+                kind="java_udf",
+                java_source="class T { int x; } // not actually using ProcessBuilder here",
+                class_name="T",
+            )
+        )
+        is None
+    )

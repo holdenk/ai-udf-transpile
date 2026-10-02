@@ -45,7 +45,10 @@ _SENTINEL_RAISED = object()
 # reflect/java_method run arbitrary JVM methods from a SQL expression.
 # Runtime/ProcessBuilder in a Java UDF runs at class-load, before any row check.
 _FORBIDDEN_SQL = re.compile(r"\b(?:reflect|java_method)\s*\(", re.IGNORECASE)
-_FORBIDDEN_JAVA = re.compile(r"\b(?:Runtime\.getRuntime|ProcessBuilder)\b")
+# \s* around the dot: valid Java allows whitespace/comments between tokens
+# of a qualified name (`Runtime . getRuntime()` compiles fine), and the plain
+# literal match let that trivially evade this gate.
+_FORBIDDEN_JAVA = re.compile(r"\b(?:Runtime\s*\.\s*getRuntime|ProcessBuilder)\b")
 _PLACEHOLDER = re.compile(r"_udf_param_\d+")
 
 
@@ -156,13 +159,19 @@ def _sql_for_forbidden_scan(sql: str) -> str:
     return without_line.replace("`", "")
 
 
+def _java_for_forbidden_scan(java: str) -> str:
+    """Drop comments so `Run/* */time.getRuntime` still matches, same as the SQL side."""
+    without_block = re.sub(r"/\*.*?\*/", " ", java, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", " ", without_block)
+
+
 def rejected_rewrite(result: Any) -> Optional[str]:
     """Return an error if the rewrite must not be compiled or executed."""
     sql = getattr(result, "sql", None) or ""
     java = getattr(result, "java_source", None) or ""
     if _FORBIDDEN_SQL.search(_sql_for_forbidden_scan(sql)):
         return "rewrite invokes reflect or java_method"
-    if _FORBIDDEN_JAVA.search(java):
+    if _FORBIDDEN_JAVA.search(_java_for_forbidden_scan(java)):
         return "java rewrite uses Runtime.getRuntime or ProcessBuilder"
     return None
 
