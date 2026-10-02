@@ -9,18 +9,20 @@ rows whose columns happen to describe UDFs. Iceberg neither knows nor cares
 that `catalyst_sql` is executable. The interesting version is a rewrite we
 verified becoming a *first-class function* other engines can resolve.
 
-The metadata format for that exists. [Iceberg's SQL UDF spec](https://iceberg.apache.org/udf-spec/)
+The metadata format for the SQL half exists. [Iceberg's SQL UDF spec](https://iceberg.apache.org/udf-spec/)
 (format-version 1, merged February 2026 in apache/iceberg#14117) is a real
-document, not a hope. What is still missing, and why this stays a note:
+document. Two different horizons:
 
-- Representations are **SQL only** (`type` must be `"sql"`). There is no
-  Java, Rust, or GPU payload. `java_udf` and the reserved kinds in
-  `targets.py` do not fit.
-- A definition version may carry **one SQL body per dialect**. There is no
-  engine-version field on the representation. Spark 4.1 and Spark 4.3 cannot
-  both be current `dialect: "spark"` bodies.
-- REST catalog support that has landed is **read-only** (list and load).
-  Create/replace is not something to code against yet.
+- **Today's spec is SQL.** A representation's `type` must be `"sql"`. One
+  body per dialect, no engine-version field, so Spark 4.1 and 4.3 cannot both
+  be the current `dialect: "spark"` body. `SparkFunctionCatalog` can list and
+  load a function. REST list/load matches that. Create/replace is not in the
+  REST spec yet.
+- **The future catalog is multi-lingual.** Java, Rust, and GPU payloads — the
+  reserved kinds in `targets.py` — belong on the same definition as the SQL
+  body, as further representation types. Format-version 1 cannot store them.
+  That is the catalog this note is named for. It is not a reason to ignore
+  the SQL catalog that already exists.
 
 Check the spec again before writing a client. The shape below is format-version
 1 as published, not a guess.
@@ -62,9 +64,9 @@ one of them is current.
   `properties`, and a reader still has to check it. It is not `definition-id`
   and it is not `function-uuid`.
 - **`target_kind=catalyst` can become one `sql` representation with
-  `dialect: "spark"`.** `java_udf`, `rust`, `gpu_kernel`, and `binary` cannot.
-  The spec will not grow a blob representation just because `targets.py`
-  reserved the names.
+  `dialect: "spark"`.** That is the today path, below. `java_udf`, `rust`,
+  `gpu_kernel`, and `binary` wait on a future representation type. Reserving
+  the names in `targets.py` does not make format-version 1 store them.
 - **`spark_version` is in our key and is not in the spec.** Publishing a
   second Spark version means a new definition version that *replaces* the
   spark representation, with the old body kept only for rollback. A reader
@@ -142,19 +144,52 @@ and, in the fallback where `simpleString()` fails, a class name
 publish path, and the class-name fallback is already the wrong string for our
 own cache key.
 
+## Today: match a registered function, then register ours
+
+This is the part worth doing against the spec that exists. Catalyst SQL only.
+`java_udf` stays in our catalog.
+
+**Match, on a cache miss.** If a function catalog is configured, load
+`namespace.<python name>`. `SparkFunctionCatalog.loadFunction` is the Spark
+call; REST `GET .../functions/{function}` is the same fact over HTTP. Pick the
+definition whose parameter types match ours after the Iceberg spelling
+(`bigint` → `long`, `array<string>` → list of string). Read the
+`dialect: "spark"` body on `current-version-id`.
+
+Compare it to our expression with the placeholder rename undone: their `sql`
+uses parameter names, ours uses `_udf_param_N`. Same text, or a body we have
+never seen, both go through `hypothesis_check` at the local tolerance and
+`smoke_test_reconstruction` before anything is served. A body that fails that
+check is not a hit. Fall through to the agent. A `udf_key` property that
+matches ours is a shortcut to "same bytes", not a reason to skip the check.
+
+**Register, after a local catalyst success.** Commit that body as the current
+spark representation. Parameter names come from the Python signature.
+`on-null-input` stays `call` unless we have shown the Python function really
+null-propagates. `deterministic` is true only for a pure rewrite. `udf_key`
+and `tolerance` go in `properties`. If the loaded body already matches and
+verified, stop; that is the hit above, not a new version. If it differs,
+a new definition version replaces the current spark body and keeps the old
+one for rollback.
+
+Create/replace is the half the REST spec does not have yet. Match is the half
+that does. Ship match first. Register when a catalog will take the commit.
+
 ## The part that actually gets better
 
 - **Cross-engine, for the SQL subset.** A body that is valid Spark SQL and
   valid Trino SQL can be stored as two representations on one version. The
   spec will not pretend one string is universal, and neither should we.
-  Java UDFs stay ours until a representation type exists for them.
+  Java, Rust, and GPU representations are the future catalog, not this one.
 - **Cold start, for named SQL.** Write-back already lets a fresh process skip
-  the backend. A catalog extends that across engines, and the name mapping
-  makes the rewrite visible to SQL written by hand, not just to our hook.
+  the backend. A match against a registered function does the same thing
+  through a name a person can type, and a register makes the next session
+  the one that matches.
 
-## Not doing this yet, and why
+## Not doing the future catalog yet
 
-The metadata format is real, and it still does not cover the targets we
-actually ship besides Catalyst SQL. REST cannot create a function yet. The
-trust rule above is the hard part, and the current write-back path needs it
-whether or not Iceberg is involved: a shared row is a candidate, not a hit.
+Multi-lingual representations have nowhere to live in format-version 1.
+The SQL match/register path above does not wait on them. It waits on a
+catalog a session can load, and on the trust rule: a loaded body is a
+candidate, not a hit, until this process has checked it. The write-back
+table needs that same rule whether or not Iceberg is involved.
