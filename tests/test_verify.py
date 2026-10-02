@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai_udf_transpile.verify import VerifyFailed, exec_udf_source, load_python_udf
+from ai_udf_transpile.verify import VerifyFailed, exec_udf_source, load_python_udf, rejected_rewrite
 
 
 def test_import_inside_function():
@@ -132,15 +132,81 @@ def test_reflect_and_process_builder_rejected_without_spark():
     assert not ok
     assert "Runtime.getRuntime" in (err or "")
 
-    # A mention inside a comment, with no real call in the code, must not be
-    # a false-positive rejection.
-    from ai_udf_transpile.verify import rejected_rewrite
+    # Plain whitespace around the dot evades a literal match just as well.
+    assert rejected_rewrite(
+        TranspileResult(
+            kind="java_udf",
+            java_source="class T { Object r = Runtime . getRuntime(); }",
+            class_name="T",
+        )
+    )
 
+    # A `//` or `/*` inside a string literal is not a comment: blanking from
+    # it to end-of-line would let a real call later on the line sail through.
+    assert rejected_rewrite(
+        TranspileResult(
+            kind="java_udf",
+            java_source='class T { String s = "http://x"; Object r = Runtime.getRuntime(); }',
+            class_name="T",
+        )
+    )
+    assert rejected_rewrite(
+        TranspileResult(
+            kind="java_udf",
+            java_source='class T { String s = "/*"; Object r = Runtime.getRuntime(); String t = "*/"; }',
+            class_name="T",
+        )
+    )
+
+    # javac ends line comments at CR as well as LF, and translates \uXXXX
+    # escapes before lexing -- so a comment can end mid-line and the dot need
+    # not appear literally in the source at all.
+    assert rejected_rewrite(
+        TranspileResult(
+            kind="java_udf",
+            java_source="class T { Object r = // sneaky\rRuntime.getRuntime();\n}",
+            class_name="T",
+        )
+    )
+    assert rejected_rewrite(
+        TranspileResult(
+            kind="java_udf",
+            java_source="class T { Object r = // sneaky \\u000d Runtime.getRuntime();\n}",
+            class_name="T",
+        )
+    )
+    assert rejected_rewrite(
+        TranspileResult(
+            kind="java_udf",
+            java_source="class T { Object r = Runtime\\u002egetRuntime(); }",
+            class_name="T",
+        )
+    )
+    assert rejected_rewrite(
+        TranspileResult(
+            kind="java_udf",
+            java_source="class T { Object p = new \\u0050rocessBuilder(); }",
+            class_name="T",
+        )
+    )
+
+    # A mention inside a string or text block, with no real call in the code,
+    # must not be a false-positive rejection either.
     assert (
         rejected_rewrite(
             TranspileResult(
                 kind="java_udf",
-                java_source="class T { int x; } // not actually using ProcessBuilder here",
+                java_source='class T { String s = "Runtime.getRuntime is blocked"; }',
+                class_name="T",
+            )
+        )
+        is None
+    )
+    assert (
+        rejected_rewrite(
+            TranspileResult(
+                kind="java_udf",
+                java_source='class T { String s = """Runtime.getRuntime() // ProcessBuilder"""; }',
                 class_name="T",
             )
         )

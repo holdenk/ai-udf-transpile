@@ -159,10 +159,63 @@ def _sql_for_forbidden_scan(sql: str) -> str:
     return without_line.replace("`", "")
 
 
+# Comments and string/char/text-block contents, blanked before the forbidden
+# scan. Leftmost match wins, so a string starting before a `//` or `/*` inside
+# it consumes it -- comment syntax inside a literal is never treated as a
+# comment (a real call cannot hide behind `"http://..."` on the same line),
+# and a mention inside a literal is blanked with it (no false positive).
+# Line comments end at CR too: javac treats \r as a line terminator.
+_JAVA_SKIP = re.compile(
+    r"//[^\n\r]*"  # line comment
+    r"|/\*.*?\*/"  # block comment
+    r'|"""(?:[^"\\]|\\.|"(?!""))*"""'  # text block
+    r'|"(?:[^"\\\n]|\\.)*"'  # string literal
+    r"|'(?:[^'\\\n]|\\.)*'",  # char literal
+    re.DOTALL,
+)
+
+_JAVA_UNICODE_ESCAPE = re.compile(r"\\u+[0-9a-fA-F]{4}")
+
+
+def _translate_java_unicode_escapes(java: str) -> str:
+    """JLS 3.3: `\\uXXXX` translates before lexing, even inside comments and
+    literals, so the scan must see the translated text -- `Runtime\\u002egetRuntime`
+    compiles, and `// x \\u000d Runtime.getRuntime()` is a comment that ends
+    mid-line. A backslash is eligible only when the run of backslashes right
+    before it is even (`\\\\u0041` is an escaped backslash plus text). Single
+    pass: translated output is not rescanned.
+    """
+    out: list[str] = []
+    i = 0
+    run = 0
+    while i < len(java):
+        if java[i] == "\\" and run % 2 == 0:
+            match = _JAVA_UNICODE_ESCAPE.match(java, i)
+            if match:
+                out.append(chr(int(match.group(0)[-4:], 16)))
+                i = match.end()
+                run = 0
+                continue
+        out.append(java[i])
+        run = run + 1 if java[i] == "\\" else 0
+        i += 1
+    return "".join(out)
+
+
+def _blank_java_skippable(match: re.Match) -> str:
+    return re.sub(r"[^\n]", " ", match.group(0))
+
+
 def _java_for_forbidden_scan(java: str) -> str:
-    """Drop comments so `Run/* */time.getRuntime` still matches, same as the SQL side."""
-    without_block = re.sub(r"/\*.*?\*/", " ", java, flags=re.DOTALL)
-    return re.sub(r"//[^\n]*", " ", without_block)
+    """Scan what javac would lex: unicode escapes translated, comments and
+    literals blanked (the SQL side mirrors the comment half of this).
+
+    The evasions that matter are whitespace/comments around the dot of a
+    qualified name (`Runtime/* */./* */getRuntime()` compiles) and unicode
+    escapes for the tokens themselves; a comment cannot split an identifier
+    (`Run/* */time` does not compile).
+    """
+    return _JAVA_SKIP.sub(_blank_java_skippable, _translate_java_unicode_escapes(java))
 
 
 def rejected_rewrite(result: Any) -> Optional[str]:
