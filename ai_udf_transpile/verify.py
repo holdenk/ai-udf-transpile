@@ -415,17 +415,48 @@ def _spark_type(simple: str):
     }.get(t, LongType() if t.startswith("decimal") else StringType())
 
 
-def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_type: str):
-    from pyspark.sql import Row
-    from pyspark.sql.types import StructField, StructType
+# One Spark job per example dominates verify time. A hundred rows in one
+# DataFrame is the cheap path; a batch that throws (ANSI divide-by-zero on a
+# single row fails the whole job) falls back to per-row eval.
+SQL_BATCH_ROWS = 100
 
-    fields = [
+
+def _param_fields(input_types: list[str]):
+    from pyspark.sql.types import StructField
+
+    return [
         StructField(f"_udf_param_{i}", _spark_type(input_types[i]), True) for i in range(len(input_types))
     ]
-    schema = StructType(fields)
-    row_kwargs = {f"_udf_param_{i}": args[i] for i in range(len(args))}
-    df = spark.createDataFrame([Row(**row_kwargs)], schema=schema)
+
+
+def _row_values(args: tuple) -> dict[str, Any]:
+    return {f"_udf_param_{i}": args[i] for i in range(len(args))}
+
+
+def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_type: str):
+    from pyspark.sql import Row
+    from pyspark.sql.types import StructType
+
+    del return_type
+    df = spark.createDataFrame([Row(**_row_values(args))], StructType(_param_fields(input_types)))
     return df.selectExpr(f"({sql}) AS result").collect()[0][0]
+
+
+def _eval_sql_batch(spark: Any, sql: str, rows: list[tuple], input_types: list[str]) -> list:
+    """Evaluate ``sql`` on many argument tuples in one job. Order matches ``rows``."""
+    from pyspark.sql import Row
+    from pyspark.sql.types import IntegerType, StructField, StructType
+
+    fields = [StructField("_batch_id", IntegerType(), False)] + _param_fields(input_types)
+    data = []
+    for idx, args in enumerate(rows):
+        values = {"_batch_id": idx}
+        values.update(_row_values(args))
+        data.append(Row(**values))
+    df = spark.createDataFrame(data, StructType(fields))
+    collected = df.orderBy("_batch_id").selectExpr("_batch_id", f"({sql}) AS result").collect()
+    by_id = {int(record[0]): record[1] for record in collected}
+    return [by_id[i] for i in range(len(rows))]
 
 
 def smoke_test_reconstruction(
@@ -621,14 +652,60 @@ def hypothesis_check(
     if spark is None:
         return False, "hypothesis_check requires a SparkSession"
 
+    import time
+
     from hypothesis import HealthCheck, example, given, settings
     from hypothesis import strategies as st
 
     strategies = [_strategy_for(t) for t in input_types]
     mismatch: list[str] = []
     py_successes = [0]  # a rewrite is only verified if python succeeds somewhere
+    # (args, python value, python exception). SQL runs later, ~100 rows per job.
+    queued: list[tuple[tuple, Any, Optional[BaseException]]] = []
+    example_count = 0
+    sql_batches = 0
+    started = time.perf_counter()
+
+    def _judge(
+        args: tuple,
+        py_value: Any,
+        py_exc: Optional[BaseException],
+        sql_value: Any,
+        sql_exc: Optional[BaseException],
+    ) -> None:
+        if sql_exc is not None:
+            if py_exc is None:
+                mismatch.append(f"sql raised {sql_exc!r} on {args!r} but python returned {py_value!r}")
+            return
+        if py_exc is not None:
+            # Spark's own hypothesis policy: python raise + sql value is allowed.
+            return
+        if not _within_tolerance(py_value, sql_value, tolerance):
+            mismatch.append(f"mismatch on {args!r}: python={py_value!r} sql={sql_value!r}")
+
+    def _flush(batch: list[tuple[tuple, Any, Optional[BaseException]]]) -> None:
+        nonlocal sql_batches
+        if not batch:
+            return
+        sql_batches += 1
+        args_list = [item[0] for item in batch]
+        try:
+            sql_values = _eval_sql_batch(spark, eval_expr, args_list, input_types)
+        except Exception:
+            logger.debug("sql batch of %d failed; retrying per row", len(batch), exc_info=True)
+            for args, py_value, py_exc in batch:
+                try:
+                    sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type)
+                    _judge(args, py_value, py_exc, sql_value, None)
+                except Exception as exc:
+                    _judge(args, py_value, py_exc, _SENTINEL_RAISED, exc)
+            return
+        for (args, py_value, py_exc), sql_value in zip(batch, sql_values):
+            _judge(args, py_value, py_exc, sql_value, None)
 
     def _run(args: tuple) -> None:
+        nonlocal example_count
+        example_count += 1
         py_exc: Optional[BaseException] = None
         try:
             py_value = python_fn(*args)
@@ -646,21 +723,7 @@ def hypothesis_check(
                 # return type would fail as well, so the sql side may do
                 # anything (ANSI overflow on cast(bround(1e37) as bigint)).
                 return
-        try:
-            sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type)
-            sql_exc = None
-        except Exception as exc:
-            sql_value = _SENTINEL_RAISED
-            sql_exc = exc
-        if sql_exc is not None:
-            if py_exc is None:
-                mismatch.append(f"sql raised {sql_exc!r} on {args!r} but python returned {py_value!r}")
-            return
-        if py_exc is not None:
-            # Spark's own hypothesis policy: python raise + sql value is allowed.
-            return
-        if not _within_tolerance(py_value, sql_value, tolerance):
-            mismatch.append(f"mismatch on {args!r}: python={py_value!r} sql={sql_value!r}")
+        queued.append((args, py_value, py_exc))
 
     def _explicit_examples() -> list[tuple]:
         """Real sampled rows plus built-in interesting strings.
@@ -767,10 +830,26 @@ def hypothesis_check(
         database=None,
     )(check)
 
+    def _log_timing() -> None:
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "hypothesis_check examples=%d sql_rows=%d batches=%d seconds=%.2f",
+            example_count,
+            len(queued),
+            sql_batches,
+            elapsed,
+        )
+
     try:
         check()
     except Exception as exc:
+        _log_timing()
         return False, f"hypothesis failed: {exc}"
+    for offset in range(0, len(queued), SQL_BATCH_ROWS):
+        if mismatch:
+            break
+        _flush(queued[offset : offset + SQL_BATCH_ROWS])
+    _log_timing()
     if mismatch:
         return False, mismatch[0]
     if py_successes[0] == 0:

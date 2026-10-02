@@ -53,9 +53,14 @@ def _sql(sql: str) -> TranspileResult:
     return TranspileResult(kind=KIND_CATALYST, sql=sql)
 
 
-def test_correct_sql_passes(spark):
+def test_correct_sql_passes(spark, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="ai_udf_transpile.verify")
     ok, err = _check(PLUS_ONE, _sql("_udf_param_0 + 1"), ["bigint"], "bigint", spark)
     assert ok, err
+    assert "hypothesis_check examples=" in caplog.text
+    assert "seconds=" in caplog.text
 
 
 def test_python_raise_sql_null_is_allowed(spark):
