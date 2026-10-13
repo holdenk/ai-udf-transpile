@@ -49,8 +49,9 @@ def backwards(name: str) -> str:
 def zfill3(s: str) -> str:
     # The non-trivial arm: python zfill never truncates and pads after a +/-
     # sign, so the rewrite is a 3-branch CASE -- bare lpad is wrong on both.
-    # (Array returns would show more, but _transpile_func admits only
-    # numeric/string/boolean/binary returns, before any transpiler runs.)
+    # (Array-of-atomic returns are supported too -- scatter_to_seconds in
+    # demo.py returns array<string> -- but this bench stays atomic to keep
+    # the arms comparable. Complex types -- structs, nested maps -- are not.)
     return s.zfill(3)
 
 
