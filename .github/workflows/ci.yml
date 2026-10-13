@@ -94,3 +94,21 @@ jobs:
         run: |
           export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
           pytest tests/ -v
+      # Reduced-settings E2E canary: proves the transpile pipeline works on a
+      # fresh Spark master build and produces the CSV for slides. always() so
+      # a pytest flake doesn't hide a real bench regression (or vice versa).
+      - name: Micro benchmark (reduced)
+        if: always()
+        env:
+          SPARK_HOME: ${{ github.workspace }}/spark
+        run: |
+          export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
+          export PYSPARK_PYTHON="$(which python)" PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
+          python examples/bench_micro.py 100000 --rounds 1 --csv bench_micro.csv
+      - name: Upload benchmark CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-micro-csv
+          path: bench_micro.csv
+          if-no-files-found: ignore
