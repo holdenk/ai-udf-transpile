@@ -8,11 +8,13 @@ Three numbers, all on one local SparkSession:
   fill cost    one-time seconds for register_impl (Hypothesis + javac)
 
     export SPARK_HOME=/path/to/spark-master   # same env as demo_quickstart.py
-    python examples/bench_micro.py [rows]     # default 10,000,000
+    python examples/bench_micro.py [rows] [--rounds N] [--csv PATH]
 """
 
 from __future__ import annotations
 
+import argparse
+import csv
 import os
 import sys
 import tempfile
@@ -78,7 +80,15 @@ def noop_seconds(df) -> float:
 
 
 def main() -> int:
-    rows = int(sys.argv[1]) if len(sys.argv) > 1 else 10_000_000
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("rows", nargs="?", type=int, default=10_000_000)
+    parser.add_argument("--rounds", type=int, default=3, help="measured rounds per arm; min is reported")
+    parser.add_argument(
+        "--csv", metavar="PATH", help="also write results to PATH as section,name,metric,value"
+    )
+    args = parser.parse_args()
+    rows = args.rows
+    csv_rows: list[tuple[str, str, str, object]] = []
     spark = (
         SparkSession.builder.master("local[*]")
         .appName("ai-udf-transpile-bench")
@@ -184,12 +194,16 @@ def main() -> int:
     for _, arm_df, _ in arms:  # warmup round for everyone
         noop_seconds(arm_df)
     secs: dict[str, float] = {}
-    for _ in range(3):
+    for _ in range(args.rounds):
         for name, arm_df, _ in arms:
             secs[name] = min(secs.get(name, float("inf")), noop_seconds(arm_df))
     for name, _, baseline in arms:
         speedup = f"  ({secs[baseline] / secs[name]:.1f}x python)" if baseline else ""
         print(f"{name + ':':24}{secs[name]:6.2f}s  {rows / secs[name]:>12,.0f} rows/s{speedup}")
+        csv_rows.append(("throughput", name, "rows_per_second", round(rows / secs[name])))
+        csv_rows.append(("throughput", name, "seconds", round(secs[name], 3)))
+        if baseline:
+            csv_rows.append(("throughput", name, "speedup_vs_python", round(secs[baseline] / secs[name], 1)))
 
     print()
     print("=== UDF DEFINITION OVERHEAD (avg of 300 creations) ===")
@@ -207,16 +221,30 @@ def main() -> int:
     plain_ms = (time.perf_counter() - start) / creations * 1000
     spark.conf.set(TRANSPILE_CONF, "true")
     print(f"plugin warm-hit: {hit_ms:.2f} ms/def   plain python udf: {plain_ms:.2f} ms/def")
+    csv_rows.append(("definition_overhead", "plugin warm-hit", "ms_per_definition", round(hit_ms, 2)))
+    csv_rows.append(("definition_overhead", "plain python udf", "ms_per_definition", round(plain_ms, 2)))
 
     print()
     print("=== ONE-TIME FILL COST (verify + publish, per rewrite) ===")
-    print(f"register_impl catalyst plus_one (Hypothesis): {fill_catalyst:.2f}s")
-    print(f"register_impl catalyst zfill3 (Hypothesis): {fill_zfill:.2f}s")
-    print(f"register_impl catalyst edit_distance (Hypothesis): {fill_edit:.2f}s")
-    print(f"register_impl java_udf backwards (Hypothesis + javac): {fill_java:.2f}s")
+    fills = [
+        ("catalyst plus_one (Hypothesis)", fill_catalyst),
+        ("catalyst zfill3 (Hypothesis)", fill_zfill),
+        ("catalyst edit_distance (Hypothesis)", fill_edit),
+        ("java_udf backwards (Hypothesis + javac)", fill_java),
+    ]
+    for name, seconds in fills:
+        print(f"register_impl {name}: {seconds:.2f}s")
+        csv_rows.append(("fill_cost", name, "seconds", round(seconds, 2)))
 
     shutdown()
     spark.stop()
+
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["section", "name", "metric", "value"])
+            writer.writerows(csv_rows)
+        print(f"csv: wrote {len(csv_rows)} rows to {args.csv}")
     return 0
 
 
