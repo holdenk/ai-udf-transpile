@@ -5,7 +5,7 @@ Each backend gets a fresh SQLite catalog, transpiles two UDFs for real
 (cache miss -> CLI -> Hypothesis verify -> cache hit), and we time it.
 
     export SPARK_HOME=/path/to/spark-master
-    export PYTHONPATH="$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-0.10.9.9-src.zip"
+    export PYTHONPATH="$SPARK_HOME/python:$(echo $SPARK_HOME/python/lib/py4j-*-src.zip | awk '{print $1}')"
     export PYSPARK_PYTHON="$(pwd)/.venv/bin/python"
     export PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
     python examples/demo_live_backends.py              # all backends found on PATH

@@ -150,6 +150,11 @@ Implement `org.apache.spark.sql.api.java.UDFN` (N = arity):
   arbitrary precision, so a `long` can overflow where Python cannot;
   `Double.toString` spells non-finite values `Infinity`/`NaN` where Python
   spells `inf`/`nan` — match Python's spelling if the UDF stringifies.
+- Forbidden APIs (the rewrite is rejected before it is ever compiled or run):
+  `Runtime.getRuntime`, `System.load`/`loadLibrary`/`exit`, `ProcessBuilder`,
+  reflection (`Class.forName`, `loadClass`, `getMethod`, `MethodHandles`),
+  any `exec(`, and anything under `java.io.`, `java.net.`, or `javax.script`.
+  A row function needs none of them.
 
 ### Example (Java)
 

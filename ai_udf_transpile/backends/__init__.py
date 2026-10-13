@@ -25,7 +25,8 @@ def pick_auto(spark: Any = None) -> str:
     for name, binary in candidates:
         if shutil.which(binary):
             return name
-    raise BackendError("auto backend: none of cortex, agent, claude found on PATH")
+    tried = ", ".join(f"{name} ({binary})" for name, binary in candidates)
+    raise BackendError(f"auto backend: none of these are on PATH: {tried}")
 
 
 def get_backend(name: Optional[str] = None, spark: Any = None) -> Backend:
@@ -48,4 +49,4 @@ def get_backend(name: Optional[str] = None, spark: Any = None) -> Backend:
         from ai_udf_transpile.backends.claude import ClaudeBackend
 
         return ClaudeBackend(spark)
-    raise ValueError(f"unknown backend {chosen!r}")
+    raise BackendError(f"unknown backend {chosen!r}; expected auto, fake, coco, cursor, or claude")

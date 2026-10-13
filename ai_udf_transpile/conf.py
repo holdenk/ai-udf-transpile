@@ -123,11 +123,19 @@ def get_bool(key: str, spark: Any = None, default: bool = False) -> bool:
 
 
 def get_int(key: str, spark: Any = None, default: int = 0) -> int:
-    return int(get_value(key, spark, str(default)))
+    try:
+        return int(get_value(key, spark, str(default)))
+    except (TypeError, ValueError):
+        logger.debug("conf %s is not an int; using %s", key, default)
+        return default
 
 
 def get_float(key: str, spark: Any = None, default: float = 0.0) -> float:
-    return float(get_value(key, spark, str(default)))
+    try:
+        return float(get_value(key, spark, str(default)))
+    except (TypeError, ValueError):
+        logger.debug("conf %s is not a float; using %s", key, default)
+        return default
 
 
 def get_csv(key: str, spark: Any = None, default: Optional[str] = None) -> set[str]:

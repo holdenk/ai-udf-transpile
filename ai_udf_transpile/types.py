@@ -17,6 +17,28 @@ ANNOTATION_MAP: dict[str, tuple[str, str]] = {
     "datetime": ("timestamp", "timestamp"),
 }
 
+# Reverse map for the register_impl input_types path: simple strings the
+# cache keys use → input category.
+_SIMPLE_TO_CATEGORY: dict[str, str] = {simple: category for category, simple in ANNOTATION_MAP.values()}
+
+
+def categories_for_spark_types(input_types: list[str]) -> list[str]:
+    """Best-effort input categories for simple-type strings (register_impl input_types path)."""
+    out: list[str] = []
+    for simple in input_types:
+        t = simple.strip().lower()
+        if t in _SIMPLE_TO_CATEGORY:
+            out.append(_SIMPLE_TO_CATEGORY[t])
+        elif t.startswith("map<"):
+            out.append("map")
+        elif t.startswith("array<"):
+            out.append("array")
+        else:
+            # Unknown simple type: numeric is the historical default.
+            out.append("numeric")
+    return out
+
+
 ATOMIC_RETURN_PREFIXES = (
     "tinyint",
     "smallint",
@@ -136,7 +158,8 @@ def return_spark_type(return_type: Any) -> Optional[str]:
     if isinstance(return_type, str):
         simple = return_type.strip().lower()
         if _is_supported_return_simple(simple):
-            return return_type.strip()
+            # Canonical lowercase, so "DOUBLE" and DoubleType() key identically.
+            return simple
         return None
     simple_fn = getattr(return_type, "simpleString", None)
     if callable(simple_fn):

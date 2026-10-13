@@ -4,7 +4,7 @@
 Run with a packaged Spark master:
 
     export SPARK_HOME=/path/to/spark-master
-    export PYTHONPATH="$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-0.10.9.9-src.zip"
+    export PYTHONPATH="$SPARK_HOME/python:$(echo $SPARK_HOME/python/lib/py4j-*-src.zip | awk '{print $1}')"
     export PYSPARK_PYTHON="$(pwd)/.venv/bin/python"   # workers must match the driver
     export PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
     python examples/demo.py
@@ -217,6 +217,24 @@ def always_decline(x: int) -> int:
     return len(os.getcwd())
 
 
+_TIMEOUTS: list[str] = []
+
+
+def wait_transpiled(desc, func, rtype, timeout=120):
+    """Poll a fresh UDF until the cache hit transpiles it; return the last UDF.
+
+    A timeout is recorded so main() can exit non-zero (run_demos.sh keys on it).
+    """
+    deadline = time.time() + timeout
+    udf = UserDefinedFunction(func, rtype)
+    while time.time() < deadline and not udf.transpiled:
+        time.sleep(1.0)
+        udf = UserDefinedFunction(func, rtype)
+    if not udf.transpiled:
+        _TIMEOUTS.append(desc)
+    return udf
+
+
 def wait_for_status(catalog, key, want, timeout=120):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -224,7 +242,10 @@ def wait_for_status(catalog, key, want, timeout=120):
         if row is not None and row.status == want:
             return row
         time.sleep(0.5)
-    return catalog.get(key)
+    row = catalog.get(key)
+    if row is None or row.status != want:
+        _TIMEOUTS.append(f"{key[:16]}: wanted {want}, still {row.status if row else None}")
+    return row
 
 
 def main() -> int:
@@ -251,47 +272,24 @@ def main() -> int:
         first = UserDefinedFunction(func, rtype)
         print(f"{func.__name__}: first call transpiled={bool(first.transpiled)} (cache miss -> Python)")
         # wait for the inline worker
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            second = UserDefinedFunction(func, rtype)
-            if second.transpiled:
-                break
-            time.sleep(1.0)
+        second = wait_transpiled(f"{func.__name__} cache hit", func, rtype)
         print(f"{func.__name__}: second call transpiled={bool(second.transpiled)} (cache hit)")
         rows = df.filter("x is not null").select(second("x").alias("r")).collect()
         print(f"{func.__name__}: results={[r[0] for r in rows]}")
 
-    g = UserDefinedFunction(greet, StringType())
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        g = UserDefinedFunction(greet, StringType())
-        if g.transpiled:
-            break
-        time.sleep(1.0)
+    g = wait_transpiled("g not transpiled", greet, StringType())
     names = spark.createDataFrame([("bo",), ("holden",)], ["name"])
     greet_rows = [r[0] for r in names.select(g("name")).collect()]
     print(f"greet: transpiled={bool(g.transpiled)} results={greet_rows}")
 
-    ua = UserDefinedFunction(upper_useragent, StringType())
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        ua = UserDefinedFunction(upper_useragent, StringType())
-        if ua.transpiled:
-            break
-        time.sleep(1.0)
+    ua = wait_transpiled("ua not transpiled", upper_useragent, StringType())
     uas = spark.createDataFrame([("Mozilla/5.0 (Windows NT 10.0; Win64; x64)",)], ["ua"])
     print(
         f"upper_useragent (SPARK-21935): transpiled={bool(ua.transpiled)} "
         f"results={[r[0] for r in uas.select(ua('ua')).collect()]}"
     )
 
-    ci = UserDefinedFunction(contains_ingredient, BooleanType())
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        ci = UserDefinedFunction(contains_ingredient, BooleanType())
-        if ci.transpiled:
-            break
-        time.sleep(1.0)
+    ci = wait_transpiled("ci not transpiled", contains_ingredient, BooleanType())
     recipes = spark.createDataFrame(
         [("2 cups flour, 1 tsp salt", "salt"), ("100% whole wheat", "%"), (None, "salt")],
         ["recipe", "ingredient"],
@@ -304,13 +302,7 @@ def main() -> int:
 
     # Timestamp inputs are gated out by default; opt in for this one.
     conf.set_value(conf.INPUT_CATEGORIES, "numeric,string,bool,binary,map,timestamp", spark)
-    te = UserDefinedFunction(timestamp_to_epoch, StringType())
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        te = UserDefinedFunction(timestamp_to_epoch, StringType())
-        if te.transpiled:
-            break
-        time.sleep(1.0)
+    te = wait_transpiled("te not transpiled", timestamp_to_epoch, StringType())
     pickups = spark.createDataFrame(
         [
             (datetime.datetime(2015, 1, 1, 0, 12, 0),),
@@ -326,13 +318,7 @@ def main() -> int:
         f"distinct_count={stamped.distinct().count()} (NULL -> 'nan', like the pandas original)"
     )
 
-    sc = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        sc = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
-        if sc.transpiled:
-            break
-        time.sleep(1.0)
+    sc = wait_transpiled("sc not transpiled", scatter_to_seconds, ArrayType(StringType()))
     starts = spark.createDataFrame(
         [
             ("2015-01-01 00:00:00", "2"),
@@ -368,12 +354,7 @@ def main() -> int:
         f"BSPIn: first call transpiled={bool(bi.transpiled)} results={first_rows} "
         "(miss -> Python, rows sampled)"
     )
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        bi = UserDefinedFunction(BSPIn, IntegerType())
-        if bi.transpiled:
-            break
-        time.sleep(1.0)
+    bi = wait_transpiled("BSPIn not transpiled", BSPIn, IntegerType())
     print(
         f"BSPIn (array<string> inputs): transpiled={bool(bi.transpiled)} "
         f"results={[r[0] for r in lac.select(bi('OLD_LAC', 'NEW_LAC', 'bsp', 'mid')).collect()]}"
@@ -394,12 +375,7 @@ def main() -> int:
         f"flatlist: first call transpiled={bool(fl.transpiled)} results={first_rows} "
         "(miss -> Python, rows sampled)"
     )
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        fl = UserDefinedFunction(flatlist, ArrayType(StringType()))
-        if fl.transpiled:
-            break
-        time.sleep(1.0)
+    fl = wait_transpiled("flatlist not transpiled", flatlist, ArrayType(StringType()))
     print(
         f"flatlist (array<array<string>> input): transpiled={bool(fl.transpiled)} "
         f"results={[r[0] for r in nested.select(fl('s')).collect()]}"
@@ -420,12 +396,7 @@ def main() -> int:
     mb = UserDefinedFunction(mod_bucket, LongType())
     first_rows = [r[0] for r in mods.select(mb("value", "modulus")).collect()]
     print(f"mod_bucket: first call transpiled={bool(mb.transpiled)} results={first_rows} (miss -> Python)")
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        mb = UserDefinedFunction(mod_bucket, LongType())
-        if mb.transpiled:
-            break
-        time.sleep(1.0)
+    mb = wait_transpiled("mod_bucket not transpiled", mod_bucket, LongType())
     print(
         f"mod_bucket (floored modulo): transpiled={bool(mb.transpiled)} "
         f"results={[r[0] for r in mods.select(mb('value', 'modulus')).collect()]} "
@@ -433,13 +404,7 @@ def main() -> int:
     )
 
     halves = spark.createDataFrame([(0.5,), (2.5,), (3.5,), (-2.5,), (1e16,)], ["x"])
-    rh = UserDefinedFunction(round_half, LongType())
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        rh = UserDefinedFunction(round_half, LongType())
-        if rh.transpiled:
-            break
-        time.sleep(1.0)
+    rh = wait_transpiled("rh not transpiled", round_half, LongType())
     print(
         f"round_half (banker's rounding): transpiled={bool(rh.transpiled)} "
         f"results={[r[0] for r in halves.select(rh('x')).collect()]} "
@@ -450,26 +415,14 @@ def main() -> int:
         [(datetime.datetime(2026, 9, 21),), (datetime.datetime(2026, 9, 27),)],  # Monday, Sunday
         ["t"],
     )
-    wd = UserDefinedFunction(weekday_of, LongType())
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        wd = UserDefinedFunction(weekday_of, LongType())
-        if wd.transpiled:
-            break
-        time.sleep(1.0)
+    wd = wait_transpiled("wd not transpiled", weekday_of, LongType())
     print(
         f"weekday_of (Monday=0): transpiled={bool(wd.transpiled)} "
         f"results={[r[0] for r in days.select(wd('t')).collect()]} (bare dayofweek rejected)"
     )
 
     dots = spark.createDataFrame([("a.b",), ("no.dot.here.really",), ("plain",)], ["s"])
-    sd = UserDefinedFunction(split_dot, ArrayType(StringType()))
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        sd = UserDefinedFunction(split_dot, ArrayType(StringType()))
-        if sd.transpiled:
-            break
-        time.sleep(1.0)
+    sd = wait_transpiled("sd not transpiled", split_dot, ArrayType(StringType()))
     print(
         f"split_dot (regex trap): transpiled={bool(sd.transpiled)} "
         f"results={[r[0] for r in dots.select(sd('s')).collect()]} "
@@ -477,13 +430,7 @@ def main() -> int:
     )
 
     zins = spark.createDataFrame([("5",), ("-5",), ("+7",), ("abcd",)], ["s"])
-    zf = UserDefinedFunction(zfill3, StringType())
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        zf = UserDefinedFunction(zfill3, StringType())
-        if zf.transpiled:
-            break
-        time.sleep(1.0)
+    zf = wait_transpiled("zf not transpiled", zfill3, StringType())
     print(
         f"zfill3 (sign-aware, never truncates): transpiled={bool(zf.transpiled)} "
         f"results={[r[0] for r in zins.select(zf('s')).collect()]} (bare lpad rejected)"
@@ -502,12 +449,7 @@ def main() -> int:
     w = UserDefinedFunction(widget_name, StringType())
     first_rows = [r[0] for r in payloads.select(w("payload")).collect()]
     print(f"widget_name: first call transpiled={bool(w.transpiled)} results={first_rows} (miss -> Python)")
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        w = UserDefinedFunction(widget_name, StringType())
-        if w.transpiled:
-            break
-        time.sleep(1.0)
+    w = wait_transpiled("widget_name not transpiled", widget_name, StringType())
     sampled = catalog._conn.execute("SELECT args_json FROM samples").fetchall()
     print(f"widget_name: sampled real rows={len(sampled)} e.g. {sampled[0][0] if sampled else None}")
     print(
@@ -517,23 +459,11 @@ def main() -> int:
 
     print()
     print("=== JAVA UDF TARGET (compiled on the driver, Hypothesis-verified) ===")
-    bw = UserDefinedFunction(backwards, StringType())
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        bw = UserDefinedFunction(backwards, StringType())
-        if bw.transpiled:
-            break
-        time.sleep(1.0)
+    bw = wait_transpiled("bw not transpiled", backwards, StringType())
     bw_rows = [r[0] for r in names.select(bw("name")).collect()]
     print(f"backwards: transpiled={bool(bw.transpiled)} results={bw_rows} (Java UDF from cache)")
 
-    b = UserDefinedFunction(both_positive, BooleanType())
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        b = UserDefinedFunction(both_positive, BooleanType())
-        if b.transpiled:
-            break
-        time.sleep(1.0)
+    b = wait_transpiled("b not transpiled", both_positive, BooleanType())
     pairs = spark.createDataFrame([(1, 2), (-1, 2)], ["a", "b"])
     print(
         f"both_positive: transpiled={bool(b.transpiled)} "
@@ -841,11 +771,7 @@ def main() -> int:
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     wb_df = spark.createDataFrame([(1,), (2,)], ["x"])
     for func in (plus_one, is_none_branch):
-        u = UserDefinedFunction(func, LongType())
-        deadline = time.time() + 120
-        while time.time() < deadline and not u.transpiled:
-            time.sleep(1.0)
-            u = UserDefinedFunction(func, LongType())
+        u = wait_transpiled(f"{func.__name__} (writeback) not transpiled", func, LongType())
         print(
             f"{func.__name__}: transpiled={bool(u.transpiled)} "
             f"results={[r[0] for r in wb_df.select(u('x')).collect()]}"
@@ -855,6 +781,8 @@ def main() -> int:
     while time.time() < deadline and n < 2:  # the flush runs on the worker thread
         n = spark.sql(f"SELECT COUNT(*) FROM {wb_table}").collect()[0][0]
         time.sleep(1.0)
+    if n < 2:
+        _TIMEOUTS.append(f"writeback flush: only {n} rows in {wb_table}")
     print(f"shared table {wb_table}: {n} verified rows (flushed after 2 staged successes)")
 
     # Fresh-process view: brand-new SQLite file, same shared table.
@@ -876,6 +804,10 @@ def main() -> int:
 
     shutdown()
     spark.stop()
+    if _TIMEOUTS:
+        for note in _TIMEOUTS:
+            print(f"TIMED OUT: {note}")
+        return 1
     return 0
 
 

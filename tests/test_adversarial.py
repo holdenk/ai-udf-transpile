@@ -160,6 +160,7 @@ def test_bround_to_int_rejected_overflow(spark):
     # 1e16: python returns 10000000000000000; int32 cast raises under ANSI.
     ok, err = _check(round_half, "cast(bround(_udf_param_0) as int)", spark, ["double"], "bigint")
     assert not ok
+    assert "sql raised" in (err or "")
 
 
 def test_naive_dayofweek_rejected(spark):
@@ -249,7 +250,6 @@ def test_mod_bucket_end_to_end(spark, sqlite_path):
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     rows = [(7, 3), (-7, 3), (7, -3), (-7, -3), (None, 3)]
     df = spark.createDataFrame(rows, "x bigint, y bigint")
-    expected = [mod_bucket(a, b) if a is not None and b is not None else None for a, b in rows]
     # python: None % 3 raises; the UDF would error -- compare only non-null.
     expected = [a % b for a, b in rows if a is not None]
     df = df.filter("x is not null")

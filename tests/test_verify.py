@@ -130,7 +130,7 @@ def test_reflect_and_process_builder_rejected_without_spark():
         spark=None,
     )
     assert not ok
-    assert "Runtime.getRuntime" in (err or "")
+    assert "forbidden API" in (err or "")
 
     # Plain whitespace around the dot evades a literal match just as well.
     assert rejected_rewrite(

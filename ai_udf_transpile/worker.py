@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 _stop = threading.Event()
 _thread: Optional[threading.Thread] = None
 _thread_lock = threading.Lock()
-_worker_spark: Any = None
 
 
 def stop_inline() -> None:
@@ -123,12 +122,15 @@ def process_row(
             )
             # The reconstruction hook reads the process-global catalog/session.
             # The standalone worker does not go through enable(), so pin both
-            # or the smoke test no-ops and a bad rewrite is promoted.
-            from ai_udf_transpile.transpiler import set_catalog, set_session
+            # or the smoke test no-ops and a bad rewrite is promoted. Only pin
+            # when unset: a shutdown()+enable() cycle that raced this thread
+            # must not have the dead catalog stomp the fresh one.
+            from ai_udf_transpile.transpiler import get_catalog, set_catalog, set_session
 
-            set_catalog(catalog)
-            if spark is not None:
-                set_session(spark)
+            if get_catalog() is None:
+                set_catalog(catalog)
+                if spark is not None:
+                    set_session(spark)
             smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
                 spark,
                 source_text=row.source_text,
@@ -198,23 +200,33 @@ def poll_once(
 
 
 def _loop(catalog: Catalog, spark: Any) -> None:
-    interval = conf.get_float(conf.POLL_INTERVAL, spark, float(conf.DEFAULTS[conf.POLL_INTERVAL]))
-    while not _stop.is_set():
+    me = threading.current_thread()
+    # Identity check retires a zombie whose replacement was started while it
+    # was mid-poll; otherwise it would spin forever on its closed catalog.
+    while _thread is me and not _stop.is_set():
         try:
             backend = get_backend(spark=spark)
             poll_once(catalog, backend, spark)
         except Exception:
             logger.exception("inline worker poll failed")
+        # Read per iteration so a conf change applies without a restart.
+        interval = conf.get_float(conf.POLL_INTERVAL, spark, float(conf.DEFAULTS[conf.POLL_INTERVAL]))
         _stop.wait(interval)
 
 
 def maybe_start_inline(spark: Any, catalog: Catalog) -> None:
-    global _thread, _worker_spark
+    global _thread
     with _thread_lock:
-        if _thread is not None and _thread.is_alive():
-            return
+        thread = _thread
+        if thread is not None and thread.is_alive():
+            if not _stop.is_set():
+                return  # healthy worker already running
+            # A shutdown() raced a still-running poll (verify can take
+            # minutes, the join only waits 5s). Wait a moment for it to
+            # notice _stop, then replace it -- CAS row claims keep a brief
+            # two-worker overlap safe.
+            thread.join(timeout=5)
         _stop.clear()
-        _worker_spark = spark
         _thread = threading.Thread(
             target=_loop,
             name="ai-udf-transpile-worker",

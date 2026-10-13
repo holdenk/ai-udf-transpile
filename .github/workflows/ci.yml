@@ -93,7 +93,7 @@ jobs:
           SPARK_HOME: ${{ github.workspace }}/spark
         run: |
           export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
-          pytest tests/ -v
+          pytest tests/ -v -rs
       # Reduced-settings E2E canary: proves the transpile pipeline works on a
       # fresh Spark master build and produces the CSV for slides. always() so
       # a pytest flake doesn't hide a real bench regression (or vice versa).

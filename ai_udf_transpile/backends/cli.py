@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,13 +23,19 @@ logger = logging.getLogger(__name__)
 def parse_sandbox(sandbox: Path, stdout: str = "") -> TranspileResult:
     sql_path = sandbox / "OUT.sql"
     java_path = sandbox / "OUT.java"
+    # DECLINE is cheap and final (prompt.md): a DECLINE file never falls
+    # through to leftovers in the other file or stdout.
     if sql_path.exists():
         sql = sql_path.read_text(encoding="utf-8").strip()
-        if sql and sql.upper() != "DECLINE":
+        if sql and sql.upper() == "DECLINE":
+            raise BackendDecline("OUT.sql: DECLINE")
+        if sql:
             return TranspileResult(kind=KIND_CATALYST, sql=sql)
     if java_path.exists():
         source = java_path.read_text(encoding="utf-8").strip()
-        if source and source.upper() != "DECLINE":
+        if source and source.upper() == "DECLINE":
+            raise BackendDecline("OUT.java: DECLINE")
+        if source:
             return TranspileResult(
                 kind=KIND_JAVA_UDF,
                 java_source=source,
@@ -38,7 +45,7 @@ def parse_sandbox(sandbox: Path, stdout: str = "") -> TranspileResult:
     if not text or text.upper().startswith("DECLINE"):
         raise BackendDecline(text or "empty CLI output")
     first, _, rest = text.partition("\n")
-    if first.strip().lower().endswith(".java") or "class " in text:
+    if first.strip().lower().endswith(".java") or _JAVA_DECL_RE.search(text):
         return TranspileResult(
             kind=KIND_JAVA_UDF,
             java_source=text,
@@ -46,6 +53,11 @@ def parse_sandbox(sandbox: Path, stdout: str = "") -> TranspileResult:
         )
     sql = rest.strip() if first.strip().upper() == "SQL" else text
     return TranspileResult(kind=KIND_CATALYST, sql=sql)
+
+
+# A real class declaration is followed by a body/extends/implements; bare
+# `class ` in prose ("this class of input") is not Java.
+_JAVA_DECL_RE = re.compile(r"\bclass\s+\w+\s*(?:\{|extends\b|implements\b)")
 
 
 ArgvBuilder = Callable[[str, Path, str], list[str]]
@@ -81,7 +93,6 @@ class CliSpec:
     default_binary: str
     binary_conf_key: str
     argv: ArgvBuilder
-    extra_env: tuple[str, ...] = ()
     model_conf_key: Optional[str] = None
     model_flag: Optional[str] = None
 
@@ -134,7 +145,6 @@ CURSOR_SPEC = CliSpec(
     default_binary=conf.DEFAULTS[conf.BINARY_CURSOR],
     binary_conf_key=conf.BINARY_CURSOR,
     argv=cursor_argv,
-    extra_env=("CURSOR_API_KEY",),
     model_conf_key=conf.MODEL_CURSOR,
     model_flag="--model",
 )
@@ -143,7 +153,6 @@ CLAUDE_SPEC = CliSpec(
     default_binary=conf.DEFAULTS[conf.BINARY_CLAUDE],
     binary_conf_key=conf.BINARY_CLAUDE,
     argv=claude_argv,
-    extra_env=("ANTHROPIC_API_KEY",),
     model_conf_key=conf.MODEL_CLAUDE,
     model_flag="--model",
 )
@@ -204,7 +213,7 @@ class CliBackend:
             raise BackendError(f"{self.name} binary not found: {argv[0]}") from exc
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
-        if completed.returncode not in (0, None) and completed.returncode != 0:
+        if completed.returncode not in (0, None):
             # Still try to parse sandbox outputs; some CLIs exit non-zero after writing files.
             logger.debug("%s exit %s stderr=%s", self.name, completed.returncode, stderr[:500])
         model = self.model()
