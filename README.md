@@ -18,7 +18,7 @@ Targets **classic Spark master** (the `AbstractTranspiler` hook landed for
 ```bash
 pip install -e ".[dev]"
 export SPARK_HOME=/path/to/spark-master   # package-only build, tests skipped
-export PYTHONPATH="$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-*-src.zip"
+export PYTHONPATH="$SPARK_HOME/python:$(ls $SPARK_HOME/python/lib/py4j-*-src.zip | head -n1)"
 ```
 
 PyPI PySpark is not used for integration tests until 4.3+ is the pinned
@@ -67,6 +67,21 @@ Standalone worker when `inlineWorker` is false:
 ```bash
 python -m ai_udf_transpile.worker --sqlite-path /tmp/ai_udf_transpile.sqlite --backend fake
 ```
+
+## Demos & benchmarks
+
+```bash
+examples/run_demos.sh           # quickstart + full demo (fake backend)
+examples/run_demos.sh --bench   # + local micro benchmarks
+examples/run_demos.sh --live    # + real CLI backends (cortex/agent/claude on PATH)
+```
+
+The runner wires up `SPARK_HOME` (default `~/spark`), the py4j zip, and a
+matching `PYSPARK_PYTHON` itself. `examples/demo_quickstart.py` is the
+60-second version (one Catalyst rewrite, one Java UDF); `examples/demo.py`
+is the full tour including the adversarial pack. `examples/bench_micro.py`
+measures Python-vs-transpiled throughput over 10M cached rows (noop sink,
+plan-checked), per-definition catalog cost, and one-time verify cost.
 
 ## Catalog
 
