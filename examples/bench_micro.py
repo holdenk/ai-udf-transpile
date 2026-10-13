@@ -27,7 +27,8 @@ from pyspark.sql.types import LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import enable, register_impl, shutdown  # noqa: E402
-from ai_udf_transpile.backends.fake import BACKWARDS_JAVA  # noqa: E402
+from ai_udf_transpile.backends.fake import BACKWARDS_JAVA, FIXTURES  # noqa: E402
+from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PARTITIONS = os.cpu_count() or 16
@@ -41,6 +42,18 @@ def backwards(name: str) -> str:
     if name is None:
         return None
     return name[::-1]
+
+
+def zfill3(s: str) -> str:
+    # The non-trivial arm: python zfill never truncates and pads after a +/-
+    # sign, so the rewrite is a 3-branch CASE -- bare lpad is wrong on both.
+    # (Array returns would show more, but _transpile_func admits only
+    # numeric/string/boolean/binary returns, before any transpiler runs.)
+    return s.zfill(3)
+
+
+# The fake backend's fixture for this exact source: verified-faithful SQL.
+ZFILL_SQL = FIXTURES[canonical_source_from_func(zfill3)].sql
 
 
 def noop_seconds(df) -> float:
@@ -69,6 +82,9 @@ def main() -> int:
     # plus_one raises on None in interpreted Python, so the sample has no NULL.
     sample_ints = spark.createDataFrame([(1,), (41,)], ["x"])
     sample_strs = spark.createDataFrame([("holden",), (None,)], ["s"])
+    # "-555" pins the CASE's branch order: sign-before-length would truncate.
+    # No NULL row: interpreted python raises on None, the SQL returns NULL.
+    sample_zfill = spark.createDataFrame([("5",), ("-5",), ("+7",), ("-555",), ("abcd",)], ["s"])
 
     print(f"=== THROUGHPUT ({rows:,} rows, local[*], noop sink, min of 3 rounds) ===")
     # UserDefinedFunction is always SQL_BATCHED_UDF (the classic pickle path);
@@ -77,10 +93,12 @@ def main() -> int:
     # below guard against silently benchmarking the wrong operator.
     py_plus = UserDefinedFunction(plus_one, LongType())
     py_back = UserDefinedFunction(backwards, StringType())
-    assert not py_plus.transpiled and not py_back.transpiled
+    py_zfill = UserDefinedFunction(zfill3, StringType())
+    assert not py_plus.transpiled and not py_back.transpiled and not py_zfill.transpiled
     assert "BatchEvalPython" in ints.select(py_plus("x"))._jdf.queryExecution().toString()
     py_plus_expect = [r[0] for r in sample_ints.select(py_plus("x")).collect()]
     py_back_expect = [r[0] for r in sample_strs.select(py_back("s")).collect()]
+    py_zfill_expect = [r[0] for r in sample_zfill.select(py_zfill("s")).collect()]
 
     sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-bench-"), "cache.sqlite")
     enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
@@ -92,22 +110,32 @@ def main() -> int:
     start = time.perf_counter()
     register_impl(spark, backwards, kind="java_udf", impl_source=BACKWARDS_JAVA, return_type=StringType())
     fill_java = time.perf_counter() - start
+    start = time.perf_counter()
+    register_impl(spark, zfill3, kind="catalyst", catalyst_sql=ZFILL_SQL, return_type=StringType())
+    fill_zfill = time.perf_counter() - start
 
     ai_plus = UserDefinedFunction(plus_one, LongType())
     ai_back = UserDefinedFunction(backwards, StringType())
-    assert ai_plus.transpiled and ai_back.transpiled, "warm catalog did not produce a hit"
+    ai_zfill = UserDefinedFunction(zfill3, StringType())
+    assert ai_plus.transpiled and ai_back.transpiled and ai_zfill.transpiled, (
+        "warm catalog did not produce a hit"
+    )
     assert [r[0] for r in sample_ints.select(ai_plus("x")).collect()] == py_plus_expect
     assert [r[0] for r in sample_strs.select(ai_back("s")).collect()] == py_back_expect
+    assert [r[0] for r in sample_zfill.select(ai_zfill("s")).collect()] == py_zfill_expect
     assert "EvalPython" not in ints.select(ai_plus("x"))._jdf.queryExecution().toString()
     assert "EvalPython" not in strs.select(ai_back("s"))._jdf.queryExecution().toString()
+    assert "EvalPython" not in strs.select(ai_zfill("s"))._jdf.queryExecution().toString()
 
-    # All four UDFs exist before any timing (the transpile gate is read at
+    # All UDFs exist before any timing (the transpile gate is read at
     # construction), so rounds interleave fairly: nobody's warmup is deeper.
     arms = [
         ("python plus_one", ints.select(py_plus("x")), None),
         ("python backwards", strs.select(py_back("s")), None),
+        ("python zfill3", strs.select(py_zfill("s")), None),
         ("catalyst plus_one", ints.select(ai_plus("x")), "python plus_one"),
         ("java udf backwards", strs.select(ai_back("s")), "python backwards"),
+        ("catalyst zfill3", strs.select(ai_zfill("s")), "python zfill3"),
     ]
     for _, arm_df, _ in arms:  # warmup round for everyone
         noop_seconds(arm_df)
@@ -138,8 +166,9 @@ def main() -> int:
 
     print()
     print("=== ONE-TIME FILL COST (verify + publish, per rewrite) ===")
-    print(f"register_impl catalyst (Hypothesis): {fill_catalyst:.2f}s")
-    print(f"register_impl java_udf (Hypothesis + javac): {fill_java:.2f}s")
+    print(f"register_impl catalyst plus_one (Hypothesis): {fill_catalyst:.2f}s")
+    print(f"register_impl catalyst zfill3 (Hypothesis): {fill_zfill:.2f}s")
+    print(f"register_impl java_udf backwards (Hypothesis + javac): {fill_java:.2f}s")
 
     shutdown()
     spark.stop()
