@@ -46,9 +46,13 @@ f = udf(plus_one, LongType())  # first call: Python path; worker may fill cache
 ```
 
 Types must be known: every public parameter needs a recognized annotation
-(`int` / `float` / `str` / `bool` / `bytes`) and `udf(..., returnType)` must
-be an atomic Spark type. Untyped UDFs are ignored by this plugin (Spark's
-built-in `catalyst` transpiler may still try them).
+(`int` / `float` / `str` / `bool` / `bytes` / `datetime`, or `list[...]` /
+`dict[...]` for array/map inputs) and `udf(..., returnType)` must be an
+atomic Spark type. `numeric`, `string`, `bool`, and `binary` inputs engage
+by default; `timestamp`, `map`, and `array` inputs engage only when
+`spark.sql.experimental.aiUdfTranspile.inputCategories` opts in. Untyped
+UDFs are ignored by this plugin (Spark's built-in `catalyst` transpiler
+may still try them).
 
 Human-provided rewrite (skips the agent):
 
@@ -96,6 +100,9 @@ threshold accumulates. Lookups fall through to the table, so a fresh process
 (new SQLite file) is served verified rewrites without running a backend.
 Write-back is append-only (reads dedupe by latest `updated_at`), carries
 successes only, and is fail-open: a misconfigured table never breaks UDFs.
+Trust caveat: a served row is served as-is (no re-verification), so anyone
+who can append to that table can run SQL and Java in every reader's driver
+(see `docs/future-iceberg-udf-catalog.md`).
 
 Failed rewrites cool down for 24h (`failCooldownSeconds`) and stop retrying
 after `maxRetries` (default 3).

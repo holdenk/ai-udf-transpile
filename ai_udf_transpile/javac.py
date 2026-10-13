@@ -85,11 +85,13 @@ def _compile_jdk(spark: Any, java_source: str, class_name: str) -> bytes:
         units = file_manager.getJavaFileObjectsFromStrings(jvm.java.util.Collections.singletonList(src_file))
         classpath = jvm.java.lang.System.getProperty("java.class.path")
         options = jvm.java.util.ArrayList()
-        for opt in ("-classpath", classpath, "-d", out_dir, "-proc:none"):
+        for opt in ("-classpath", classpath, "-d", out_dir, "-proc:none", "-encoding", "UTF-8"):
             options.add(opt)
-        ok = bool(compiler.getTask(None, file_manager, None, options, None, units).call())
+        diagnostics = jvm.javax.tools.DiagnosticCollector()
+        ok = bool(compiler.getTask(None, file_manager, diagnostics, options, None, units).call())
         if not ok:
-            raise JavaCompileError(f"javac failed for {class_name}")
+            messages = "; ".join(str(d) for d in diagnostics.getDiagnostics().toArray())
+            raise JavaCompileError(f"javac failed for {class_name}: {messages or 'no diagnostics'}")
         entries: dict[str, bytes] = {}
         for root, _dirs, files in os.walk(out_dir):
             for name in files:
@@ -172,30 +174,39 @@ def _register_raw(spark: Any, name: str, class_name: str, return_type: Any) -> N
     """Register a Janino-compiled (raw UDFN) class, bypassing the generic check."""
     jvm = spark._jvm
     gateway = spark.sparkContext._gateway
+    # Session-wide conf; restore it so the registration does not leak the
+    # untyped-UDF escape hatch to the rest of the session.
+    prior = spark.conf.get("spark.sql.legacy.allowUntypedScalaUDF", None)
     spark.conf.set("spark.sql.legacy.allowUntypedScalaUDF", "true")
-    classloader = spark._jsparkSession.artifactManager().classloader()
-    clazz = classloader.loadClass(class_name)
-    instance = clazz.getConstructor(gateway.new_array(jvm.java.lang.Class, 0)).newInstance(
-        gateway.new_array(jvm.java.lang.Object, 0)
-    )
-    iface = None
-    for candidate in clazz.getInterfaces():
-        if str(candidate.getName()).startswith(_UDF_IFACE_PREFIX):
-            iface = candidate
-            break
-    if iface is None:
-        raise JavaCompileError(f"{class_name} does not implement a Spark UDFN interface")
-    jdt = spark._jsparkSession.parseDataType(return_type.json())
-    param_types = gateway.new_array(jvm.java.lang.Class, 2)
-    param_types[0] = iface
-    param_types[1] = jvm.java.lang.Class.forName("org.apache.spark.sql.types.DataType")
-    functions_cls = jvm.java.lang.Class.forName("org.apache.spark.sql.functions")
-    method = functions_cls.getMethod("udf", param_types)
-    args = gateway.new_array(jvm.java.lang.Object, 2)
-    args[0] = instance
-    args[1] = jdt
-    udf = method.invoke(None, args)
-    spark._jsparkSession.udf().register(name, udf)
+    try:
+        classloader = spark._jsparkSession.artifactManager().classloader()
+        clazz = classloader.loadClass(class_name)
+        instance = clazz.getConstructor(gateway.new_array(jvm.java.lang.Class, 0)).newInstance(
+            gateway.new_array(jvm.java.lang.Object, 0)
+        )
+        iface = None
+        for candidate in clazz.getInterfaces():
+            if str(candidate.getName()).startswith(_UDF_IFACE_PREFIX):
+                iface = candidate
+                break
+        if iface is None:
+            raise JavaCompileError(f"{class_name} does not implement a Spark UDFN interface")
+        jdt = spark._jsparkSession.parseDataType(return_type.json())
+        param_types = gateway.new_array(jvm.java.lang.Class, 2)
+        param_types[0] = iface
+        param_types[1] = jvm.java.lang.Class.forName("org.apache.spark.sql.types.DataType")
+        functions_cls = jvm.java.lang.Class.forName("org.apache.spark.sql.functions")
+        method = functions_cls.getMethod("udf", param_types)
+        args = gateway.new_array(jvm.java.lang.Object, 2)
+        args[0] = instance
+        args[1] = jdt
+        udf = method.invoke(None, args)
+        spark._jsparkSession.udf().register(name, udf)
+    finally:
+        if prior is None:
+            spark.conf.unset("spark.sql.legacy.allowUntypedScalaUDF")
+        else:
+            spark.conf.set("spark.sql.legacy.allowUntypedScalaUDF", prior)
 
 
 def register_java_udf(

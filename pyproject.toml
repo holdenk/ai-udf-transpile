@@ -17,11 +17,14 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+    # The inline worker verifies rewrites with Hypothesis at runtime, so a
+    # plain `pip install ai-udf-transpile` without [dev] must have it.
+    "hypothesis>=6.100",
+]
 
 [project.optional-dependencies]
 dev = [
-    "hypothesis>=6.100",
     "pytest>=8.0",
     "ruff>=0.8",
 ]

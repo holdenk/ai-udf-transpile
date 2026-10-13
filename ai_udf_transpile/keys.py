@@ -86,6 +86,14 @@ def _bound_names(function_ast: ast.FunctionDef, public_params: list[str]) -> set
             bound.add(node.name)
         elif isinstance(node, ast.arg):
             bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            # `except E as e:` binds e in the handler; not a capture.
+            bound.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            # `case [x, *rest]:` -- capture patterns bind locally.
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
     return bound
 
 

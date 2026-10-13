@@ -75,12 +75,16 @@ def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
         n = len(row.param_names)
         args = ", ".join(f"_udf_param_{i}" for i in range(n))
         if spark is not None and row.impl_class and (row.impl_binary or row.impl_source):
-            from ai_udf_transpile.javac import compile_java, register_java_udf
+            from ai_udf_transpile.javac import compile_java, register_java_udf, verify_function_name
 
             binary = row.impl_binary
             if binary is None and row.impl_source:
                 binary = compile_java(spark, row.impl_source, row.impl_class).jar_bytes
-            fname = f"ai_udf_{row.udf_key[:16]}"
+            # Content-addressed like the verify path: a key-addressed name
+            # would keep serving a stale jar after a re-verify stored new
+            # bytes for the same key (the artifact cache refuses overwrite
+            # and the classloader will not reload the old class name).
+            fname = verify_function_name("ai_udf", binary)
             register_java_udf(spark, fname, row.impl_class, binary, return_type)
             return F.expr(f"{fname}({args})").cast(return_type)
         if row.impl_source:

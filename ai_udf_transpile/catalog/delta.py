@@ -44,7 +44,11 @@ def _ident(table: str) -> str:
 def _sql_str(value: Optional[str]) -> str:
     if value is None:
         return "NULL"
-    return "'" + str(value).replace("'", "''") + "'"
+    # Escape backslashes too: Spark's default parser unescapes \n, \t, \\, \'
+    # inside string literals, so an unescaped backslash silently rewrites the
+    # stored SQL to something other than what was verified.
+    escaped = str(value).replace("\\", "\\\\").replace("'", "''")
+    return "'" + escaped + "'"
 
 
 def _sql_float(value: Optional[float]) -> str:
@@ -154,8 +158,12 @@ class DeltaCatalog:
             self.spark.sql(f"ALTER TABLE {self.table} ADD COLUMNS (tolerance DOUBLE)")
 
     def _select(self, udf_key: str) -> Optional[CacheRow]:
+        # insert_pending is select-then-insert and Delta has no PK, so
+        # concurrent drivers can leave twin rows for one udf_key; take the
+        # newest deterministically instead of whichever the planner picks.
         rows = self.spark.sql(
-            f"SELECT * FROM {self.table} WHERE udf_key = {_sql_str(udf_key)} LIMIT 1"
+            f"SELECT * FROM {self.table} WHERE udf_key = {_sql_str(udf_key)} "
+            "ORDER BY updated_at DESC, created_at DESC LIMIT 1"
         ).collect()
         if not rows:
             return None
@@ -255,9 +263,16 @@ class DeltaCatalog:
             """
         )
         after = self._select(udf_key)
+        # The MERGE's ON status='pending' is the CAS; attempt-count arithmetic
+        # alone would read another worker's just-made claim (no-op MERGE,
+        # after=1, before=0) as ours. Require our own stamps; the residual
+        # race (another claim in the same second with the same backend label)
+        # is bounded by the MERGE CAS itself.
         return (
             after is not None
             and after.status == "running"
+            and after.backend == backend
+            and after.claimed_at == now
             and after.attempt_count == ((before.attempt_count or 0) + 1)
         )
 

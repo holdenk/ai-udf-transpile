@@ -54,6 +54,11 @@ BUILTIN_INT_EXAMPLES: tuple[int, ...] = (
     2**31,
     -(2**31) - 1,
     2**40,
+    # 2^53 region: where int/float math diverges (the prompt's floor(x / y)
+    # trick); without these a backend ignoring "past 2^53, DECLINE" passes vacuously.
+    2**53 - 1,
+    2**53,
+    2**53 + 1,
     0,
     1,
     -1,
@@ -162,8 +167,10 @@ def _encode(value: Any) -> Any:
         # confused with the __bytes__ / __repr__ marker dicts.
         return {"__map__": [[_encode(k), _encode(v)] for k, v in value.items()]}
     if isinstance(value, (list, tuple)):
-        # array<string> args (pyspark hands array columns to the UDF as lists).
-        return {"__array__": [_encode(v) for v in value]}
+        # array<string> args (pyspark hands array columns to the UDF as
+        # lists); tuples tagged so tuple-specific ops round-trip.
+        tag = "__tuple__" if isinstance(value, tuple) else "__array__"
+        return {tag: [_encode(v) for v in value]}
     return {"__repr__": repr(value)[:200]}
 
 
@@ -195,6 +202,11 @@ def _decode_value(item: Any) -> Any:
         # Recurse: array<array<string>> args encode as nested markers.
         try:
             return [_decode_value(v) for v in item["__array__"]]
+        except Exception:
+            raise _Undecodable
+    if "__tuple__" in item:
+        try:
+            return tuple(_decode_value(v) for v in item["__tuple__"])
         except Exception:
             raise _Undecodable
     raise _Undecodable  # __repr__ placeholders are not real values

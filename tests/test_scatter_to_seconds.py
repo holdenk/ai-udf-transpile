@@ -31,6 +31,8 @@ UDF with an array return type.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 pytest.importorskip("pyspark")
@@ -333,33 +335,28 @@ def test_worker_accepts_lambda_free_sql(spark, sqlite_path):
     assert row.catalyst_sql == FAITHFUL_SQL
 
 
-# SPARK-55206: _transpile_func returns before any registered pyTranspiler,
-# including "ai", when the declared return type is not numeric, string,
-# boolean, or binary. array<string> cannot be cast under ANSI rules, and a
-# transpiled option is a child of TranspiledPythonUDF, so CheckAnalysis would
-# fail the whole query instead of falling back to interpreted Python. The
-# hook never runs, so the rewrite cannot land on a later UDF construction.
-# https://issues.apache.org/jira/browse/SPARK-55206
-#
-# def test_end_to_end_transpile_with_null_and_short_rows(spark, sqlite_path):
-#     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=True)
-#     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
-#     rows = [(s[0], s[1]) for s in SCATTER_SAMPLES]
-#     df = spark.createDataFrame(rows, ["start", "duration"])
-#     expected = [scatter_to_seconds(*s) for s in SCATTER_SAMPLES]
-#     assert expected[1] == [] and expected[2] == [] and expected[3] == []
-#
-#     first = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
-#     assert not first.transpiled
-#     assert [r[0] for r in df.select(first("start", "duration")).collect()] == expected
-#
-#     deadline = time.time() + 60
-#     second = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
-#     while time.time() < deadline and not second.transpiled:
-#         time.sleep(0.5)
-#         second = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
-#     assert second.transpiled, "fake backend never landed the bug-faithful rewrite"
-#     assert [r[0] for r in df.select(second("start", "duration")).collect()] == expected
-#     row = get_catalog()._conn.execute("SELECT status, catalyst_sql FROM cache").fetchone()
-#     assert row[0] == "success"
-#     assert row[1] == FAITHFUL_SQL
+# SPARK-55206: hook never runs for array returns; xfail until that
+# gate lifts. https://issues.apache.org/jira/browse/SPARK-55206
+@pytest.mark.xfail(reason="SPARK-55206: hook never runs for array returns", strict=False)
+def test_end_to_end_transpile_with_null_and_short_rows(spark, sqlite_path):
+    enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=True)
+    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    rows = [(s[0], s[1]) for s in SCATTER_SAMPLES]
+    df = spark.createDataFrame(rows, ["start", "duration"])
+    expected = [scatter_to_seconds(*s) for s in SCATTER_SAMPLES]
+    assert expected[1] == [] and expected[2] == [] and expected[3] == []
+
+    first = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
+    assert not first.transpiled
+    assert [r[0] for r in df.select(first("start", "duration")).collect()] == expected
+
+    deadline = time.time() + 60
+    second = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
+    while time.time() < deadline and not second.transpiled:
+        time.sleep(0.5)
+        second = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
+    assert second.transpiled, "fake backend never landed the bug-faithful rewrite"
+    assert [r[0] for r in df.select(second("start", "duration")).collect()] == expected
+    row = get_catalog()._conn.execute("SELECT status, catalyst_sql FROM cache").fetchone()
+    assert row[0] == "success"
+    assert row[1] == FAITHFUL_SQL

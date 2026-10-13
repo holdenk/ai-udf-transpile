@@ -43,13 +43,44 @@ STDLIB_ALLOWLIST = frozenset(
 _SENTINEL_RAISED = object()
 
 # reflect/java_method run arbitrary JVM methods from a SQL expression.
-# Runtime/ProcessBuilder in a Java UDF runs at class-load, before any row check.
+# Runtime/ProcessBuilder in a Java UDF runs at class-load, before any row
+# check; reflection (`Class.forName`/`getMethod`/`loadClass`) reaches the
+# same places without naming Runtime, and io/net/script are process and
+# network surface a row function never needs. Denylist, not allowlist:
+# extend it when a rewrite legitimately needs one of these and re-review.
+# \s* around dots: valid Java allows whitespace/comments between tokens of
+# a qualified name (`Runtime . getRuntime()` compiles fine).
 _FORBIDDEN_SQL = re.compile(r"\b(?:reflect|java_method)\s*\(", re.IGNORECASE)
-# \s* around the dot: valid Java allows whitespace/comments between tokens
-# of a qualified name (`Runtime . getRuntime()` compiles fine), and the plain
-# literal match let that trivially evade this gate.
-_FORBIDDEN_JAVA = re.compile(r"\b(?:Runtime\s*\.\s*getRuntime|ProcessBuilder)\b")
+_FORBIDDEN_JAVA = re.compile(
+    r"\b(?:"
+    r"Runtime\s*\.\s*getRuntime"
+    r"|System\s*\.\s*(?:load|loadLibrary|exit)"
+    r"|ProcessBuilder"
+    r"|Class\s*\.\s*forName"
+    r"|loadClass\s*\("
+    r"|getMethod\s*\("
+    r"|MethodHandles"
+    r"|exec\s*\("
+    r"|java\s*\.\s*(?:io|net)\s*\."
+    r"|javax\s*\.\s*script"
+    r")"
+)
 _PLACEHOLDER = re.compile(r"_udf_param_\d+")
+
+
+def _quote_closes(text: str, i: int) -> bool:
+    """Quote at ``i`` closes its literal: an even run of backslashes before it.
+
+    ``'\\\\'`` (escaped backslash, the normal spelling of a backslash regex)
+    ends in a quote that DOES close; treating any backslash-preceded quote as
+    escaped leaves the literal open and hides whatever follows it.
+    """
+    run = 0
+    j = i - 1
+    while j >= 0 and text[j] == "\\":
+        run += 1
+        j -= 1
+    return run % 2 == 0
 
 
 def lambda_captured_placeholder(sql: str) -> Optional[str]:
@@ -68,7 +99,7 @@ def lambda_captured_placeholder(sql: str) -> Optional[str]:
     while i < len(sql):
         char = sql[i]
         if quote is not None:
-            if char == quote and (i == 0 or sql[i - 1] != "\\"):
+            if char == quote and _quote_closes(sql, i):
                 quote = None
             i += 1
             continue
@@ -91,7 +122,7 @@ def lambda_captured_placeholder(sql: str) -> Optional[str]:
             while j < len(sql):
                 nxt = sql[j]
                 if body_quote is not None:
-                    if nxt == body_quote and sql[j - 1] != "\\":
+                    if nxt == body_quote and _quote_closes(sql, j):
                         body_quote = None
                     j += 1
                     continue
@@ -123,7 +154,7 @@ def _placeholder_outside_strings(fragment: str) -> Optional[str]:
     while i < len(fragment):
         char = fragment[i]
         if quote is not None:
-            if char == quote and fragment[i - 1] != "\\":
+            if char == quote and _quote_closes(fragment, i):
                 quote = None
             i += 1
             continue
@@ -153,10 +184,22 @@ def sql_reconstruction_error(result: Any) -> Optional[str]:
 
 
 def _sql_for_forbidden_scan(sql: str) -> str:
-    """Drop comments and identifier quotes so `reflect` and reflect/* */( still match."""
-    without_block = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    without_line = re.sub(r"--[^\n]*", " ", without_block)
-    return without_line.replace("`", "")
+    """Blank literals and comments so `reflect` and reflect/* */( still match.
+
+    Leftmost-wins alternation (mirrors ``_JAVA_SKIP``): a literal starting
+    before a ``--`` inside it consumes it, so comment syntax inside a string
+    never deletes a real call from the scan, and a mention inside a literal
+    is blanked with it.
+    """
+    return _SQL_SKIP.sub(_blank_skippable, sql).replace("`", "")
+
+
+_SQL_SKIP = re.compile(
+    r"'(?:[^']|'')*'"  # string literal ('' doubling)
+    r"|/\*.*?\*/"  # block comment
+    r"|--[^\n\r]*",  # line comment
+    re.DOTALL,
+)
 
 
 # Comments and string/char/text-block contents, blanked before the forbidden
@@ -202,7 +245,8 @@ def _translate_java_unicode_escapes(java: str) -> str:
     return "".join(out)
 
 
-def _blank_java_skippable(match: re.Match) -> str:
+def _blank_skippable(match: re.Match) -> str:
+    """Blank a comment or literal, keeping newlines (line structure survives)."""
     return re.sub(r"[^\n]", " ", match.group(0))
 
 
@@ -215,17 +259,22 @@ def _java_for_forbidden_scan(java: str) -> str:
     escapes for the tokens themselves; a comment cannot split an identifier
     (`Run/* */time` does not compile).
     """
-    return _JAVA_SKIP.sub(_blank_java_skippable, _translate_java_unicode_escapes(java))
+    return _JAVA_SKIP.sub(_blank_skippable, _translate_java_unicode_escapes(java))
 
 
 def rejected_rewrite(result: Any) -> Optional[str]:
-    """Return an error if the rewrite must not be compiled or executed."""
+    """Return an error if the rewrite must not be compiled or executed.
+
+    A binary-only java result (register_impl impl_binary) skips the Java
+    scan: the binary is trusted exactly like human-supplied catalyst_sql,
+    which this gate never re-parses either.
+    """
     sql = getattr(result, "sql", None) or ""
     java = getattr(result, "java_source", None) or ""
     if _FORBIDDEN_SQL.search(_sql_for_forbidden_scan(sql)):
         return "rewrite invokes reflect or java_method"
     if _FORBIDDEN_JAVA.search(_java_for_forbidden_scan(java)):
-        return "java rewrite uses Runtime.getRuntime or ProcessBuilder"
+        return "java rewrite uses a forbidden API (Runtime/ProcessBuilder/reflection/exec/io/net/script)"
     return None
 
 
@@ -260,7 +309,8 @@ def _copy_defining_module_imports(func: Any, ns: dict[str, Any]) -> None:
     if not srcfile:
         return
     try:
-        file_src = open(srcfile, encoding="utf-8").read()
+        with open(srcfile, encoding="utf-8") as fh:
+            file_src = fh.read()
         tree = ast.parse(file_src)
     except Exception:
         return
@@ -318,7 +368,9 @@ def exec_udf_source(
     # the UDF from exactly this text.
     filename = f"<ai_udf_verify_{abs(hash(dedented))}>"
     linecache.cache[filename] = (len(dedented), None, dedented.splitlines(True), filename)
-    exec(compile(dedented, filename, "exec"), ns, ns)  # noqa: S102 — isolated verify sandbox
+    # Not a hard import boundary: allowlisted stdlib loads on demand and the
+    # defining module's imports come along (the UDF's own module is trusted).
+    exec(compile(dedented, filename, "exec"), ns, ns)  # noqa: S102
     return ns
 
 
@@ -340,7 +392,12 @@ def _strategy_for(spark_type: str):
     from hypothesis import strategies as st
 
     t = spark_type.strip().lower()
-    if t in {"bigint", "long", "int", "integer", "smallint", "tinyint", "byte", "short"}:
+    if t in {"bigint", "long"}:
+        # int64 range: the (2^40, 2^53] region is where int/float math
+        # diverges (the prompt's own floor(x / y) trick); int32-only draws
+        # never differentially test it.
+        return st.one_of(st.none(), st.integers(min_value=-(2**63), max_value=2**63 - 1))
+    if t in {"int", "integer", "smallint", "tinyint", "byte", "short"}:
         return st.one_of(st.none(), st.integers(min_value=-(2**31), max_value=2**31 - 1))
     if t.startswith("decimal"):
         return st.one_of(st.none(), st.decimals(allow_nan=False, allow_infinity=False, places=4))
@@ -499,9 +556,14 @@ def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_
     from pyspark.sql import Row
     from pyspark.sql.types import StructType
 
-    del return_type
     df = spark.createDataFrame([Row(**_row_values(args))], StructType(_param_fields(input_types)))
-    return df.selectExpr(f"({sql}) AS result").collect()[0][0]
+    value = df.selectExpr(f"({sql}) AS result").collect()[0][0]
+    if not _representable(value, return_type):
+        # Production always casts the result; verify did not. A value that
+        # fits the tolerance but not the return type passed verification and
+        # then died on the first real query's ANSI overflow.
+        raise ArithmeticError(f"sql result {value!r} does not fit {return_type}")
+    return value
 
 
 def _eval_sql_batch(spark: Any, sql: str, rows: list[tuple], input_types: list[str]) -> list:
@@ -542,8 +604,12 @@ def smoke_test_reconstruction(
     already be written. A provisional row is visible only on this thread, so
     other queries keep the Python UDF until the caller promotes it.
 
-    Only the final analysis step produces an error: harness problems (no func,
-    hook declined, nothing reconstructed) return None -- no opinion.
+    Only a genuine hook decline (nothing reconstructed, e.g. Spark's own
+    return-type gate skipping the UDF before the hook) returns None -- no
+    opinion. Harness problems that would leave the probe silently disarmed
+    (confs that cannot be set, exceptions while constructing the UDF) return
+    an error: the row must not be promoted reconstruction-unchecked, or the
+    first real query pays for it.
     """
     from ai_udf_transpile.catalog import expose_provisional
 
@@ -586,6 +652,7 @@ def _smoke_test_reconstruction(
                 )
         except Exception:
             logger.debug("could not enable transpile confs for smoke test", exc_info=True)
+            return "smoke test could not arm the transpile confs"
         f = func
         if f is None:
             f = load_python_udf(source_text, captures)
@@ -594,10 +661,10 @@ def _smoke_test_reconstruction(
         udf = UserDefinedFunction(f, _spark_type(return_type))
         transpiled = list(getattr(udf, "transpiled", None) or [])
         if not transpiled:
-            return None  # hook declined / nothing reconstructed: nothing to break
-    except Exception:
+            return None  # hook declined / nothing reconstructed: no opinion
+    except Exception as exc:
         logger.debug("smoke test harness could not construct the UDF", exc_info=True)
-        return None
+        return f"smoke test harness failed: {exc}"
     try:
         df.select(udf(*[f"arg{i}" for i in range(len(input_types))])).schema
     except Exception as exc:
@@ -719,7 +786,12 @@ def hypothesis_check(
     from hypothesis import HealthCheck, example, given, settings
     from hypothesis import strategies as st
 
-    strategies = [_strategy_for(t) for t in input_types]
+    try:
+        strategies = [_strategy_for(t) for t in input_types]
+    except VerifyFailed as exc:
+        # e.g. register_impl input_types with an unknown simple string;
+        # the docstring says never raises.
+        return False, f"{type(exc).__name__}: {exc}"
     mismatch: list[str] = []
     py_successes = [0]  # a rewrite is only verified if python succeeds somewhere
     # (args, python value, python exception). SQL runs later, ~100 rows per job.

@@ -73,17 +73,22 @@ def sqlite_path(tmp_path):
 @pytest.fixture(scope="session")
 def spark():
     _bootstrap_spark_home()
-    pytest.importorskip("pyspark")
+    # With SPARK_HOME explicitly provided (CI does), a session that cannot
+    # start is a failure, not a silent skip -- otherwise the CI job goes
+    # green with zero Spark coverage, which is exactly the breakage it
+    # exists to catch. Without it, skip cleanly (no Spark here at all).
+    have_home = bool(os.environ.get("SPARK_HOME"))
+    outcome = pytest.fail if have_home else pytest.skip
+    try:
+        from pyspark.sql import SparkSession
+        from pyspark.sql.transpile import AbstractTranspiler  # noqa: F401
+    except Exception as exc:
+        outcome(f"pyspark transpile surface missing (SPARK_HOME={os.environ.get('SPARK_HOME')}): {exc}")
     os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
     # Workers must run the same interpreter as the driver (cloudpickle shares
     # bytecode); the system default python3 may be too old for Spark master.
     os.environ["PYSPARK_PYTHON"] = sys.executable
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-    try:
-        from pyspark.sql import SparkSession
-        from pyspark.sql.transpile import AbstractTranspiler  # noqa: F401
-    except Exception as exc:
-        pytest.skip(f"pyspark transpile surface missing: {exc}")
     try:
         session = (
             SparkSession.builder.master("local[1]")
@@ -99,6 +104,6 @@ def spark():
         )
         session.range(1).count()
     except Exception as exc:
-        pytest.skip(f"Spark session unavailable: {exc}")
+        outcome(f"Spark session unavailable: {exc}")
     yield session
     session.stop()

@@ -214,6 +214,14 @@ class Catalog(Protocol):
     def samples_for(self, udf_key: str, limit: int = 32) -> list[list]: ...
 
 
+# Stored tolerance for a rewrite registered with verify=False: larger than
+# any sane session tolerance, so tolerance_serves() refuses to serve it until
+# a worker has actually verified the rewrite (then the real, smaller
+# tolerance replaces it). None would read as "checked exactly", which an
+# unchecked rewrite must never claim.
+UNCHECKED_TOLERANCE = 1e308
+
+
 def configured_tolerance(spark: Any = None) -> float:
     """Session absolute tolerance. Negative or non-numeric values count as 0."""
     try:

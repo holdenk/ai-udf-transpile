@@ -12,7 +12,11 @@ import warnings
 from typing import Any, Callable, Optional
 
 from ai_udf_transpile import conf
-from ai_udf_transpile.catalog import configured_tolerance, publish_verified
+from ai_udf_transpile.catalog import (
+    UNCHECKED_TOLERANCE,
+    configured_tolerance,
+    publish_verified,
+)
 from ai_udf_transpile.keys import (
     canonical_source,
     canonical_source_from_func,
@@ -22,6 +26,7 @@ from ai_udf_transpile.keys import (
 )
 from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileResult
 from ai_udf_transpile.types import (
+    categories_for_spark_types,
     input_categories,
     input_spark_types,
     return_spark_type,
@@ -36,8 +41,10 @@ logger = logging.getLogger(__name__)
 def _function_ast(func: Callable[..., Any]) -> ast.FunctionDef:
     src = textwrap.dedent(inspect.getsource(func))
     tree = ast.parse(src)
-    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
-    return fn
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            return node
+    raise ValueError("register_impl requires a def statement (a lambda has no annotations to key)")
 
 
 def _public_params(func: Callable[..., Any], function_ast: ast.FunctionDef) -> list[str]:
@@ -95,8 +102,13 @@ def enable(
     if table is not None:
         conf.set_value(conf.TABLE, table, spark)
     chosen_backend = backend if backend is not None else conf.default_backend()
-    conf.set_value(conf.BACKEND, chosen_backend, spark)
-    conf.set_value(conf.MAX_EXAMPLES, conf.default_max_examples(), spark)
+    # Stamp only an explicit choice. A blanket default write lands in the
+    # _RUNTIME overlay, which beats spark.conf, and would permanently shadow
+    # conf values the caller set before enable().
+    if backend is not None or os.environ.get("AI_UDF_TRANSPILE_BACKEND"):
+        conf.set_value(conf.BACKEND, chosen_backend, spark)
+    if os.environ.get("AI_UDF_TRANSPILE_MAX_EXAMPLES") or os.environ.get("GITHUB_ACTIONS") == "true":
+        conf.set_value(conf.MAX_EXAMPLES, conf.default_max_examples(), spark)
 
     try:
         spark.conf.set("spark.sql.experimental.optimizer.transpilePyUDFs", "true")
@@ -170,7 +182,13 @@ def register_impl(
     return_type: Any = None,
     verify: bool = True,
 ) -> Any:
-    """Write a human-provided rewrite into the catalog (origin='human')."""
+    """Write a human-provided rewrite into the catalog (origin='human').
+
+    With ``verify=False`` the rewrite is staged unverified: it is served only
+    after a worker re-verifies it (origin='human' rows are verified without a
+    backend run), and it is not published to the shared writeback table until
+    then. It still must pass the reconstruction smoke test.
+    """
     from ai_udf_transpile.backends.human import ORIGIN
     from ai_udf_transpile.transpiler import get_catalog
     from ai_udf_transpile.verify import hypothesis_check
@@ -189,7 +207,7 @@ def register_impl(
     ):
         raise ValueError("register_impl requires known input and output types")
     in_types = input_types or input_spark_types(function_ast, params)
-    in_cats = input_categories(function_ast, params) or ["numeric"] * len(params)
+    in_cats = input_categories(function_ast, params) or categories_for_spark_types(in_types or [])
     out_type = return_spark_type(declared_return)
     if in_types is None or out_type is None:
         raise ValueError("register_impl requires known input_types and return_type")
@@ -214,7 +232,7 @@ def register_impl(
         raise ValueError("register_impl needs catalyst_sql or a java_udf payload")
 
     hyp: Optional[bool] = None
-    tolerance = configured_tolerance(spark) if verify else None
+    tolerance = configured_tolerance(spark) if verify else UNCHECKED_TOLERANCE
     if verify:
         # Verify against any real rows recorded for this UDF, like the worker
         # does: for multi-param UDFs the built-in examples vary one param at a
@@ -239,7 +257,8 @@ def register_impl(
             tolerance=tolerance,
         )
         if not ok:
-            if catalog.get(key) is None:
+            existing = catalog.get(key)
+            if existing is None:
                 catalog.insert_pending(
                     udf_key=key,
                     source_text=source,
@@ -251,7 +270,11 @@ def register_impl(
                     closure_fingerprint=fingerprint,
                     captures=captures,
                 )
-            catalog.mark_failed(key, err or "register_impl verify failed", origin=ORIGIN)
+                catalog.mark_failed(key, err or "register_impl verify failed", origin=ORIGIN)
+            elif not existing.reconstructable():
+                # No live verified payload to protect; record the failure.
+                catalog.mark_failed(key, err or "register_impl verify failed", origin=ORIGIN)
+            # else: a verified success already serves this key; leave it alone.
             raise ValueError(f"register_impl Hypothesis failed: {err}")
         hyp = True
 
@@ -292,7 +315,10 @@ def register_impl(
         catalog.mark_failed(key, smoke_err, origin=ORIGIN)
         raise ValueError(f"register_impl reconstruction failed: {smoke_err}")
     catalog.promote_success(key)
-    publish_verified(catalog, key)
+    if verify:
+        # UNCHECKED_TOLERANCE rows are served only after a worker verifies
+        # them, and the shared writeback table carries verified rows only.
+        publish_verified(catalog, key)
     return key
 
 
