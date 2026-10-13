@@ -52,6 +52,21 @@ def zfill3(s: str) -> str:
     return s.zfill(3)
 
 
+def edit_distance(a: str, b: str) -> int:
+    # The algorithmic arm: a quadratic DP per row in interpreted python, one
+    # native Catalyst builtin once transpiled. -1 on NULL, like a SQL citizen.
+    if a is None or b is None:
+        return -1
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[len(b)]
+
+
 # The fake backend's fixture for this exact source: verified-faithful SQL.
 ZFILL_SQL = FIXTURES[canonical_source_from_func(zfill3)].sql
 
@@ -77,14 +92,25 @@ def main() -> int:
     # Cache the inputs so range/cast generation is not in the measurement.
     ints = spark.range(0, rows, numPartitions=PARTITIONS).toDF("x").cache()
     strs = ints.select(F.col("x").cast("string").alias("s")).cache()
+    # Short strings with varying content: the DP cost is real but not so big
+    # that the python arm dominates the wall clock.
+    pairs = ints.select(
+        (F.col("x") % 100003).cast("string").alias("a"),
+        ((F.col("x") * 7 + 13) % 99991).cast("string").alias("b"),
+    ).cache()
     ints.count()
     strs.count()
+    pairs.count()
     # plus_one raises on None in interpreted Python, so the sample has no NULL.
     sample_ints = spark.createDataFrame([(1,), (41,)], ["x"])
     sample_strs = spark.createDataFrame([("holden",), (None,)], ["s"])
     # "-555" pins the CASE's branch order: sign-before-length would truncate.
     # No NULL row: interpreted python raises on None, the SQL returns NULL.
     sample_zfill = spark.createDataFrame([("5",), ("-5",), ("+7",), ("-555",), ("abcd",)], ["s"])
+    sample_pairs = spark.createDataFrame(
+        [("kitten", "sitting"), ("", "abc"), ("same", "same"), (None, "x"), ("x", None), (None, None)],
+        ["a", "b"],
+    )
 
     print(f"=== THROUGHPUT ({rows:,} rows, local[*], noop sink, min of 3 rounds) ===")
     # UserDefinedFunction is always SQL_BATCHED_UDF (the classic pickle path);
@@ -94,11 +120,13 @@ def main() -> int:
     py_plus = UserDefinedFunction(plus_one, LongType())
     py_back = UserDefinedFunction(backwards, StringType())
     py_zfill = UserDefinedFunction(zfill3, StringType())
-    assert not py_plus.transpiled and not py_back.transpiled and not py_zfill.transpiled
+    py_edit = UserDefinedFunction(edit_distance, LongType())
+    assert not any(u.transpiled for u in (py_plus, py_back, py_zfill, py_edit))
     assert "BatchEvalPython" in ints.select(py_plus("x"))._jdf.queryExecution().toString()
     py_plus_expect = [r[0] for r in sample_ints.select(py_plus("x")).collect()]
     py_back_expect = [r[0] for r in sample_strs.select(py_back("s")).collect()]
     py_zfill_expect = [r[0] for r in sample_zfill.select(py_zfill("s")).collect()]
+    py_edit_expect = [r[0] for r in sample_pairs.select(py_edit("a", "b")).collect()]
 
     sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-bench-"), "cache.sqlite")
     enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
@@ -113,19 +141,33 @@ def main() -> int:
     start = time.perf_counter()
     register_impl(spark, zfill3, kind="catalyst", catalyst_sql=ZFILL_SQL, return_type=StringType())
     fill_zfill = time.perf_counter() - start
+    start = time.perf_counter()
+    register_impl(
+        spark,
+        edit_distance,
+        kind="catalyst",
+        catalyst_sql="coalesce(levenshtein(_udf_param_0, _udf_param_1), -1)",
+        return_type=LongType(),
+    )
+    fill_edit = time.perf_counter() - start
 
     ai_plus = UserDefinedFunction(plus_one, LongType())
     ai_back = UserDefinedFunction(backwards, StringType())
     ai_zfill = UserDefinedFunction(zfill3, StringType())
-    assert ai_plus.transpiled and ai_back.transpiled and ai_zfill.transpiled, (
-        "warm catalog did not produce a hit"
-    )
+    ai_edit = UserDefinedFunction(edit_distance, LongType())
+    warm = (ai_plus, ai_back, ai_zfill, ai_edit)
+    assert all(u.transpiled for u in warm), "warm catalog did not produce a hit"
     assert [r[0] for r in sample_ints.select(ai_plus("x")).collect()] == py_plus_expect
     assert [r[0] for r in sample_strs.select(ai_back("s")).collect()] == py_back_expect
     assert [r[0] for r in sample_zfill.select(ai_zfill("s")).collect()] == py_zfill_expect
-    assert "EvalPython" not in ints.select(ai_plus("x"))._jdf.queryExecution().toString()
-    assert "EvalPython" not in strs.select(ai_back("s"))._jdf.queryExecution().toString()
-    assert "EvalPython" not in strs.select(ai_zfill("s"))._jdf.queryExecution().toString()
+    assert [r[0] for r in sample_pairs.select(ai_edit("a", "b")).collect()] == py_edit_expect
+    for plan_df in (
+        ints.select(ai_plus("x")),
+        strs.select(ai_back("s")),
+        strs.select(ai_zfill("s")),
+        pairs.select(ai_edit("a", "b")),
+    ):
+        assert "EvalPython" not in plan_df._jdf.queryExecution().toString()
 
     # All UDFs exist before any timing (the transpile gate is read at
     # construction), so rounds interleave fairly: nobody's warmup is deeper.
@@ -133,9 +175,11 @@ def main() -> int:
         ("python plus_one", ints.select(py_plus("x")), None),
         ("python backwards", strs.select(py_back("s")), None),
         ("python zfill3", strs.select(py_zfill("s")), None),
+        ("python edit_distance", pairs.select(py_edit("a", "b")), None),
         ("catalyst plus_one", ints.select(ai_plus("x")), "python plus_one"),
         ("java udf backwards", strs.select(ai_back("s")), "python backwards"),
         ("catalyst zfill3", strs.select(ai_zfill("s")), "python zfill3"),
+        ("catalyst edit_distance", pairs.select(ai_edit("a", "b")), "python edit_distance"),
     ]
     for _, arm_df, _ in arms:  # warmup round for everyone
         noop_seconds(arm_df)
@@ -168,6 +212,7 @@ def main() -> int:
     print("=== ONE-TIME FILL COST (verify + publish, per rewrite) ===")
     print(f"register_impl catalyst plus_one (Hypothesis): {fill_catalyst:.2f}s")
     print(f"register_impl catalyst zfill3 (Hypothesis): {fill_zfill:.2f}s")
+    print(f"register_impl catalyst edit_distance (Hypothesis): {fill_edit:.2f}s")
     print(f"register_impl java_udf backwards (Hypothesis + javac): {fill_java:.2f}s")
 
     shutdown()
