@@ -3,7 +3,7 @@
 
 Three numbers, all on one local SparkSession:
 
-  throughput   rows/sec over a cached DataFrame, noop sink, min of 3 rounds
+  throughput   rows/sec over a cached DataFrame, noop sink, min of --rounds rounds (default 3)
   definition   ms per UserDefinedFunction(...) creation (plugin hit vs plain)
   fill cost    one-time seconds for register_impl (Hypothesis + javac)
 
@@ -87,6 +87,8 @@ def main() -> int:
         "--csv", metavar="PATH", help="also write results to PATH as section,name,metric,value"
     )
     args = parser.parse_args()
+    if args.rounds < 1:
+        parser.error("--rounds must be >= 1")
     rows = args.rows
     csv_rows: list[tuple[str, str, str, object]] = []
     spark = (
@@ -122,7 +124,7 @@ def main() -> int:
         ["a", "b"],
     )
 
-    print(f"=== THROUGHPUT ({rows:,} rows, local[*], noop sink, min of 3 rounds) ===")
+    print(f"=== THROUGHPUT ({rows:,} rows, local[*], noop sink, min of {args.rounds} rounds) ===")
     # UserDefinedFunction is always SQL_BATCHED_UDF (the classic pickle path);
     # the Arrow conf only applies to the udf() helper. This is also the path
     # the transpiler hooks, so it is the honest baseline. The plan assertions
