@@ -182,6 +182,36 @@ def always_decline(x: int) -> int:
     return len(os.getcwd())
 
 
+# Java-UDF twins for the bench: same body, different def name, so the
+# canonical source maps to a DIFFERENT catalog key -- one key, one rewrite.
+# The bench measures a catalyst arm and a java arm for the same computation.
+def plus_one_java(x: int) -> int:
+    return x + 1
+
+
+def backwards_java(name: str) -> str:
+    if name is None:
+        return None
+    return name[::-1]
+
+
+def zfill3_java(s: str) -> str:
+    return s.zfill(3)
+
+
+def edit_distance_java(a: str, b: str) -> int:
+    if a is None or b is None:
+        return -1
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[len(b)]
+
+
 def _result(sql: str) -> TranspileResult:
     return TranspileResult(kind=KIND_CATALYST, sql=sql)
 
@@ -194,6 +224,109 @@ public class Backwards implements UDF1<Object, Object> {
     @Override
     public Object call(Object s) {
         return s == null ? null : new StringBuilder((String) s).reverse().toString();
+    }
+}
+"""
+
+PLUS_ONE_JAVA = """package ai_udf;
+
+import org.apache.spark.sql.api.java.UDF1;
+
+public class PlusOneJava implements UDF1<Object, Object> {
+    @Override
+    public Object call(Object x) {
+        // python raises on None: a null here is "python raise + sql value", allowed.
+        // longValue()+1 wraps at 2^63-1: out-of-contract (the interpreted UDF
+        // errors on output conversion there), so verification never samples it.
+        return x == null ? null : ((Number) x).longValue() + 1L;
+    }
+}
+"""
+
+# zfill(3): pad with '0' AFTER a leading sign, never truncate, total width 3.
+# Width and sign are decided in CODE POINTS: python len() counts code points
+# while String.length() counts UTF-16 units, so an astral char must be width 1.
+ZFILL3_JAVA = """package ai_udf;
+
+import org.apache.spark.sql.api.java.UDF1;
+
+public class Zfill3Java implements UDF1<Object, Object> {
+    @Override
+    public Object call(Object v) {
+        // python raises on None: a null here is "python raise + sql value", allowed.
+        if (v == null) {
+            return null;
+        }
+        String s = (String) v;
+        int n = s.codePointCount(0, s.length());
+        if (n >= 3) {
+            return s;
+        }
+        // "" has no sign ("".zfill(3) == "000"), so the sign needs a guard.
+        int sign = n > 0 ? s.codePointAt(0) : -1;
+        String body = s;
+        int width = 3;
+        if (sign == '-' || sign == '+') {
+            body = s.substring(Character.charCount(sign));
+            width = 2;
+        }
+        StringBuilder b = new StringBuilder();
+        if (sign == '-' || sign == '+') {
+            b.appendCodePoint(sign);
+        }
+        int bodyN = body.codePointCount(0, body.length());
+        for (int i = bodyN; i < width; i++) {
+            b.append('0');
+        }
+        b.append(body);
+        return b.toString();
+    }
+}
+"""
+
+# Levenshtein over CODE POINTS: python len()/slicing counts code points while
+# String.length()/charAt count UTF-16 units, and a surrogate-pair compare would
+# disagree with python on astral characters.
+EDIT_DISTANCE_JAVA = """package ai_udf;
+
+import org.apache.spark.sql.api.java.UDF2;
+
+public class EditDistanceJava implements UDF2<Object, Object, Object> {
+    private static int[] toCodePoints(String s) {
+        int n = s.codePointCount(0, s.length());
+        int[] out = new int[n];
+        int idx = 0;
+        for (int i = 0; i < s.length(); ) {
+            int cp = s.codePointAt(i);
+            out[idx++] = cp;
+            i += Character.charCount(cp);
+        }
+        return out;
+    }
+
+    @Override
+    public Object call(Object a, Object b) {
+        String s = (String) a;
+        String t = (String) b;
+        if (s == null || t == null) {
+            return -1L;
+        }
+        int[] sc = toCodePoints(s);
+        int[] tc = toCodePoints(t);
+        int[] prev = new int[tc.length + 1];
+        for (int j = 0; j <= tc.length; j++) {
+            prev[j] = j;
+        }
+        for (int i = 1; i <= sc.length; i++) {
+            int[] cur = new int[tc.length + 1];
+            cur[0] = i;
+            for (int j = 1; j <= tc.length; j++) {
+                int cost = sc[i - 1] == tc[j - 1] ? 0 : 1;
+                cur[j] = Math.min(prev[j] + 1, Math.min(cur[j - 1] + 1, prev[j - 1] + cost));
+            }
+            prev = cur;
+        }
+        return (long) prev[tc.length];
     }
 }
 """
@@ -232,10 +365,26 @@ FIXTURES: dict[str, TranspileResult] = {
         "interval 1 second), "
         "x -> date_format(x, 'yyyy-MM-dd HH:mm:ss')) END"
     ),
-    canonical_source_from_func(backwards): TranspileResult(
+    canonical_source_from_func(backwards): _result("reverse(_udf_param_0)"),
+    canonical_source_from_func(backwards_java): TranspileResult(
         kind=KIND_JAVA_UDF,
         java_source=BACKWARDS_JAVA,
         class_name="ai_udf.Backwards",
+    ),
+    canonical_source_from_func(plus_one_java): TranspileResult(
+        kind=KIND_JAVA_UDF,
+        java_source=PLUS_ONE_JAVA,
+        class_name="ai_udf.PlusOneJava",
+    ),
+    canonical_source_from_func(zfill3_java): TranspileResult(
+        kind=KIND_JAVA_UDF,
+        java_source=ZFILL3_JAVA,
+        class_name="ai_udf.Zfill3Java",
+    ),
+    canonical_source_from_func(edit_distance_java): TranspileResult(
+        kind=KIND_JAVA_UDF,
+        java_source=EDIT_DISTANCE_JAVA,
+        class_name="ai_udf.EditDistanceJava",
     ),
     # In-UDFs check old in the first list and new in the second; Out-UDFs swap.
     canonical_source_from_func(BSPIn): _result(

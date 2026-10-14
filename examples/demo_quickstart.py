@@ -30,7 +30,7 @@ def plus_one(x: int) -> int:
     return x + 1
 
 
-def backwards(name: str) -> str:
+def backwards_java(name: str) -> str:
     if name is None:
         return None
     return name[::-1]
@@ -73,13 +73,13 @@ def main() -> int:
     label = " (Catalyst SQL)" if hit.transpiled else " (TIMED OUT, still Python)"
     print(f"plus_one: second call transpiled={bool(hit.transpiled)} results={rows}{label}")
 
-    first = UserDefinedFunction(backwards, StringType())
-    print(f"backwards: first call transpiled={bool(first.transpiled)} (miss -> Python path)")
-    hit = wait_for_hit(backwards, StringType())
+    first = UserDefinedFunction(backwards_java, StringType())
+    print(f"backwards_java: first call transpiled={bool(first.transpiled)} (miss -> Python path)")
+    hit = wait_for_hit(backwards_java, StringType())
     ok = ok and hit.transpiled
     rows = [r[0] for r in names.select(hit("name")).collect()]
     label = " (Java UDF)" if hit.transpiled else " (TIMED OUT, still Python)"
-    print(f"backwards: second call transpiled={bool(hit.transpiled)} results={rows}{label}")
+    print(f"backwards_java: second call transpiled={bool(hit.transpiled)} results={rows}{label}")
 
     try:  # _conn is sqlite-catalog-only; skip the dump on wrapped catalogs
         catalog_rows = get_catalog()._conn.execute(
