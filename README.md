@@ -13,6 +13,30 @@ thread by default, or `python -m ai_udf_transpile.worker`) fills the cache.
 Targets **classic Spark master** (the `AbstractTranspiler` hook landed for
 4.3 / current master). Connect is not supported. This is experimental.
 
+## Don't use this code (yet)
+
+A working experiment, not a dependency:
+
+- **The hook itself is unreleased.** Targets Spark master (4.3+); Spark's
+  ANSI path skips array-return UDFs before the `ai` transpiler ever runs
+  (SPARK-55206).
+- **Verification is value-equality, not proof.** Hypothesis samples inputs
+  and compares outputs at a tolerance; a wrong-but-lucky rewrite can pass.
+  The vacuous-pass traps (python raises on every example, SQL returns
+  anything) are closed, but "verified" means "matched every sampled input",
+  not "faithful".
+- **Generated code runs in your driver.** The rewrite is SQL you execute
+  and, for java UDFs, javac output loaded into the session. The CLI
+  backends write into a sandbox directory — that is a work dir, not a
+  security boundary. Same trust hole in the shared write-back table:
+  anyone who can append to it runs SQL and Java in every reader's driver.
+- **Benchmarks are honest but narrow.** Single node, fake backend, five
+  functions, min of 3. The graph below is that run, not a promise about
+  your cluster.
+- **Fail-open everywhere.** A misconfigured catalog or unreachable backend
+  never breaks UDF definition — which also means misconfiguration is
+  silent.
+
 ## Install
 
 ```bash
@@ -84,13 +108,32 @@ The runner wires up `SPARK_HOME` (default `~/spark`), the py4j zip, and a
 matching `PYSPARK_PYTHON` itself. `examples/demo_quickstart.py` is the
 60-second version (one Catalyst rewrite, one Java UDF); `examples/demo.py`
 is the full tour including the adversarial pack. `examples/bench_micro.py`
-measures three arms per function —
-regular Python, transpiled static (`register_impl`), and transpiled AI
-(backend-filled through the inline worker) — over 10M cached rows (noop
+measures up to four arms per function —
+regular Python, transpiled static (Spark's built-in `catalyst` transpiler,
+which converts only simple operations like `plus_one`; everything else
+declines and gets no static number), transpiled AI as Catalyst SQL, and
+transpiled AI as a Java UDF (compiled on the driver; a target for every
+convertible benched UDF, not just one) — over 10M cached rows (noop
 sink, plan-checked). Its CSV is one row per function with per-arm
 rows/sec, speedup vs regular, and `transpile_succeeded` booleans for
-static and AI. It also reports per-definition catalog cost and one-time
-fill cost per rewrite.
+static and both AI kinds. It also reports per-definition catalog cost and
+one-time fill cost per rewrite.
+
+The perf graph is generated from that CSV by a CLI tool
+(`examples/bench_graph.py`, matplotlib — no AI in the loop, ever):
+
+![throughput by function and arm](docs/bench_perf.png)
+
+Regenerate it the same way the committed PNG was made — a 10M-row,
+min-of-3 local run against a Spark checkout with the transpiler surface
+(here `upstream/branch-4.x`; master works too). CI uploads the same CSV
+from its reduced-settings run as the `bench-micro-csv` artifact, so the
+second command re-plots that one too:
+
+```bash
+examples/run_demos.sh --bench --csv bench_micro.csv   # or: python examples/bench_micro.py --csv bench_micro.csv
+python examples/bench_graph.py bench_micro.csv docs/bench_perf.png
+```
 
 ## Catalog
 

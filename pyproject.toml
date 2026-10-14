@@ -27,6 +27,8 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.8",
+    # Regenerates the README perf graph from the bench CSV (bench_graph.py).
+    "matplotlib>=3.8",
 ]
 # Documentation-only extra: Delta Lake is not installed from PyPI here.
 delta = []
