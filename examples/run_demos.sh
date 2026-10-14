@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Run the demos end to end against a packaged Spark master.
 #
-#   examples/run_demos.sh           # fake-backend demos (quickstart, full)
-#   examples/run_demos.sh --live    # + real CLI backends (cortex/agent/claude on PATH)
-#   examples/run_demos.sh --bench   # + local micro benchmarks (~10M rows)
+#   examples/run_demos.sh                        # fake-backend demos (quickstart, full)
+#   examples/run_demos.sh --live                 # + real CLI backends (cortex/agent/claude on PATH)
+#   examples/run_demos.sh --bench                 # + local micro benchmarks (~10M rows)
+#   examples/run_demos.sh --bench --csv out.csv   # + also write the wide per-function CSV
 #
 # Env: SPARK_HOME (default ~/spark), PYTHON (default repo .venv).
 set -u -o pipefail
@@ -42,12 +43,21 @@ export SPARK_LOCAL_IP=127.0.0.1 SPARK_LOCAL_HOSTNAME=localhost
 
 LIVE=0
 BENCH=0
-for arg in "$@"; do
-  case "$arg" in
+CSV=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --live) LIVE=1 ;;
     --bench) BENCH=1 ;;
-    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+    # Passed through to bench_micro.py; implies --bench (only the bench reads it).
+    --csv)
+      [ $# -ge 2 ] || { echo "error: --csv needs a path" >&2; exit 2; }
+      CSV="$2"
+      BENCH=1
+      shift
+      ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
+  shift
 done
 
 NAMES=()
@@ -70,7 +80,11 @@ run_demo() {
 run_demo "quickstart" examples/demo_quickstart.py
 run_demo "full demo" examples/demo.py
 [ "$LIVE" -eq 1 ] && run_demo "live backends" examples/demo_live_backends.py
-[ "$BENCH" -eq 1 ] && run_demo "micro bench" examples/bench_micro.py
+if [ "$BENCH" -eq 1 ]; then
+  BENCH_ARGS=(examples/bench_micro.py)
+  [ -n "$CSV" ] && BENCH_ARGS+=(--csv "$CSV")
+  run_demo "micro bench" "${BENCH_ARGS[@]}"
+fi
 
 echo "===== SUMMARY ====="
 for i in "${!NAMES[@]}"; do
