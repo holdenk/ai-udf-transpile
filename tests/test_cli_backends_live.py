@@ -46,14 +46,25 @@ def greet(name: str) -> str:
     return "hi " + name
 
 
-def _wait_success(catalog, timeout=900):
+def _wait_success(catalog, retrigger, timeout=900):
+    """Wait for the row to succeed; on a transient CLI failure, poke it again.
+
+    A BackendError row (CLI crash/empty output) requeues on the next UDF
+    construction, exactly like a user's next query -- so this loop retries
+    like one instead of failing the test on the first hiccup.
+    """
     deadline = time.time() + timeout
+    max_retries = int(conf.DEFAULTS[conf.MAX_RETRIES])
     while time.time() < deadline:
-        rows = catalog._conn.execute("SELECT status, target_kind, error FROM cache").fetchall()
+        rows = catalog._conn.execute("SELECT status, target_kind, error, attempt_count FROM cache").fetchall()
         if rows and rows[0][0] == "success":
             return rows[0]
         if rows and rows[0][0] == "failed":
-            pytest.fail(f"backend row failed: {rows[0][2]}")
+            error = rows[0][2] or ""
+            if error.startswith("BackendError:") and rows[0][3] < max_retries:
+                retrigger()
+            else:
+                pytest.fail(f"backend row failed: {error}")
         time.sleep(2)
     pytest.fail("backend never produced a success row")
 
@@ -68,7 +79,7 @@ def test_live_backend_plus_one(spark, sqlite_path, backend):
 
     first = UserDefinedFunction(plus_one, LongType())
     assert not first.transpiled
-    row = _wait_success(get_catalog())
+    row = _wait_success(get_catalog(), lambda: UserDefinedFunction(plus_one, LongType()))
     assert row[1] in {"catalyst", "java_udf"}
 
     second = UserDefinedFunction(plus_one, LongType())
@@ -87,7 +98,7 @@ def test_live_backend_greet(spark, sqlite_path, backend):
 
     first = UserDefinedFunction(greet, StringType())
     assert not first.transpiled
-    _wait_success(get_catalog())
+    _wait_success(get_catalog(), lambda: UserDefinedFunction(greet, StringType()))
 
     second = UserDefinedFunction(greet, StringType())
     assert second.transpiled
@@ -110,7 +121,7 @@ def test_live_backend_upper_useragent(spark, sqlite_path, backend):
     assert not first.transpiled
     assert [r[0] for r in df.select(first("ua")).collect()] == [a.upper() for a in agents]
 
-    _wait_success(get_catalog())
+    _wait_success(get_catalog(), lambda: UserDefinedFunction(upper_useragent, StringType()))
     second = UserDefinedFunction(upper_useragent, StringType())
     assert second.transpiled
     assert [r[0] for r in df.select(second("ua")).collect()] == [a.upper() for a in agents]

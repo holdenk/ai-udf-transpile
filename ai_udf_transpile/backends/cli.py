@@ -42,8 +42,13 @@ def parse_sandbox(sandbox: Path, stdout: str = "") -> TranspileResult:
                 class_name=extract_java_class(source),
             )
     text = (stdout or "").strip()
-    if not text or text.upper().startswith("DECLINE"):
-        raise BackendDecline(text or "empty CLI output")
+    if not text:
+        # No files, no stdout: the CLI itself failed (crash, auth, rate limit).
+        # An explicit DECLINE is the model deciding; silence is an error, and
+        # errors get retried instead of cooling down like a decline.
+        raise BackendError("empty CLI output (no OUT.sql, OUT.java, or stdout)")
+    if text.upper().startswith("DECLINE"):
+        raise BackendDecline(text)
     first, _, rest = text.partition("\n")
     if first.strip().lower().endswith(".java") or _JAVA_DECL_RE.search(text):
         return TranspileResult(

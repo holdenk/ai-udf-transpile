@@ -259,6 +259,15 @@ def retries_exhausted(row: CacheRow, spark: Any = None) -> bool:
     return row.attempt_count >= max_retries
 
 
+def infra_failure(row: CacheRow) -> bool:
+    """A ``BackendError`` row (CLI crash/timeout/empty output) is transient.
+
+    Retry it as soon as a claim is free, bounded by MAX_RETRIES; declines and
+    bad rewrites keep the long cooldown because retrying them is spent money.
+    """
+    return (row.error or "").startswith("BackendError:")
+
+
 def open_catalog(spark: Any = None, *, sqlite_path: Optional[str] = None) -> Catalog:
     kind = conf.get_value(conf.CATALOG, spark, conf.DEFAULTS[conf.CATALOG]).strip().lower()
     if kind == "sqlite":

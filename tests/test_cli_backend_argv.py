@@ -4,7 +4,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from ai_udf_transpile import conf
+from ai_udf_transpile.backends.base import BackendDecline, BackendError
 from ai_udf_transpile.backends.claude import ClaudeBackend
 from ai_udf_transpile.backends.cli import _parse_claude_json, parse_sandbox
 from ai_udf_transpile.backends.coco import CocoBackend
@@ -161,3 +164,15 @@ def test_parse_java_when_no_sql(tmp_path):
     result = parse_sandbox(tmp_path)
     assert result.kind == KIND_JAVA_UDF
     assert result.class_name == "com.ex.PlusOne"
+
+
+def test_parse_empty_output_is_an_error_not_a_decline(tmp_path):
+    # No files, no stdout: the CLI crashed or was rate-limited; it did not
+    # decide anything. An error retries; a decline cools down.
+    with pytest.raises(BackendError):
+        parse_sandbox(tmp_path, stdout="")
+
+
+def test_parse_decline_stdout(tmp_path):
+    with pytest.raises(BackendDecline):
+        parse_sandbox(tmp_path, stdout="DECLINE\narray return is not expressible")

@@ -13,6 +13,7 @@ from ai_udf_transpile.catalog import (
     CacheRow,
     cooldown_active,
     dumps,
+    infra_failure,
     iso_now,
     loads_dict,
     loads_list,
@@ -197,7 +198,9 @@ class DeltaCatalog:
             return WAIT, row
         if row.status == "failed":
             session = spark if spark is not None else self.spark
-            if cooldown_active(row, session) or retries_exhausted(row, session):
+            # Infra failures retry immediately (MAX_RETRIES still bounds);
+            # declines and bad rewrites wait out the cooldown.
+            if (cooldown_active(row, session) and not infra_failure(row)) or retries_exhausted(row, session):
                 return WAIT, row
             now = iso_now()
             self.spark.sql(
