@@ -138,6 +138,21 @@ def zfill3(s: str) -> str:
     return s.zfill(3)
 
 
+def edit_distance(a: str, b: str) -> int:
+    # The algorithmic arm: a quadratic DP per row in interpreted python, one
+    # native Catalyst builtin once transpiled. -1 on NULL, like a SQL citizen.
+    if a is None or b is None:
+        return -1
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[len(b)]
+
+
 def kms_encrypt(text: str, key_id: str) -> str:
     # The canonical untranspilable UDF: an AWS KMS Encrypt call per row.
     # There is no Catalyst equivalent -- the ciphertext comes from the
@@ -259,6 +274,10 @@ FIXTURES: dict[str, TranspileResult] = {
         "WHEN substr(_udf_param_0, 1, 1) IN ('-', '+') "
         "THEN concat(substr(_udf_param_0, 1, 1), lpad(substr(_udf_param_0, 2), 2, '0')) "
         "ELSE lpad(_udf_param_0, 3, '0') END"
+    ),
+    # The quadratic python DP is one native builtin; -1 on NULL, like python.
+    canonical_source_from_func(edit_distance): _result(
+        "coalesce(levenshtein(_udf_param_0, _udf_param_1), -1)"
     ),
 }
 
