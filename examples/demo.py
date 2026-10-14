@@ -141,7 +141,9 @@ def zfill3(s: str) -> str:
     return s.zfill(3)
 
 
-def backwards(name: str) -> str:
+def backwards_java(name: str) -> str:
+    # The Java-UDF twin: same body as a catalyst reverse() would cover, but
+    # the def name maps to the java fixture -- one key, one rewrite kind.
     if name is None:
         return None
     return name[::-1]
@@ -318,22 +320,6 @@ def main() -> int:
         f"distinct_count={stamped.distinct().count()} (NULL -> 'nan', like the pandas original)"
     )
 
-    sc = wait_transpiled("sc not transpiled", scatter_to_seconds, ArrayType(StringType()))
-    starts = spark.createDataFrame(
-        [
-            ("2015-01-01 00:00:00", "2"),
-            ("2015-12-31 23:59:59", "2"),  # year rollover
-            ("2015-01-01", "5"),  # short start -> []
-            (None, "2"),  # null start -> []
-        ],
-        ["start", "duration"],
-    )
-    print(
-        f"scatter_to_seconds (array<string> return): transpiled={bool(sc.transpiled)} "
-        f"results={[r[0] for r in starts.select(sc('start', 'duration')).collect()]} "
-        "(failure paths -> [], never NULL)"
-    )
-
     # Array inputs are gated out by default; opt in for the LAC-membership UDF.
     conf.set_value(conf.INPUT_CATEGORIES, "numeric,string,bool,binary,map,timestamp,array", spark)
     lac = spark.createDataFrame(
@@ -360,35 +346,15 @@ def main() -> int:
         f"results={[r[0] for r in lac.select(bi('OLD_LAC', 'NEW_LAC', 'bsp', 'mid')).collect()]}"
     )
 
-    # First nested array input: array<array<string>> -> array<string>.
-    nested = spark.createDataFrame(
-        [
-            ([["a", "b"], ["c"]],),
-            ([["a", None], ["b"]],),  # null element survives
-            ([["x", "y"], ["x"]],),  # duplicate survives
-        ],
-        "s array<array<string>>",
-    )
-    fl = UserDefinedFunction(flatlist, ArrayType(StringType()))
-    first_rows = [r[0] for r in nested.select(fl("s")).collect()]
-    print(
-        f"flatlist: first call transpiled={bool(fl.transpiled)} results={first_rows} "
-        "(miss -> Python, rows sampled)"
-    )
-    fl = wait_transpiled("flatlist not transpiled", flatlist, ArrayType(StringType()))
-    print(
-        f"flatlist (array<array<string>> input): transpiled={bool(fl.transpiled)} "
-        f"results={[r[0] for r in nested.select(fl('s')).collect()]}"
-    )
-
     print()
     print("=== ADVERSARIAL PACK (python/Spark lookalikes, battery-verified rewrites) ===")
     # Each of these has a tempting naive rewrite that verification REJECTS:
     #   x % y        -> Spark `%` truncates, python floors (pmod fails for y<0)
     #   round(x)     -> Spark round is half-up, python is banker's
     #   t.weekday()  -> dayofweek is Sunday=1, python is Monday=0
-    #   s.split('.') -> Spark split takes a regex; '.' matches everything
     #   s.zfill(3)   -> lpad truncates and pads before the sign
+    # split_dot's s.split('.') regex trap is exercised by tests/test_adversarial.py;
+    # in this demo it lands in NOT WORKING below (array return, gate before hook).
     mods = spark.createDataFrame(
         [(7, 3), (-7, 3), (7, -3), (-7, -3)],
         "value bigint, modulus bigint",
@@ -421,14 +387,6 @@ def main() -> int:
         f"results={[r[0] for r in days.select(wd('t')).collect()]} (bare dayofweek rejected)"
     )
 
-    dots = spark.createDataFrame([("a.b",), ("no.dot.here.really",), ("plain",)], ["s"])
-    sd = wait_transpiled("sd not transpiled", split_dot, ArrayType(StringType()))
-    print(
-        f"split_dot (regex trap): transpiled={bool(sd.transpiled)} "
-        f"results={[r[0] for r in dots.select(sd('s')).collect()]} "
-        "(unescaped '.' splits into empty strings -- rejected)"
-    )
-
     zins = spark.createDataFrame([("5",), ("-5",), ("+7",), ("abcd",)], ["s"])
     zf = wait_transpiled("zf not transpiled", zfill3, StringType())
     print(
@@ -459,9 +417,9 @@ def main() -> int:
 
     print()
     print("=== JAVA UDF TARGET (compiled on the driver, Hypothesis-verified) ===")
-    bw = wait_transpiled("bw not transpiled", backwards, StringType())
+    bw = wait_transpiled("bw not transpiled", backwards_java, StringType())
     bw_rows = [r[0] for r in names.select(bw("name")).collect()]
-    print(f"backwards: transpiled={bool(bw.transpiled)} results={bw_rows} (Java UDF from cache)")
+    print(f"backwards_java: transpiled={bool(bw.transpiled)} results={bw_rows} (Java UDF from cache)")
 
     b = wait_transpiled("b not transpiled", both_positive, BooleanType())
     pairs = spark.createDataFrame([(1, 2), (-1, 2)], ["a", "b"])
@@ -499,6 +457,52 @@ def main() -> int:
     h = UserDefinedFunction(uses_helper, LongType())
     print(
         f"closure over a Python function: transpiled={bool(h.transpiled)} (cannot key captures -> declined)"
+    )
+
+    # Array-return UDFs: Spark's transpiler attaches only numeric/string/
+    # bool/binary return types, and that gate runs BEFORE any registered
+    # transpiler -- so our hook is never consulted for these: nothing queues,
+    # nothing fills, and no rewrite (however faithful) can ride
+    # TranspiledPythonUDF. The decline is upstream and structural, not a
+    # backend decision. register_impl below still verifies array-return SQL
+    # (verification never attaches), which is how the wrong-rewrite battery
+    # still covers the scatter_to_seconds/flatlist fixtures; split_dot's regex
+    # trap is covered directly by tests/test_adversarial.py.
+    starts = spark.createDataFrame(
+        [
+            ("2015-01-01 00:00:00", "2"),
+            ("2015-12-31 23:59:59", "2"),  # year rollover
+            ("2015-01-01", "5"),  # short start -> []
+            (None, "2"),  # null start -> []
+        ],
+        ["start", "duration"],
+    )
+    sc = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
+    print(
+        f"scatter_to_seconds (array<string> return): transpiled={bool(sc.transpiled)} "
+        f"results={[r[0] for r in starts.select(sc('start', 'duration')).collect()]} "
+        "(upstream return-type gate: hook never runs, stays interpreted)"
+    )
+    nested = spark.createDataFrame(
+        [
+            ([["a", "b"], ["c"]],),
+            ([["a", None], ["b"]],),  # null element survives
+            ([["x", "y"], ["x"]],),  # duplicate survives
+        ],
+        "s array<array<string>>",
+    )
+    fl = UserDefinedFunction(flatlist, ArrayType(StringType()))
+    print(
+        f"flatlist (array<array<string>> input): transpiled={bool(fl.transpiled)} "
+        f"results={[r[0] for r in nested.select(fl('s')).collect()]} (same gate: input is fine, "
+        "the return type is not)"
+    )
+    dots = spark.createDataFrame([("a.b",), ("no.dot.here.really",), ("plain",)], ["s"])
+    sd = UserDefinedFunction(split_dot, ArrayType(StringType()))
+    print(
+        f"split_dot (regex trap): transpiled={bool(sd.transpiled)} "
+        f"results={[r[0] for r in dots.select(sd('s')).collect()]} "
+        "(faithful rewrite is split(s, '\\\\.') but it cannot attach)"
     )
 
     UserDefinedFunction(always_decline, LongType())

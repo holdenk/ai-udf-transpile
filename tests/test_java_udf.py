@@ -13,7 +13,7 @@ from pyspark.sql.types import StringType
 from pyspark.sql.udf import UserDefinedFunction
 
 from ai_udf_transpile import enable
-from ai_udf_transpile.backends.fake import BACKWARDS_JAVA, backwards
+from ai_udf_transpile.backends.fake import BACKWARDS_JAVA, backwards_java
 from ai_udf_transpile.javac import compile_java, extract_java_class, register_java_udf
 from ai_udf_transpile.transpiler import get_catalog
 
@@ -52,7 +52,7 @@ def test_register_and_call_java_udf(spark):
 def test_java_udf_end_to_end(spark, sqlite_path):
     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
-    first = UserDefinedFunction(backwards, StringType())
+    first = UserDefinedFunction(backwards_java, StringType())
     assert not first.transpiled
     catalog = get_catalog()
     deadline = time.time() + 90
@@ -70,7 +70,7 @@ def test_java_udf_end_to_end(spark, sqlite_path):
     assert row[3] == "ai_udf.Backwards"
     assert row[4] and row[4] > 100, "compiled jar bytes were not stored"
 
-    second = UserDefinedFunction(backwards, StringType())
+    second = UserDefinedFunction(backwards_java, StringType())
     assert second.transpiled
     df = spark.createDataFrame([("hello",), (None,)], ["x"])
     assert [r[0] for r in df.select(second("x")).collect()] == ["olleh", None]
