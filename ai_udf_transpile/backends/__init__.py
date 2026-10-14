@@ -16,17 +16,42 @@ def _binary(spark: Any, key: str, default: str) -> str:
     return conf.get_value(key, spark, default)
 
 
+def _auto_priority(spark: Any = None) -> list[str]:
+    raw = conf.get_value(
+        conf.AUTO_BACKEND_PRIORITY,
+        spark,
+        conf.default_auto_backend_priority(),
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 def pick_auto(spark: Any = None) -> str:
-    candidates = [
-        ("coco", _binary(spark, conf.BINARY_COCO, conf.DEFAULTS[conf.BINARY_COCO])),
-        ("cursor", _binary(spark, conf.BINARY_CURSOR, conf.DEFAULTS[conf.BINARY_CURSOR])),
-        ("claude", _binary(spark, conf.BINARY_CLAUDE, conf.DEFAULTS[conf.BINARY_CLAUDE])),
-    ]
+    binaries = {
+        "coco": _binary(spark, conf.BINARY_COCO, conf.DEFAULTS[conf.BINARY_COCO]),
+        "pi": _binary(spark, conf.BINARY_PI, conf.DEFAULTS[conf.BINARY_PI]),
+        "claude": _binary(spark, conf.BINARY_CLAUDE, conf.DEFAULTS[conf.BINARY_CLAUDE]),
+        "codex": _binary(spark, conf.BINARY_CODEX, conf.DEFAULTS[conf.BINARY_CODEX]),
+        "cursor": _binary(spark, conf.BINARY_CURSOR, conf.DEFAULTS[conf.BINARY_CURSOR]),
+    }
+    order = _auto_priority(spark)
+    candidates = [(name, binaries[name]) for name in order if name in binaries]
     for name, binary in candidates:
         if shutil.which(binary):
             return name
-    tried = ", ".join(f"{name} ({binary})" for name, binary in candidates)
-    raise BackendError(f"auto backend: none of these are on PATH: {tried}")
+    unknown = [name for name in order if name not in binaries]
+    tried = ", ".join(f"{name} ({binary})" for name, binary in candidates) or "<empty>"
+    msg = [f"auto backend: none of these are on PATH: {tried}"]
+    if unknown:
+        msg.append(f"unknown names in {conf.AUTO_BACKEND_PRIORITY}: {', '.join(unknown)}")
+    raise BackendError("; ".join(msg))
 
 
 def get_backend(name: Optional[str] = None, spark: Any = None) -> Backend:
@@ -41,6 +66,10 @@ def get_backend(name: Optional[str] = None, spark: Any = None) -> Backend:
         from ai_udf_transpile.backends.coco import CocoBackend
 
         return CocoBackend(spark)
+    if chosen == "pi":
+        from ai_udf_transpile.backends.pi import PiBackend
+
+        return PiBackend(spark)
     if chosen == "cursor":
         from ai_udf_transpile.backends.cursor import CursorBackend
 
@@ -49,4 +78,8 @@ def get_backend(name: Optional[str] = None, spark: Any = None) -> Backend:
         from ai_udf_transpile.backends.claude import ClaudeBackend
 
         return ClaudeBackend(spark)
-    raise BackendError(f"unknown backend {chosen!r}; expected auto, fake, coco, cursor, or claude")
+    if chosen == "codex":
+        from ai_udf_transpile.backends.codex import CodexBackend
+
+        return CodexBackend(spark)
+    raise BackendError(f"unknown backend {chosen!r}; expected auto, fake, coco, pi, claude, codex, or cursor")

@@ -2,9 +2,9 @@
 
 Partial, non-blocking Python UDF transpilation for Apache Spark. Spark's
 built-in Catalyst transpiler covers simple functions; this plugin asks an
-agent (CoCo / Cursor / Claude, or a deterministic fake backend in CI) to
-rewrite the rest into Catalyst SQL or a Java UDF, then Hypothesis-checks the
-rewrite against the original Python before it is served.
+agent (CoCo / Pi / Claude / Codex / Cursor, or a deterministic fake backend
+in CI) to rewrite the rest into Catalyst SQL or a Java UDF, then
+Hypothesis-checks the rewrite against the original Python before it is served.
 
 Queries never wait on the agent. A miss inserts a `pending` catalog row and
 Spark keeps the interpreted Python UDF. A background worker (inline driver
@@ -56,7 +56,7 @@ from ai_udf_transpile import enable, register_impl
 
 spark = SparkSession.builder.getOrCreate()
 spark.conf.set("spark.sql.ansi.enabled", "true")
-enable(spark, backend="fake")  # or coco / cursor / claude / auto
+enable(spark, backend="fake")  # or coco / pi / claude / codex / cursor / auto
 
 from pyspark.sql.functions import udf
 from pyspark.sql.types import LongType
@@ -101,7 +101,9 @@ python -m ai_udf_transpile.worker --sqlite-path /tmp/ai_udf_transpile.sqlite --b
 ```bash
 examples/run_demos.sh           # quickstart + full demo (fake backend)
 examples/run_demos.sh --bench   # + local micro benchmarks
-examples/run_demos.sh --live    # + real CLI backends (cortex/agent/claude on PATH)
+examples/run_demos.sh --live    # + real CLI backends (cortex/pi/agent/claude/codex on PATH)
+examples/run_demos.sh --bench --transpilation-timing-csv bench_transpilation_timing.csv
+examples/run_demos.sh --bench --rust-accel
 ```
 
 The runner wires up `SPARK_HOME` (default `~/spark`), the py4j zip, and a
@@ -116,8 +118,11 @@ transpiled AI as a Java UDF (compiled on the driver; a target for every
 convertible benched UDF, not just one) — over 10M cached rows (noop
 sink, plan-checked). Its CSV is one row per function with per-arm
 rows/sec, speedup vs regular, and `transpile_succeeded` booleans for
-static and both AI kinds. It also reports per-definition catalog cost and
-one-time fill cost per rewrite.
+static and both AI kinds. A second transpilation timing CSV (auto-written when
+`--csv` is set, or explicit via `--transpilation-timing-csv`) captures one-time transpile fill costs
+and plain-vs-AI UDF lookup/definition costs. `--rust-accel` runs the same
+bench with rust acceleration Spark configs enabled (default preset: Comet; add
+`--rust-accel-conf key=value` for local overrides).
 
 The perf graph is generated from that CSV by a CLI tool
 (`examples/bench_graph.py`, matplotlib — no AI in the loop, ever):
@@ -134,6 +139,13 @@ second command re-plots that one too:
 examples/run_demos.sh --bench --csv bench_micro.csv   # or: python examples/bench_micro.py --csv bench_micro.csv
 python examples/bench_graph.py bench_micro.csv docs/bench_perf.png
 ```
+
+`backend=auto` picks the first available backend from
+`spark.sql.experimental.aiUdfTranspile.autoBackendPriority`
+(default: `coco,pi,claude,codex,cursor`). Override binaries with
+`spark.sql.experimental.aiUdfTranspile.binary.<name>` and models with
+`spark.sql.experimental.aiUdfTranspile.model.<name>`, where `<name>` is one of
+`coco`, `pi`, `claude`, `codex`, or `cursor`.
 
 ## Catalog
 

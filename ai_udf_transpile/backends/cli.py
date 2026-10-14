@@ -137,6 +137,19 @@ def claude_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
     ]
 
 
+def codex_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
+    del sandbox
+    return [
+        binary,
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "workspace-write",
+        "--approve-for-me",
+        prompt_text,
+    ]
+
+
 COCO_SPEC = CliSpec(
     name="coco",
     default_binary=conf.DEFAULTS[conf.BINARY_COCO],
@@ -144,6 +157,14 @@ COCO_SPEC = CliSpec(
     argv=coco_argv,
     model_conf_key=conf.MODEL_COCO,
     model_flag="-m",
+)
+PI_SPEC = CliSpec(
+    name="pi",
+    default_binary=conf.DEFAULTS[conf.BINARY_PI],
+    binary_conf_key=conf.BINARY_PI,
+    argv=cursor_argv,
+    model_conf_key=conf.MODEL_PI,
+    model_flag="--model",
 )
 CURSOR_SPEC = CliSpec(
     name="cursor",
@@ -159,6 +180,14 @@ CLAUDE_SPEC = CliSpec(
     binary_conf_key=conf.BINARY_CLAUDE,
     argv=claude_argv,
     model_conf_key=conf.MODEL_CLAUDE,
+    model_flag="--model",
+)
+CODEX_SPEC = CliSpec(
+    name="codex",
+    default_binary=conf.DEFAULTS[conf.BINARY_CODEX],
+    binary_conf_key=conf.BINARY_CODEX,
+    argv=codex_argv,
+    model_conf_key=conf.MODEL_CODEX,
     model_flag="--model",
 )
 
