@@ -2,9 +2,11 @@
 # Run the demos end to end against a packaged Spark master.
 #
 #   examples/run_demos.sh                        # fake-backend demos (quickstart, full)
-#   examples/run_demos.sh --live                 # + real CLI backends (cortex/agent/claude on PATH)
+#   examples/run_demos.sh --live                 # + real CLI backends (cortex/pi/agent/claude/codex on PATH)
 #   examples/run_demos.sh --bench                 # + local micro benchmarks (~10M rows)
 #   examples/run_demos.sh --bench --csv out.csv   # + also write the wide per-function CSV
+#   examples/run_demos.sh --bench --transpilation-timing-csv out_transpilation_timing.csv
+#   examples/run_demos.sh --bench --rust-accel [--rust-accel-conf key=value]
 #
 # Env: SPARK_HOME (default ~/spark), PYTHON (default repo .venv).
 set -u -o pipefail
@@ -44,6 +46,10 @@ export SPARK_LOCAL_IP=127.0.0.1 SPARK_LOCAL_HOSTNAME=localhost
 LIVE=0
 BENCH=0
 CSV=""
+TRANSPILE_TIMING_CSV=""
+RUST_ACCEL=0
+RUST_PRESET="comet"
+RUST_CONF=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --live) LIVE=1 ;;
@@ -52,6 +58,30 @@ while [ $# -gt 0 ]; do
     --csv)
       [ $# -ge 2 ] || { echo "error: --csv needs a path" >&2; exit 2; }
       CSV="$2"
+      BENCH=1
+      shift
+      ;;
+    --transpilation-timing-csv|--timing-csv)
+      [ $# -ge 2 ] || { echo "error: $1 needs a path" >&2; exit 2; }
+      TRANSPILE_TIMING_CSV="$2"
+      BENCH=1
+      shift
+      ;;
+    --rust-accel)
+      RUST_ACCEL=1
+      BENCH=1
+      ;;
+    --rust-accel-preset)
+      [ $# -ge 2 ] || { echo "error: --rust-accel-preset needs a value" >&2; exit 2; }
+      RUST_PRESET="$2"
+      RUST_ACCEL=1
+      BENCH=1
+      shift
+      ;;
+    --rust-accel-conf)
+      [ $# -ge 2 ] || { echo "error: --rust-accel-conf needs key=value" >&2; exit 2; }
+      RUST_CONF+=("$2")
+      RUST_ACCEL=1
       BENCH=1
       shift
       ;;
@@ -83,6 +113,13 @@ run_demo "full demo" examples/demo.py
 if [ "$BENCH" -eq 1 ]; then
   BENCH_ARGS=(examples/bench_micro.py)
   [ -n "$CSV" ] && BENCH_ARGS+=(--csv "$CSV")
+  [ -n "$TRANSPILE_TIMING_CSV" ] && BENCH_ARGS+=(--transpilation-timing-csv "$TRANSPILE_TIMING_CSV")
+  if [ "$RUST_ACCEL" -eq 1 ]; then
+    BENCH_ARGS+=(--rust-accel --rust-accel-preset "$RUST_PRESET")
+    for kv in "${RUST_CONF[@]}"; do
+      BENCH_ARGS+=(--rust-accel-conf "$kv")
+    done
+  fi
   run_demo "micro bench" "${BENCH_ARGS[@]}"
 fi
 

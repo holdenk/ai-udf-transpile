@@ -11,7 +11,9 @@ from ai_udf_transpile.backends.base import BackendDecline, BackendError
 from ai_udf_transpile.backends.claude import ClaudeBackend
 from ai_udf_transpile.backends.cli import _parse_claude_json, parse_sandbox
 from ai_udf_transpile.backends.coco import CocoBackend
+from ai_udf_transpile.backends.codex import CodexBackend
 from ai_udf_transpile.backends.cursor import CursorBackend
+from ai_udf_transpile.backends.pi import PiBackend
 from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF
 
 
@@ -56,6 +58,29 @@ def test_cursor_argv(tmp_path):
     assert "--output-format" in argv
 
 
+def test_pi_argv(tmp_path):
+    backend = PiBackend()
+    argv = backend.build_argv(tmp_path, "PROMPT TEXT")
+    assert argv[0] == "pi"
+    assert "-p" in argv
+    assert "PROMPT TEXT" in argv
+    assert "--trust" in argv
+    assert "--force" in argv
+    assert "--output-format" in argv
+
+
+def test_codex_argv(tmp_path):
+    backend = CodexBackend()
+    argv = backend.build_argv(tmp_path, "PROMPT TEXT")
+    assert argv[0] == "codex"
+    assert "exec" in argv
+    assert "--skip-git-repo-check" in argv
+    assert "--sandbox" in argv
+    assert "workspace-write" in argv
+    assert "--approve-for-me" in argv
+    assert "PROMPT TEXT" in argv
+
+
 def test_claude_argv(tmp_path):
     backend = ClaudeBackend()
     argv = backend.build_argv(tmp_path, "PROMPT TEXT")
@@ -89,6 +114,20 @@ def test_coco_model_flag(tmp_path):
     argv = CocoBackend().build_argv(tmp_path, "PROMPT TEXT")
     assert "-m" in argv
     assert argv[argv.index("-m") + 1] == "snow-intelligence-x"
+
+
+def test_pi_model_flag(tmp_path):
+    conf.set_value(conf.MODEL_PI, "pi-foo")
+    argv = PiBackend().build_argv(tmp_path, "PROMPT TEXT")
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "pi-foo"
+
+
+def test_codex_model_flag(tmp_path):
+    conf.set_value(conf.MODEL_CODEX, "codex-foo")
+    argv = CodexBackend().build_argv(tmp_path, "PROMPT TEXT")
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "codex-foo"
 
 
 def test_parse_claude_json_extracts_model_and_result():

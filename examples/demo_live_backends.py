@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Demo against the real AI CLI backends (coco / cursor / claude).
+"""Demo against the real AI CLI backends (coco / pi / cursor / claude / codex).
 
 Each backend gets a fresh SQLite catalog, transpiles two UDFs for real
 (cache miss -> CLI -> Hypothesis verify -> cache hit), and we time it.
@@ -30,7 +30,13 @@ from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
 
-BACKEND_BINARIES = {"coco": "cortex", "cursor": "agent", "claude": "claude"}
+BACKEND_BINARIES = {
+    "coco": "cortex",
+    "pi": "pi",
+    "cursor": "agent",
+    "claude": "claude",
+    "codex": "codex",
+}
 
 
 def plus_one(x: int) -> int:
@@ -91,7 +97,8 @@ def run_backend(spark, backend: str) -> dict:
 def main() -> int:
     wanted = sys.argv[1:] or [name for name, binary in BACKEND_BINARIES.items() if shutil.which(binary)]
     if not wanted:
-        print("no backends found on PATH (looked for cortex, agent, claude)")
+        looked_for = ", ".join(BACKEND_BINARIES.values())
+        print(f"no backends found on PATH (looked for {looked_for})")
         return 1
     conf.set_value(conf.CLI_TIMEOUT, "600")  # coco can take minutes
 

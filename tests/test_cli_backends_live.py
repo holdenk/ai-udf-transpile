@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Live end-to-end tests against the real AI CLI backends (coco/cursor/claude).
+"""Live end-to-end tests against the real AI CLI backends (coco/pi/cursor/claude/codex).
 
 These never run in CI: they require AI_UDF_LIVE=1 and the backend binary on
 PATH with working auth. Run locally with:
@@ -33,8 +33,10 @@ pytestmark = [
 
 BACKENDS = {
     "coco": conf.DEFAULTS[conf.BINARY_COCO],
+    "pi": conf.DEFAULTS[conf.BINARY_PI],
     "cursor": conf.DEFAULTS[conf.BINARY_CURSOR],
     "claude": conf.DEFAULTS[conf.BINARY_CLAUDE],
+    "codex": conf.DEFAULTS[conf.BINARY_CODEX],
 }
 
 

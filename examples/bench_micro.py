@@ -22,12 +22,19 @@ the backend converts four (both kinds) and declines always_decline
 (env-dependent, no faithful rewrite), which falls back to python with
 unchanged perf.
 
+A second CSV (--transpilation-timing-csv, or auto-generated next to --csv)
+records timing
+details: one-time transpile fill cost and UDF lookup/definition overhead on
+the plain vs AI paths.
+
   throughput   rows/sec over a cached DataFrame, noop sink, min of --rounds rounds
   definition   ms per UserDefinedFunction(...) creation (plugin hit vs plain)
   fill cost    ai: queue -> backend -> Hypothesis -> success or decline
 
     export SPARK_HOME=/path/to/spark-master   # same env as demo_quickstart.py
     python examples/bench_micro.py [rows] [--rounds N] [--csv PATH]
+    python examples/bench_micro.py --transpilation-timing-csv bench_micro_transpilation_timing.csv
+    python examples/bench_micro.py --rust-accel
 """
 
 from __future__ import annotations
@@ -61,6 +68,10 @@ from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
 PARTITIONS = os.cpu_count() or 16
+RUST_COMET_CONFS = {
+    "spark.plugins": "org.apache.comet.CometPlugin",
+    "spark.comet.enabled": "true",
+}
 
 
 def plus_one(x: int) -> int:
@@ -147,6 +158,19 @@ def wait_for_catalog_result(
     return status, backend, error
 
 
+def parse_conf_overrides(parser: argparse.ArgumentParser, values: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw in values:
+        if "=" not in raw:
+            parser.error(f"--rust-accel-conf expects key=value, got {raw!r}")
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not key:
+            parser.error(f"--rust-accel-conf expects key=value, got {raw!r}")
+        out[key] = value.strip()
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("rows", nargs="?", type=int, default=10_000_000)
@@ -156,19 +180,70 @@ def main() -> int:
         metavar="PATH",
         help="write the wide per-function table (perf + transpile booleans)",
     )
+    parser.add_argument(
+        "--transpilation-timing-csv",
+        "--timing-csv",
+        dest="transpilation_timing_csv",
+        metavar="PATH",
+        help="write transpilation timing details (fill + lookup/definition cost) as a second CSV",
+    )
+    parser.add_argument(
+        "--rust-accel",
+        action="store_true",
+        help="run with rust acceleration configs (default preset: comet)",
+    )
+    parser.add_argument(
+        "--rust-accel-preset",
+        choices=["comet", "none"],
+        default=None,
+        help="preset rust accelerator config set (implies --rust-accel)",
+    )
+    parser.add_argument(
+        "--rust-accel-conf",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra Spark config(s) when --rust-accel is on (repeatable)",
+    )
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error("--rounds must be >= 1")
+    if args.rust_accel_preset is not None:
+        args.rust_accel = True
+    rust_extra = parse_conf_overrides(parser, args.rust_accel_conf)
+    if rust_extra and not args.rust_accel:
+        parser.error("--rust-accel-conf requires --rust-accel")
+    timing_csv = args.transpilation_timing_csv
+    if timing_csv is None and args.csv:
+        p = Path(args.csv)
+        suffix = p.suffix if p.suffix else ".csv"
+        timing_csv = str(p.with_name(f"{p.stem}_transpilation_timing{suffix}"))
+    if timing_csv and args.csv:
+        csv_path = Path(args.csv).expanduser().resolve()
+        timing_path = Path(timing_csv).expanduser().resolve()
+        if csv_path == timing_path:
+            parser.error(
+                "--transpilation-timing-csv must differ from --csv "
+                "(or omit it to use the default sibling path)"
+            )
+    rust_preset = args.rust_accel_preset or "comet"
     rows = args.rows
-    spark = (
+    builder = (
         SparkSession.builder.master("local[*]")
         .appName("ai-udf-transpile-bench")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", str(PARTITIONS))
         .config("spark.sql.ansi.enabled", "true")
         .config(TRANSPILE_CONF, "false")  # the regular phase must stay interpreted python
-        .getOrCreate()
     )
+    rust_confs: dict[str, str] = {}
+    if args.rust_accel:
+        if rust_preset == "comet":
+            rust_confs.update(RUST_COMET_CONFS)
+        rust_confs.update(rust_extra)
+        for key, value in sorted(rust_confs.items()):
+            builder = builder.config(key, value)
+    spark = builder.getOrCreate()
 
     # Cache the inputs so range/cast generation is not in the measurement.
     ints = spark.range(0, rows, numPartitions=PARTITIONS).toDF("x").cache()
@@ -200,6 +275,13 @@ def main() -> int:
         ("edit_distance", edit_distance, LongType(), pairs, ["a", "b"], sample_pairs),
         ("always_decline", always_decline, LongType(), ints, ["x"], None),
     ]
+
+    if args.rust_accel:
+        label = f"{rust_preset} preset"
+        print(f"=== RUST ACCEL ({label}) ===")
+        for key, value in sorted(rust_confs.items()):
+            print(f"{key}={value}")
+        print()
 
     print(f"=== THROUGHPUT ({rows:,} rows, local[*], noop sink, min of {args.rounds} rounds) ===")
 
@@ -375,26 +457,64 @@ def main() -> int:
     )
 
     print()
-    print("=== UDF DEFINITION OVERHEAD (avg of 300 creations) ===")
-    creations = 300
-    assert UserDefinedFunction(plus_one, LongType()).transpiled  # probe: really the hit path
-    start = time.perf_counter()
-    for _ in range(creations):
-        UserDefinedFunction(plus_one, LongType())
-    hit_ms = (time.perf_counter() - start) / creations * 1000
-    spark.conf.set(TRANSPILE_CONF, "false")
-    assert not UserDefinedFunction(plus_one, LongType()).transpiled  # probe: really the plain path
-    start = time.perf_counter()
-    for _ in range(creations):
-        UserDefinedFunction(plus_one, LongType())
-    plain_ms = (time.perf_counter() - start) / creations * 1000
-    print(f"plugin warm-hit: {hit_ms:.2f} ms/def   plain python udf: {plain_ms:.2f} ms/def")
-
-    print()
     print("=== ONE-TIME FILL COST (queue -> backend -> Hypothesis -> success or decline) ===")
+    timing_header = ["section", "mode", "function", "kind", "metric", "value", "unit", "transpile_succeeded"]
+    timing_rows: list[list] = []
     for (name, kind), fill_secs in fills.items():
         declined = "  (declined)" if name == "always_decline" else ""
         print(f"  {name + ' (' + kind + ')':24}{fill_secs:6.2f}s  (incl. claim latency){declined}")
+        timing_rows.append(
+            [
+                "fill",
+                "ai",
+                name,
+                kind,
+                "fill_seconds",
+                f"{fill_secs:.6f}",
+                "seconds",
+                str(name != "always_decline"),
+            ]
+        )
+
+    print()
+    print("=== LOOKUP COST (UDF definition; avg of 200 creations) ===")
+    lookups = 200
+    lookup_targets = []
+    for name, fn, rtype, _df, _cols, _sample in functions:
+        lookup_targets.append((name, "catalyst", fn, rtype, ai_ok[name]))
+        twin = JAVA_TWINS.get(name)
+        if twin is not None:
+            lookup_targets.append((name, "java", twin, rtype, java_ok.get(name, False)))
+    for mode, transpile_on in (("plain", False), ("ai", True)):
+        spark.conf.set(TRANSPILE_CONF, "true" if transpile_on else "false")
+        if transpile_on:
+            spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
+        for name, kind, fn, rtype, expected_hit in lookup_targets:
+            start = time.perf_counter()
+            transpiled = False
+            for _ in range(lookups):
+                transpiled = bool(UserDefinedFunction(fn, rtype).transpiled)
+            ms = (time.perf_counter() - start) / lookups * 1000
+            if transpile_on:
+                assert transpiled == expected_hit, (
+                    f"lookup mode drift for {name} ({kind}): transpiled={transpiled}, expected={expected_hit}"
+                )
+            else:
+                assert not transpiled, f"plain lookup unexpectedly transpiled {name} ({kind})"
+            suffix = " (hit)" if transpiled else " (fallback)"
+            print(f"  {mode + ' ' + name + ' (' + kind + ')' + ':':30}{ms:6.2f} ms/def{suffix}")
+            timing_rows.append(
+                [
+                    "lookup",
+                    mode,
+                    name,
+                    kind,
+                    "definition_ms",
+                    f"{ms:.6f}",
+                    "ms/def",
+                    str(transpiled),
+                ]
+            )
 
     shutdown()
     spark.stop()
@@ -405,6 +525,12 @@ def main() -> int:
             writer.writerow(header)
             writer.writerows(wide)
         print(f"csv: wrote {len(wide)} rows to {args.csv}")
+    if timing_csv:
+        with open(timing_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(timing_header)
+            writer.writerows(timing_rows)
+        print(f"transpilation timing csv: wrote {len(timing_rows)} rows to {timing_csv}")
     return 0
 
 

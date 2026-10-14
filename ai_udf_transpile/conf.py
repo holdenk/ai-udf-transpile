@@ -20,8 +20,10 @@ POLL_INTERVAL = PREFIX + "pollIntervalSeconds"
 CLAIM_TIMEOUT = PREFIX + "claimTimeoutSeconds"
 CLI_TIMEOUT = PREFIX + "cliTimeoutSeconds"
 BINARY_COCO = PREFIX + "binary.coco"
+BINARY_PI = PREFIX + "binary.pi"
 BINARY_CURSOR = PREFIX + "binary.cursor"
 BINARY_CLAUDE = PREFIX + "binary.claude"
+BINARY_CODEX = PREFIX + "binary.codex"
 MAX_EXAMPLES = PREFIX + "maxExamples"
 # Absolute numeric tolerance used while checking a rewrite, and the loosest
 # tested tolerance a cached rewrite may have and still be served.
@@ -29,8 +31,11 @@ TOLERANCE = PREFIX + "tolerance"
 MAX_RETRIES = PREFIX + "maxRetries"
 FAIL_COOLDOWN = PREFIX + "failCooldownSeconds"
 MODEL_COCO = PREFIX + "model.coco"
+MODEL_PI = PREFIX + "model.pi"
 MODEL_CURSOR = PREFIX + "model.cursor"
 MODEL_CLAUDE = PREFIX + "model.claude"
+MODEL_CODEX = PREFIX + "model.codex"
+AUTO_BACKEND_PRIORITY = PREFIX + "autoBackendPriority"
 INPUT_CATEGORIES = PREFIX + "inputCategories"
 SAMPLING = PREFIX + "sampling"
 MAX_SAMPLES = PREFIX + "maxSamples"
@@ -46,8 +51,12 @@ DEFAULTS: dict[str, str] = {
     CLAIM_TIMEOUT: "600",
     CLI_TIMEOUT: "300",
     BINARY_COCO: "cortex",
+    BINARY_PI: "pi",
+    BINARY_CODEX: "codex",
     BINARY_CURSOR: "agent",
     BINARY_CLAUDE: "claude",
+    # first available binary on PATH wins when backend=auto
+    AUTO_BACKEND_PRIORITY: "coco,pi,claude,codex,cursor",
     MAX_EXAMPLES: "20",
     TOLERANCE: "0",
     MAX_RETRIES: "3",
@@ -81,6 +90,13 @@ def default_backend() -> str:
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return "fake"
     return "auto"
+
+
+def default_auto_backend_priority() -> str:
+    env = os.environ.get("AI_UDF_TRANSPILE_BACKEND_PRIORITY")
+    if env:
+        return env
+    return DEFAULTS[AUTO_BACKEND_PRIORITY]
 
 
 def default_max_examples() -> str:
