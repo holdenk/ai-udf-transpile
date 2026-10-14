@@ -89,17 +89,21 @@ plan-checked), per-definition catalog cost, and one-time verify cost.
 
 ## Catalog
 
-Default catalog is **SQLite** (real `UPDATE` CAS). Optional `catalog=delta`
-requires Delta Lake on the classpath. Vanilla Hive/Parquet tables cannot
-`UPDATE` a row, so they are never the primary catalog — but a parquet (or
-iceberg) table can be a **write-back target**: set
-`spark.sql.experimental.aiUdfTranspile.writebackTable` (plus optional
-`writebackFormat=parquet|iceberg` and `writebackThreshold`, default 32) and
-verified successes stage in SQLite, then append to the shared table once the
-threshold accumulates. Lookups fall through to the table, so a fresh process
-(new SQLite file) is served verified rewrites without running a backend.
-Write-back is append-only (reads dedupe by latest `updated_at`), carries
-successes only, and is fail-open: a misconfigured table never breaks UDFs.
+Default catalog is **SQLite** (real `UPDATE` CAS; claims, cooldowns, and
+samples stay local by design). The shared path is **write-back to an
+Iceberg table served by Apache Polaris or any other Iceberg REST
+catalog**: configure that catalog in Spark, set
+`spark.sql.experimental.aiUdfTranspile.writebackTable` to the
+fully-qualified table (e.g. `polaris.db.ai_udf_writeback`) plus
+`writebackFormat=iceberg` (Iceberg runtime on the classpath; `parquet`
+works where no catalog is available) and optional `writebackThreshold`,
+default 32. Verified successes stage in SQLite, then append to the shared
+table once the threshold accumulates. Lookups fall through to the table,
+so a fresh process (new SQLite file) is served verified rewrites without
+running a backend. Write-back is append-only (reads dedupe by latest
+`updated_at`), carries successes only, and is fail-open: a misconfigured
+or unreachable catalog never breaks UDFs. `catalog=delta` (Delta Lake
+on the classpath) still exists but is no longer the shared story.
 Trust caveat: a served row is served as-is (no re-verification), so anyone
 who can append to that table can run SQL and Java in every reader's driver
 (see `docs/future-iceberg-udf-catalog.md`).
