@@ -7,6 +7,7 @@
 #   examples/run_demos.sh --bench --csv out.csv   # + also write the wide per-function CSV
 #   examples/run_demos.sh --bench --transpilation-timing-csv out_transpilation_timing.csv
 #   examples/run_demos.sh --bench --rust-accel [--rust-accel-conf key=value]
+#   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 #
 # Env: SPARK_HOME (default ~/spark), PYTHON (default repo .venv).
 set -u -o pipefail
@@ -111,6 +112,11 @@ run_demo "quickstart" examples/demo_quickstart.py
 run_demo "full demo" examples/demo.py
 [ "$LIVE" -eq 1 ] && run_demo "live backends" examples/demo_live_backends.py
 if [ "$BENCH" -eq 1 ]; then
+  if [ "$RUST_ACCEL" -eq 1 ] && [ "$RUST_PRESET" = "comet" ]; then
+    if [ -z "${AI_UDF_TRANSPILE_COMET_JAR:-}" ] && [ -z "${COMET_JAR:-}" ]; then
+      echo "warning: rust preset 'comet' usually needs COMET_JAR/AI_UDF_TRANSPILE_COMET_JAR set" >&2
+    fi
+  fi
   BENCH_ARGS=(examples/bench_micro.py)
   [ -n "$CSV" ] && BENCH_ARGS+=(--csv "$CSV")
   [ -n "$TRANSPILE_TIMING_CSV" ] && BENCH_ARGS+=(--transpilation-timing-csv "$TRANSPILE_TIMING_CSV")

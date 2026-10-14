@@ -34,6 +34,7 @@ the plain vs AI paths.
     export SPARK_HOME=/path/to/spark-master   # same env as demo_quickstart.py
     python examples/bench_micro.py [rows] [--rounds N] [--csv PATH]
     python examples/bench_micro.py --transpilation-timing-csv bench_micro_transpilation_timing.csv
+    export COMET_JAR=/path/to/comet-spark-spark4.x_2.13-<version>.jar
     python examples/bench_micro.py --rust-accel
 """
 
@@ -69,9 +70,14 @@ TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
 PARTITIONS = os.cpu_count() or 16
 RUST_COMET_CONFS = {
-    "spark.plugins": "org.apache.comet.CometPlugin",
+    "spark.plugins": "org.apache.spark.CometPlugin",
+    "spark.shuffle.manager": "org.apache.spark.sql.comet.execution.shuffle.CometShuffleManager",
     "spark.comet.enabled": "true",
+    "spark.comet.explain.fallback.enabled": "true",
+    "spark.memory.offHeap.enabled": "true",
+    "spark.memory.offHeap.size": "2g",
 }
+COMET_JAR_ENV_KEYS = ("AI_UDF_TRANSPILE_COMET_JAR", "COMET_JAR")
 
 
 def plus_one(x: int) -> int:
@@ -171,6 +177,14 @@ def parse_conf_overrides(parser: argparse.ArgumentParser, values: list[str]) -> 
     return out
 
 
+def _comet_jar_from_env() -> str:
+    for key in COMET_JAR_ENV_KEYS:
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("rows", nargs="?", type=int, default=10_000_000)
@@ -190,7 +204,10 @@ def main() -> int:
     parser.add_argument(
         "--rust-accel",
         action="store_true",
-        help="run with rust acceleration configs (default preset: comet)",
+        help=(
+            "run with rust acceleration configs (default preset: comet; "
+            "jar from AI_UDF_TRANSPILE_COMET_JAR/COMET_JAR)"
+        ),
     )
     parser.add_argument(
         "--rust-accel-preset",
@@ -240,6 +257,17 @@ def main() -> int:
     if args.rust_accel:
         if rust_preset == "comet":
             rust_confs.update(RUST_COMET_CONFS)
+            comet_jar = _comet_jar_from_env()
+            if comet_jar:
+                rust_confs.setdefault("spark.jars", comet_jar)
+                rust_confs.setdefault("spark.driver.extraClassPath", comet_jar)
+                rust_confs.setdefault("spark.executor.extraClassPath", comet_jar)
+            else:
+                print(
+                    "warning: rust preset 'comet' expects Comet on classpath; set "
+                    "AI_UDF_TRANSPILE_COMET_JAR or COMET_JAR",
+                    file=sys.stderr,
+                )
         rust_confs.update(rust_extra)
         for key, value in sorted(rust_confs.items()):
             builder = builder.config(key, value)

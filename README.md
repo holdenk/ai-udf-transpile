@@ -104,6 +104,7 @@ examples/run_demos.sh --bench   # + local micro benchmarks
 examples/run_demos.sh --live    # + real CLI backends (cortex/pi/agent/claude/codex on PATH)
 examples/run_demos.sh --bench --transpilation-timing-csv bench_transpilation_timing.csv
 examples/run_demos.sh --bench --rust-accel
+examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 ```
 
 The runner wires up `SPARK_HOME` (default `~/spark`), the py4j zip, and a
@@ -122,7 +123,10 @@ static and both AI kinds. A second transpilation timing CSV (auto-written when
 `--csv` is set, or explicit via `--transpilation-timing-csv`) captures one-time transpile fill costs
 and plain-vs-AI UDF lookup/definition costs. `--rust-accel` runs the same
 bench with rust acceleration Spark configs enabled (default preset: Comet; add
-`--rust-accel-conf key=value` for local overrides).
+`--rust-accel-conf key=value` for local overrides). For the Comet preset, set
+`AI_UDF_TRANSPILE_COMET_JAR` (or `COMET_JAR`) so the plugin jar is on Spark's
+classpath; `examples/setup_comet.sh` can clone/build Comet from source and emit
+the exports for your current Spark checkout.
 
 The perf graph is generated from that CSV by a CLI tool
 (`examples/bench_graph.py`, matplotlib — no AI in the loop, ever):
