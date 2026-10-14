@@ -84,8 +84,13 @@ The runner wires up `SPARK_HOME` (default `~/spark`), the py4j zip, and a
 matching `PYSPARK_PYTHON` itself. `examples/demo_quickstart.py` is the
 60-second version (one Catalyst rewrite, one Java UDF); `examples/demo.py`
 is the full tour including the adversarial pack. `examples/bench_micro.py`
-measures Python-vs-transpiled throughput over 10M cached rows (noop sink,
-plan-checked), per-definition catalog cost, and one-time verify cost.
+measures three arms per function —
+regular Python, transpiled static (`register_impl`), and transpiled AI
+(backend-filled through the inline worker) — over 10M cached rows (noop
+sink, plan-checked). Its CSV is one row per function with per-arm
+rows/sec, speedup vs regular, and `transpile_succeeded` booleans for
+static and AI. It also reports per-definition catalog cost and one-time
+fill cost per rewrite.
 
 ## Catalog
 

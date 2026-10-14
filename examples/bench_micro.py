@@ -1,15 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Local micro benchmarks: Python UDF vs transpiled Catalyst SQL vs Java UDF.
+"""Local micro benchmarks: regular vs transpiled (static) vs transpiled (AI).
 
-Three numbers, all on one local SparkSession:
+Three arms per function on one local SparkSession:
 
-  throughput   rows/sec over a cached DataFrame, noop sink, min of --rounds rounds (default 3)
+  regular   interpreted python, constructed before the plugin is enabled
+  static    human-provided rewrite via register_impl (origin='human')
+  ai        backend-generated rewrite (fake backend, through the inline worker)
+
+The wide CSV (--csv; CI uploads it for slides) is one row per function with
+perf for each arm, speedup vs regular, and transpile_succeeded booleans for
+static and AI. always_decline has no faithful static rewrite (its result is
+environment-dependent) and the backend declines it: AI perf falls back to
+python, boolean False.
+
+  throughput   rows/sec over a cached DataFrame, noop sink, min of --rounds rounds
   definition   ms per UserDefinedFunction(...) creation (plugin hit vs plain)
-  fill cost    one-time seconds for register_impl (Hypothesis + javac)
-
-The throughput section also includes the atomic ``always_decline`` UDF whose
-environment-dependent behavior stays on the Python path after the fake backend
-declines.
+  fill cost    one-time seconds per rewrite (static: register_impl verify;
+               ai: queue -> backend -> Hypothesis -> verified success)
 
     export SPARK_HOME=/path/to/spark-master   # same env as demo_quickstart.py
     python examples/bench_micro.py [rows] [--rounds N] [--csv PATH]
@@ -32,11 +39,12 @@ from pyspark.sql import functions as F  # noqa: E402
 from pyspark.sql.types import LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
-from ai_udf_transpile import enable, register_impl, shutdown  # noqa: E402
+from ai_udf_transpile import conf, enable, register_impl, shutdown  # noqa: E402
 from ai_udf_transpile.backends.fake import BACKWARDS_JAVA, FIXTURES, always_decline  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
+PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
 PARTITIONS = os.cpu_count() or 16
 
 
@@ -75,8 +83,13 @@ def edit_distance(a: str, b: str) -> int:
     return prev[len(b)]
 
 
-# The fake backend's fixture for this exact source: verified-faithful SQL.
+PLUS_SQL = "_udf_param_0 + 1"
+EDIT_SQL = "coalesce(levenshtein(_udf_param_0, _udf_param_1), -1)"
 ZFILL_SQL = FIXTURES[canonical_source_from_func(zfill3)].sql
+for _f in (plus_one, backwards, zfill3, edit_distance):
+    # The ai arm needs a fake fixture for each benched function; fail at
+    # import rather than as a surprise decline mid-bench.
+    assert canonical_source_from_func(_f) in FIXTURES, f"no fake fixture for {_f.__name__}"
 
 
 def noop_seconds(df) -> float:
@@ -111,20 +124,21 @@ def main() -> int:
     parser.add_argument("rows", nargs="?", type=int, default=10_000_000)
     parser.add_argument("--rounds", type=int, default=3, help="measured rounds per arm; min is reported")
     parser.add_argument(
-        "--csv", metavar="PATH", help="also write results to PATH as section,name,metric,value"
+        "--csv",
+        metavar="PATH",
+        help="write the wide per-function table (perf + transpile booleans)",
     )
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error("--rounds must be >= 1")
     rows = args.rows
-    csv_rows: list[tuple[str, str, str, object]] = []
     spark = (
         SparkSession.builder.master("local[*]")
         .appName("ai-udf-transpile-bench")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", str(PARTITIONS))
         .config("spark.sql.ansi.enabled", "true")
-        .config(TRANSPILE_CONF, "false")  # phase A must stay interpreted Python
+        .config(TRANSPILE_CONF, "false")  # the regular phase must stay interpreted python
         .getOrCreate()
     )
 
@@ -152,51 +166,100 @@ def main() -> int:
     )
 
     print(f"=== THROUGHPUT ({rows:,} rows, local[*], noop sink, min of {args.rounds} rounds) ===")
-    # UserDefinedFunction is always SQL_BATCHED_UDF (the classic pickle path);
-    # the Arrow conf only applies to the udf() helper. This is also the path
-    # the transpiler hooks, so it is the honest baseline. The plan assertions
-    # below guard against silently benchmarking the wrong operator.
+
+    # -- regular phase: constructed before enable(), so the transpile hook
+    # never runs (it is not even registered) and every arm is plain python.
     py_plus = UserDefinedFunction(plus_one, LongType())
     py_back = UserDefinedFunction(backwards, StringType())
     py_zfill = UserDefinedFunction(zfill3, StringType())
     py_edit = UserDefinedFunction(edit_distance, LongType())
-    assert not any(u.transpiled for u in (py_plus, py_back, py_zfill, py_edit))
+    py_decline = UserDefinedFunction(always_decline, LongType())
+    assert not any(u.transpiled for u in (py_plus, py_back, py_zfill, py_edit, py_decline))
     assert "BatchEvalPython" in ints.select(py_plus("x"))._jdf.queryExecution().toString()
     py_plus_expect = [r[0] for r in sample_ints.select(py_plus("x")).collect()]
     py_back_expect = [r[0] for r in sample_strs.select(py_back("s")).collect()]
     py_zfill_expect = [r[0] for r in sample_zfill.select(py_zfill("s")).collect()]
     py_edit_expect = [r[0] for r in sample_pairs.select(py_edit("a", "b")).collect()]
 
-    sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-bench-"), "cache.sqlite")
-    catalog = enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
-    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    # -- static phase: human-provided rewrites on their own catalog. No inline
+    # worker needed -- register_impl verifies synchronously.
+    static_sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-bench-static-"), "cache.sqlite")
+    enable(spark, sqlite_path=static_sqlite, backend="fake", inline_worker=False)
+    spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
+    static_fills: dict[str, float] = {}
+    for name, fn, kwargs in [
+        ("plus_one", plus_one, dict(kind="catalyst", catalyst_sql=PLUS_SQL, return_type=LongType())),
+        (
+            "backwards",
+            backwards,
+            dict(kind="java_udf", impl_source=BACKWARDS_JAVA, return_type=StringType()),
+        ),
+        ("zfill3", zfill3, dict(kind="catalyst", catalyst_sql=ZFILL_SQL, return_type=StringType())),
+        (
+            "edit_distance",
+            edit_distance,
+            dict(kind="catalyst", catalyst_sql=EDIT_SQL, return_type=LongType()),
+        ),
+    ]:
+        start = time.perf_counter()
+        register_impl(spark, fn, **kwargs)
+        static_fills[name] = time.perf_counter() - start
+    st_plus = UserDefinedFunction(plus_one, LongType())
+    st_back = UserDefinedFunction(backwards, StringType())
+    st_zfill = UserDefinedFunction(zfill3, StringType())
+    st_edit = UserDefinedFunction(edit_distance, LongType())
+    static_ok = {
+        "plus_one": bool(st_plus.transpiled),
+        "backwards": bool(st_back.transpiled),
+        "zfill3": bool(st_zfill.transpiled),
+        "edit_distance": bool(st_edit.transpiled),
+    }
+    assert all(static_ok.values()), f"static register_impl did not hit: {static_ok}"
+    assert [r[0] for r in sample_ints.select(st_plus("x")).collect()] == py_plus_expect
+    assert [r[0] for r in sample_strs.select(st_back("s")).collect()] == py_back_expect
+    assert [r[0] for r in sample_zfill.select(st_zfill("s")).collect()] == py_zfill_expect
+    assert [r[0] for r in sample_pairs.select(st_edit("a", "b")).collect()] == py_edit_expect
+    for plan_df in (
+        ints.select(st_plus("x")),
+        strs.select(st_back("s")),
+        strs.select(st_zfill("s")),
+        pairs.select(st_edit("a", "b")),
+    ):
+        assert "EvalPython" not in plan_df._jdf.queryExecution().toString()
 
-    start = time.perf_counter()
-    register_impl(spark, plus_one, kind="catalyst", catalyst_sql="_udf_param_0 + 1", return_type=LongType())
-    fill_catalyst = time.perf_counter() - start
-    start = time.perf_counter()
-    register_impl(spark, backwards, kind="java_udf", impl_source=BACKWARDS_JAVA, return_type=StringType())
-    fill_java = time.perf_counter() - start
-    start = time.perf_counter()
-    register_impl(spark, zfill3, kind="catalyst", catalyst_sql=ZFILL_SQL, return_type=StringType())
-    fill_zfill = time.perf_counter() - start
-    start = time.perf_counter()
-    register_impl(
-        spark,
-        edit_distance,
-        kind="catalyst",
-        catalyst_sql="coalesce(levenshtein(_udf_param_0, _udf_param_1), -1)",
-        return_type=LongType(),
-    )
-    fill_edit = time.perf_counter() - start
-
+    # -- ai phase: a second enable() on a fresh sqlite path swaps the catalog
+    # (none was running for the static phase, so the inline worker starts
+    # here and polls only this one). The static plans above are already
+    # resolved, so nothing re-reads the closed-over static catalog.
+    ai_sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-bench-ai-"), "cache.sqlite")
+    catalog = enable(spark, sqlite_path=ai_sqlite, backend="fake", inline_worker=True)
+    conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
+    ai_fills: dict[str, float] = {}
+    decline_error: str | None = None
+    for name, fn, rtype in [
+        ("plus_one", plus_one, LongType()),
+        ("backwards", backwards, StringType()),
+        ("zfill3", zfill3, StringType()),
+        ("edit_distance", edit_distance, LongType()),
+        ("always_decline", always_decline, LongType()),
+    ]:
+        start = time.perf_counter()
+        UserDefinedFunction(fn, rtype)  # construction queues the pending row
+        status, backend, error = wait_for_catalog_result(catalog, canonical_source_from_func(fn), timeout=120)
+        ai_fills[name] = time.perf_counter() - start
+        if name == "always_decline":
+            decline_error = error
+            assert status == "failed" and backend == "fake" and (error or "").startswith("declined:"), (
+                "expected fake backend decline for always_decline, got "
+                f"status={status!r} backend={backend!r} error={error!r}"
+            )
+        else:
+            assert status == "success", f"fake backend did not fill {name}: {error!r}"
     ai_plus = UserDefinedFunction(plus_one, LongType())
     ai_back = UserDefinedFunction(backwards, StringType())
     ai_zfill = UserDefinedFunction(zfill3, StringType())
     ai_edit = UserDefinedFunction(edit_distance, LongType())
-    UserDefinedFunction(always_decline, LongType())
-    warm = (ai_plus, ai_back, ai_zfill, ai_edit)
-    assert all(u.transpiled for u in warm), "warm catalog did not produce a hit"
+    assert all(u.transpiled for u in (ai_plus, ai_back, ai_zfill, ai_edit)), "ai fills did not hit"
     assert [r[0] for r in sample_ints.select(ai_plus("x")).collect()] == py_plus_expect
     assert [r[0] for r in sample_strs.select(ai_back("s")).collect()] == py_back_expect
     assert [r[0] for r in sample_zfill.select(ai_zfill("s")).collect()] == py_zfill_expect
@@ -208,34 +271,36 @@ def main() -> int:
         pairs.select(ai_edit("a", "b")),
     ):
         assert "EvalPython" not in plan_df._jdf.queryExecution().toString()
-    decline_source = canonical_source_from_func(always_decline)
-    decline_status, decline_backend, decline_error = wait_for_catalog_result(catalog, decline_source)
-    assert (
-        decline_status == "failed"
-        and decline_backend == "fake"
-        and decline_error is not None
-        and decline_error.startswith("declined:")
-    ), (
-        "expected fake backend decline for always_decline, got "
-        f"status={decline_status!r} backend={decline_backend!r} error={decline_error!r}"
-    )
     fallback_decline = UserDefinedFunction(always_decline, LongType())
     assert not fallback_decline.transpiled, "declined UDF unexpectedly became a hit"
     cwd_df = ints.select(fallback_decline("x"))
     assert "BatchEvalPython" in cwd_df._jdf.queryExecution().toString()
+    ai_ok = {
+        "plus_one": bool(ai_plus.transpiled),
+        "backwards": bool(ai_back.transpiled),
+        "zfill3": bool(ai_zfill.transpiled),
+        "edit_distance": bool(ai_edit.transpiled),
+        "always_decline": bool(fallback_decline.transpiled),
+    }
 
-    # All UDFs exist before any timing (the transpile gate is read at
-    # construction), so rounds interleave fairly: nobody's warmup is deeper.
+    # All arms exist before any timing, so rounds interleave fairly: nobody's
+    # warmup is deeper. The plan assertions above guard against silently
+    # benchmarking the wrong operator.
     arms = [
         ("python plus_one", ints.select(py_plus("x")), None),
         ("python backwards", strs.select(py_back("s")), None),
         ("python zfill3", strs.select(py_zfill("s")), None),
         ("python edit_distance", pairs.select(py_edit("a", "b")), None),
-        ("catalyst plus_one", ints.select(ai_plus("x")), "python plus_one"),
-        ("java udf backwards", strs.select(ai_back("s")), "python backwards"),
-        ("catalyst zfill3", strs.select(ai_zfill("s")), "python zfill3"),
-        ("catalyst edit_distance", pairs.select(ai_edit("a", "b")), "python edit_distance"),
-        ("python fallback always_decline", cwd_df, None),
+        ("python always_decline", ints.select(py_decline("x")), None),
+        ("static plus_one", ints.select(st_plus("x")), "python plus_one"),
+        ("static backwards", strs.select(st_back("s")), "python backwards"),
+        ("static zfill3", strs.select(st_zfill("s")), "python zfill3"),
+        ("static edit_distance", pairs.select(st_edit("a", "b")), "python edit_distance"),
+        ("ai plus_one", ints.select(ai_plus("x")), "python plus_one"),
+        ("ai backwards", strs.select(ai_back("s")), "python backwards"),
+        ("ai zfill3", strs.select(ai_zfill("s")), "python zfill3"),
+        ("ai edit_distance", pairs.select(ai_edit("a", "b")), "python edit_distance"),
+        ("python fallback always_decline", cwd_df, "python always_decline"),
     ]
     for _, arm_df, _ in arms:  # warmup round for everyone
         noop_seconds(arm_df)
@@ -245,18 +310,51 @@ def main() -> int:
             secs[name] = min(secs.get(name, float("inf")), noop_seconds(arm_df))
     for name, _, baseline in arms:
         speedup = f"  ({secs[baseline] / secs[name]:.1f}x python)" if baseline else ""
-        print(f"{name + ':':24}{secs[name]:6.2f}s  {rows / secs[name]:>12,.0f} rows/s{speedup}")
-        csv_rows.append(("throughput", name, "rows_per_second", round(rows / secs[name])))
-        csv_rows.append(("throughput", name, "seconds", round(secs[name], 3)))
-        if baseline:
-            csv_rows.append(("throughput", name, "speedup_vs_python", round(secs[baseline] / secs[name], 1)))
+        print(f"{name + ':':30}{secs[name]:6.2f}s  {rows / secs[name]:>12,.0f} rows/s{speedup}")
+
     print()
-    print("=== EXPECTED DECLINE ===")
+    print("=== PER-FUNCTION (the --csv table) ===")
+    header = [
+        "function",
+        "kind",
+        "regular_rows_per_second",
+        "transpiled_static_rows_per_second",
+        "transpiled_ai_rows_per_second",
+        "static_speedup_vs_regular",
+        "ai_speedup_vs_regular",
+        "transpile_succeeded_static",
+        "transpile_succeeded_ai",
+    ]
+    wide: list[list] = []
+    for fn_name, kind, regular_arm, static_arm, ai_arm in [
+        ("plus_one", "catalyst", "python plus_one", "static plus_one", "ai plus_one"),
+        ("backwards", "java_udf", "python backwards", "static backwards", "ai backwards"),
+        ("zfill3", "catalyst", "python zfill3", "static zfill3", "ai zfill3"),
+        ("edit_distance", "catalyst", "python edit_distance", "static edit_distance", "ai edit_distance"),
+        ("always_decline", "declined", "python always_decline", None, "python fallback always_decline"),
+    ]:
+        wide.append(
+            [
+                fn_name,
+                kind,
+                round(rows / secs[regular_arm]),
+                round(rows / secs[static_arm]) if static_arm else "",
+                round(rows / secs[ai_arm]),
+                round(secs[regular_arm] / secs[static_arm], 1) if static_arm else "",
+                round(secs[regular_arm] / secs[ai_arm], 1),
+                static_ok.get(fn_name, ""),
+                ai_ok[fn_name],
+            ]
+        )
+    print(",".join(header))
+    for row in wide:
+        print(",".join(str(c) for c in row))
+
+    print()
     print(
-        f"always_decline: catalog status={decline_status}, backend={decline_backend}; "
-        "fresh UDF construction stays on the Python path"
+        f"always_decline: backend declined ({decline_error}); fresh construction stays on the "
+        "python path with unchanged perf -- the row above is the story"
     )
-    csv_rows.append(("fallback", "python fallback always_decline", "transpile_status", decline_status))
 
     print()
     print("=== UDF DEFINITION OVERHEAD (avg of 300 creations) ===")
@@ -274,20 +372,15 @@ def main() -> int:
     plain_ms = (time.perf_counter() - start) / creations * 1000
     spark.conf.set(TRANSPILE_CONF, "true")
     print(f"plugin warm-hit: {hit_ms:.2f} ms/def   plain python udf: {plain_ms:.2f} ms/def")
-    csv_rows.append(("definition_overhead", "plugin warm-hit", "ms_per_definition", round(hit_ms, 2)))
-    csv_rows.append(("definition_overhead", "plain python udf", "ms_per_definition", round(plain_ms, 2)))
 
     print()
-    print("=== ONE-TIME FILL COST (verify + publish, per rewrite) ===")
-    fills = [
-        ("catalyst plus_one (Hypothesis)", fill_catalyst),
-        ("catalyst zfill3 (Hypothesis)", fill_zfill),
-        ("catalyst edit_distance (Hypothesis)", fill_edit),
-        ("java_udf backwards (Hypothesis + javac)", fill_java),
-    ]
-    for name, seconds in fills:
-        print(f"register_impl {name}: {seconds:.2f}s")
-        csv_rows.append(("fill_cost", name, "seconds", round(seconds, 2)))
+    print("=== ONE-TIME FILL COST (per rewrite) ===")
+    print("static register_impl (Hypothesis + smoke test):")
+    for name in ("plus_one", "backwards", "zfill3", "edit_distance"):
+        print(f"  {name + ':':16}{static_fills[name]:6.2f}s")
+    print("ai queue -> backend -> Hypothesis -> verified success (incl. claim latency):")
+    for name in ("plus_one", "backwards", "zfill3", "edit_distance", "always_decline"):
+        print(f"  {name + ':':16}{ai_fills[name]:6.2f}s")
 
     shutdown()
     spark.stop()
@@ -295,9 +388,9 @@ def main() -> int:
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["section", "name", "metric", "value"])
-            writer.writerows(csv_rows)
-        print(f"csv: wrote {len(csv_rows)} rows to {args.csv}")
+            writer.writerow(header)
+            writer.writerows(wide)
+        print(f"csv: wrote {len(wide)} rows to {args.csv}")
     return 0
 
 
