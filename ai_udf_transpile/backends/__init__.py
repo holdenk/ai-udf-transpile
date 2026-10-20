@@ -62,6 +62,10 @@ def get_backend(name: Optional[str] = None, spark: Any = None) -> Backend:
         from ai_udf_transpile.backends.fake import FakeBackend
 
         return FakeBackend()
+    if chosen == "bytecode":
+        from ai_udf_transpile.backends.bytecode import BytecodeBackend
+
+        return BytecodeBackend()
     if chosen == "coco":
         from ai_udf_transpile.backends.coco import CocoBackend
 
@@ -82,4 +86,4 @@ def get_backend(name: Optional[str] = None, spark: Any = None) -> Backend:
         from ai_udf_transpile.backends.codex import CodexBackend
 
         return CodexBackend(spark)
-    raise BackendError(f"unknown backend {chosen!r}; expected auto, fake, coco, pi, claude, codex, or cursor")
+    raise BackendError(f"unknown backend {chosen!r}; expected auto, fake, bytecode, coco, pi, claude, codex, or cursor")
