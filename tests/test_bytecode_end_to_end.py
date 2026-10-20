@@ -39,7 +39,7 @@ def _transpile(spark, sqlite_path, func, rtype, input_types=None):
 
 def test_plus_one_end_to_end(spark, sqlite_path):
     sql = _transpile(spark, sqlite_path, plus_one, LongType())
-    assert sql == "_udf_param_0 + 1"
+    assert sql == "(_udf_param_0 + 1)"
     second = UserDefinedFunction(plus_one, LongType())
     assert second.transpiled
     df = spark.createDataFrame([(1,), (41,)], ["x"])
