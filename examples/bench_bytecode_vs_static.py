@@ -6,10 +6,8 @@ Three arms per function on one local SparkSession:
   python    interpreted python (transpilePyUDFs=false) -- the baseline
   static    Spark's BUILT-IN catalyst transpiler (pyTranspilers=catalyst,
             plugin not enabled). It converts the simple single-expression
-            bodies and declines the multi-statement one. Correctness is
-            checked per-sample: Python `%` floors and Spark `%` truncates,
-            so a bare-`%` rewrite of mod_bucket is wrong on negatives; the
-            bench records that rather than assume it.
+            bodies and declines the multi-statement one (is_none_branch).
+            Correctness is checked per-sample rather than assumed.
   bytecode  the deterministic bytecode backend (pyTranspilers=ai, plugin on,
             backend="bytecode"). No AI round-trip, no Hypothesis fill latency
             in the hot path -- the catalog is filled once up front.
@@ -17,9 +15,8 @@ Three arms per function on one local SparkSession:
 The point: where both convert (plus_one, both_positive, greet, mod_bucket)
 the perf is comparable; where only bytecode converts (is_none_branch, which
 is multi-statement) the speedup over interpreted python is the whole story
-and static has no number. Where static converts but gets the semantics
-wrong (mod_bucket on negatives) it gets no perf number either -- the
-correctness boolean is the story.
+and static has no number. A wrong-but-converted rewrite gets no perf number
+either -- the correctness boolean is the story.
 
   export SPARK_HOME=/path/to/spark-master
   python examples/bench_bytecode_vs_static.py [rows] [--rounds N] [--csv PATH]
@@ -63,19 +60,6 @@ def noop_seconds(df) -> float:
     start = time.perf_counter()
     df.write.format("noop").mode("overwrite").save()
     return time.perf_counter() - start
-
-
-def wait_for_success(catalog, source_text: str, timeout: float = 30.0) -> tuple[str, str | None]:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        with catalog._lock:
-            row = catalog._conn.execute(
-                "SELECT status, error FROM cache WHERE source_text = ?", (source_text,)
-            ).fetchone()
-        if row is not None and row[0] in {"failed", "success"}:
-            return row[0], row[1]
-        time.sleep(0.05)
-    return "timeout", None
 
 
 def main() -> int:
@@ -175,16 +159,18 @@ def main() -> int:
     catalog = enable(spark, sqlite_path=sqlite, backend="bytecode", inline_worker=False)
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
     bc_udfs: dict[str, UserDefinedFunction] = {}
-    bytecode_ok: dict[str, bool] = {}
     for name, fn, rtype, _df, _cols, _sample in functions:
         UserDefinedFunction(fn, rtype)  # construction queues the pending row
         assert poll_once(catalog, BytecodeBackend(), spark)
-        status, error = wait_for_success(catalog, canonical_source_from_func(fn))
+        with catalog._lock:
+            status, error = catalog._conn.execute(
+                "SELECT status, error FROM cache WHERE source_text = ?",
+                (canonical_source_from_func(fn),),
+            ).fetchone()
         assert status == "success", f"bytecode backend did not fill {name}: {status} {error}"
         udf = UserDefinedFunction(fn, rtype)
         assert udf.transpiled, f"bytecode fill did not hit for {name}"
         bc_udfs[name] = udf
-        bytecode_ok[name] = True
     bytecode_correct: dict[str, bool] = {}
     for name, _fn, _rtype, df, cols, sample in functions:
         got = [r[0] for r in sample.select(bc_udfs[name](*cols)).collect()]
@@ -217,7 +203,6 @@ def main() -> int:
         "function",
         "static_converted",
         "static_correct",
-        "bytecode_converted",
         "bytecode_correct",
         "python_rows_per_second",
         "static_rows_per_second",
@@ -235,7 +220,6 @@ def main() -> int:
                 name,
                 static_ok[name],
                 static_correct[name],
-                bytecode_ok[name],
                 bytecode_correct[name],
                 round(rows / secs[py_arm]),
                 round(rows / secs[st_arm]) if st_arm else "",
@@ -257,7 +241,7 @@ def main() -> int:
         f"correct {len(st_corr)}/{len(functions)} ({', '.join(st_corr) or 'none'})"
     )
     print(
-        f"bytecode: converted {sum(bytecode_ok.values())}/{len(functions)}; "
+        f"bytecode: converted {len(functions)}/{len(functions)}; "
         f"correct {len(bc_corr)}/{len(functions)} ({', '.join(bc_corr)}) -- deterministic, no AI round-trip"
     )
 
