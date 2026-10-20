@@ -110,7 +110,11 @@ examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 The runner wires up `SPARK_HOME` (default `~/spark`), the py4j zip, and a
 matching `PYSPARK_PYTHON` itself. `examples/demo_quickstart.py` is the
 60-second version (one Catalyst rewrite, one Java UDF); `examples/demo.py`
-is the full tour including the adversarial pack. `examples/bench_micro.py`
+is the full tour including the adversarial pack. `examples/demo_transpile_inspect.py`
+shows what each UDF was transpiled to (the actual SQL/Java), how many
+worker attempts it took, and a multi-agent comparison where several
+candidate rewrites for the same UDF are run through Hypothesis to show
+which ship and which get rejected. `examples/bench_micro.py`
 measures up to four arms per function —
 regular Python, transpiled static (Spark's built-in `catalyst` transpiler,
 which converts only simple operations like `plus_one`; everything else

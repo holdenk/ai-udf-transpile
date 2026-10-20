@@ -1,0 +1,242 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Inspect what the transpiler produced, how many attempts it took, and
+whether different "agents" would have produced different (wrong) SQL.
+
+Three sections:
+
+1. TRANSPILATION RESULTS -- for each UDF: the transpiled SQL/Java,
+   attempt_count, origin, backend, and Hypothesis verdict, pulled from
+   the catalog. Shows what the code actually became, not just a boolean.
+2. ATTEMPT COUNTS -- how many worker claims each transpile took (1 with
+   the fake backend; a real backend that fails Hypothesis cools down and
+   retries, bumping the count).
+3. MULTI-AGENT COMPARISON -- for adversarial UDFs, several candidate
+   rewrites (as if from different agents) are run through Hypothesis
+   directly. Some pass, some fail -- the point: different agents produce
+   different SQL, and verification is what decides which one ships.
+
+    export SPARK_HOME=/path/to/spark-master
+    export PYTHONPATH="$SPARK_HOME/python:$(echo $SPARK_HOME/python/lib/py4j-*-src.zip | awk '{print $1}')"
+    export PYSPARK_PYTHON="$(pwd)/.venv/bin/python"
+    export PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
+    python examples/demo_transpile_inspect.py
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+import os
+import sys
+import tempfile
+import textwrap
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from pyspark.sql import SparkSession  # noqa: E402
+from pyspark.sql.types import BooleanType, LongType, StringType  # noqa: E402
+from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
+
+from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
+from ai_udf_transpile.backends.fake import (  # noqa: E402
+    FIXTURES,
+    backwards_java,
+    contains_ingredient,
+    greet,
+    is_none_branch,
+    mod_bucket,
+    plus_one,
+    round_half,
+    upper_useragent,
+    weekday_of,
+    zfill3,
+)
+from ai_udf_transpile.catalog import configured_tolerance  # noqa: E402
+from ai_udf_transpile.keys import (  # noqa: E402
+    canonical_source,
+    canonical_source_from_func,
+    extract_captures,
+)
+from ai_udf_transpile.targets import KIND_CATALYST, TranspileResult  # noqa: E402
+from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
+from ai_udf_transpile.types import input_spark_types, return_spark_type  # noqa: E402
+from ai_udf_transpile.verify import hypothesis_check  # noqa: E402
+
+
+def wait_transpiled(func, rtype, timeout=120):
+    """Re-create the UDF until the cache hit transpiles it."""
+    deadline = time.time() + timeout
+    udf = UserDefinedFunction(func, rtype)
+    while time.time() < deadline and not udf.transpiled:
+        time.sleep(1.0)
+        udf = UserDefinedFunction(func, rtype)
+    return udf
+
+
+def verify_candidate(spark, func, return_type, candidate_sql):
+    """Run Hypothesis on a candidate SQL rewrite without touching the catalog."""
+    src = textwrap.dedent(inspect.getsource(func))
+    tree = ast.parse(src)
+    function_ast = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+    params = [arg.arg for arg in function_ast.args.args]
+    source = canonical_source(function_ast)
+    captures = extract_captures(func, function_ast, params) or {}
+    in_types = input_spark_types(function_ast, params) or []
+    out_type = return_spark_type(return_type)
+    result = TranspileResult(kind=KIND_CATALYST, sql=candidate_sql)
+    ok, err = hypothesis_check(
+        source_text=source,
+        captures=captures,
+        result=result,
+        input_types=in_types,
+        return_type=out_type,
+        spark=spark,
+        max_examples=conf.get_int(conf.MAX_EXAMPLES, spark, int(conf.default_max_examples())),
+        func=func,
+        samples=[],
+        tolerance=configured_tolerance(spark),
+    )
+    return ok, err
+
+
+def _faithful_sql(func):
+    """The fake backend's verified SQL for func, or None."""
+    r = FIXTURES.get(canonical_source_from_func(func))
+    return r.sql if r and r.sql else None
+
+
+def _truncate(text, width=80):
+    if text is None:
+        return "(none)"
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _func_name(source_text):
+    if not source_text:
+        return "?"
+    return source_text.split("(")[0].replace("def ", "").strip()
+
+
+def main() -> int:
+    spark = (
+        SparkSession.builder.master("local[2]")
+        .appName("ai-udf-transpile-inspect")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.sql.ansi.enabled", "true")
+        .getOrCreate()
+    )
+    sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-inspect-"), "cache.sqlite")
+    enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
+    catalog = get_catalog()
+    spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    # weekday_of takes a datetime (timestamp category); opt in.
+    conf.set_value(conf.INPUT_CATEGORIES, "numeric,string,bool,binary,timestamp", spark)
+
+    print("=== TRANSPILATION RESULTS (what each UDF became) ===")
+    udfs = [
+        (plus_one, LongType()),
+        (is_none_branch, LongType()),
+        (greet, StringType()),
+        (upper_useragent, StringType()),
+        (contains_ingredient, BooleanType()),
+        (mod_bucket, LongType()),
+        (round_half, LongType()),
+        (weekday_of, LongType()),
+        (zfill3, StringType()),
+        (backwards_java, StringType()),
+    ]
+    for func, rtype in udfs:
+        wait_transpiled(func, rtype)
+
+    rows = catalog._conn.execute(
+        "SELECT source_text, target_kind, catalyst_sql, impl_class, "
+        "attempt_count, origin, backend, hypothesis_passed, status "
+        "FROM cache ORDER BY created_at"
+    ).fetchall()
+    for source_text, kind, sql, impl_class, attempts, origin, backend, hyp, status in rows:
+        name = _func_name(source_text)
+        if kind == "java_udf":
+            target = f"Java UDF -> {impl_class}"
+        elif sql:
+            target = f"SQL -> {sql}"
+        else:
+            target = "(no payload)"
+        print(f"  {name:22}")
+        print(f"    {_truncate(target, 90)}")
+        print(f"    attempts={attempts} origin={origin} backend={backend} hyp={hyp} status={status}")
+
+    print()
+    print("=== ATTEMPT COUNTS (worker claims per transpile) ===")
+    for source_text, _kind, _sql, _cls, attempts, _o, _b, _h, status in rows:
+        print(f"  {_func_name(source_text):22} attempts={attempts} status={status}")
+    print(
+        "(fake backend: every success is attempt 1; a real backend that fails\n"
+        " Hypothesis cools down 24h, then retries -- bumping attempt_count.)"
+    )
+
+    print()
+    print("=== MULTI-AGENT COMPARISON (different agents, different SQL) ===")
+    print("Each UDF below gets 2-3 candidate rewrites, as if from different")
+    print("agents. Hypothesis decides which ship and which get rejected.")
+    print()
+
+    candidates = [
+        (
+            "mod_bucket (value % modulus; python floors, Spark truncates)",
+            mod_bucket,
+            LongType(),
+            [
+                ("Agent A (naive %)", "_udf_param_0 % _udf_param_1"),
+                ("Agent B (pmod)", "pmod(_udf_param_0, _udf_param_1)"),
+                ("Agent C (floored CASE)", _faithful_sql(mod_bucket)),
+            ],
+        ),
+        (
+            "round_half (banker's rounding; Spark round is half-up)",
+            round_half,
+            LongType(),
+            [
+                ("Agent A (round)", "round(_udf_param_0)"),
+                ("Agent B (int cast)", "cast(round(_udf_param_0) as int)"),
+                ("Agent C (bround+bigint)", _faithful_sql(round_half)),
+            ],
+        ),
+        (
+            "weekday_of (Monday=0; Spark dayofweek Sunday=1)",
+            weekday_of,
+            LongType(),
+            [
+                ("Agent A (dayofweek)", "dayofweek(_udf_param_0)"),
+                ("Agent B (offset -1)", "dayofweek(_udf_param_0) - 1"),
+                ("Agent C (pmod+5)", _faithful_sql(weekday_of)),
+            ],
+        ),
+        (
+            "contains_ingredient (None -> False, never NULL)",
+            contains_ingredient,
+            BooleanType(),
+            [
+                ("Agent A (naive instr)", "instr(lower(_udf_param_0), _udf_param_1) > 0"),
+                ("Agent B (coalesce)", _faithful_sql(contains_ingredient)),
+            ],
+        ),
+    ]
+    for label, func, rtype, rewrites in candidates:
+        print(f"  {label}")
+        for agent, sql in rewrites:
+            ok, err = verify_candidate(spark, func, rtype, sql)
+            verdict = "ACCEPTED" if ok else f"REJECTED ({_truncate(err, 70)})"
+            print(f"    {agent + ':':22} {_truncate(sql, 56):58} {verdict}")
+        print()
+
+    shutdown()
+    spark.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
