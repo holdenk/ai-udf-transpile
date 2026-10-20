@@ -233,6 +233,58 @@ def main() -> int:
             print(f"    {agent + ':':22} {_truncate(sql, 56):58} {verdict}")
         print()
 
+    print("=== BYTECODE vs AI BACKEND (deterministic vs fake) ===")
+    print("The bytecode backend walks CPython bytecode -- no AI, no network,")
+    print("no attempts. It declines anything it cannot prove (CALL, IMPORT, ...).")
+    print()
+    from ai_udf_transpile.backends.bytecode import BytecodeBackend as _BC
+    from ai_udf_transpile.keys import canonical_source_from_func as _csf
+    from ai_udf_transpile.sandbox import make_sandbox as _ms
+    from ai_udf_transpile.targets import TranspileJob as _TJ
+
+    class _NoopSandbox:
+        def __truediv__(self, o):
+            return self
+
+        def write_text(self, *a, **k):
+            pass
+
+    bc = _BC()
+    import inspect as _insp
+
+    for func, rtype in udfs:
+        src = _csf(func)
+        params = list(func.__code__.co_varnames[: func.__code__.co_argcount])
+        sig = _insp.signature(func)
+        in_types = ["string" if p.annotation is str else "bigint" for p in sig.parameters.values()]
+        rtype_simple = return_spark_type(rtype) or "bigint"
+        job = _TJ(
+            udf_key="k",
+            source_text=src,
+            param_names=params,
+            input_types=in_types,
+            input_categories=[],
+            return_type=rtype_simple,
+            captures={},
+        )
+        ai_sql = _faithful_sql(func)
+        try:
+            with _ms(job) as sandbox:
+                bc_result = bc.run(job, sandbox)
+            bc_sql = bc_result.sql
+            match = "same" if bc_sql == ai_sql else "equiv"
+            print(
+                f"  {func.__name__:22} bytecode: {_truncate(bc_sql, 50):52} "
+                f"AI: {_truncate(ai_sql, 50)}  [{match}]"
+            )
+        except Exception as exc:
+            reason = str(exc).replace("unsupported bytecode: ", "").replace("declined: ", "")
+            print(
+                f"  {func.__name__:22} bytecode: DECLINED ({_truncate(reason, 40):42}) "
+                f"AI: {_truncate(ai_sql, 50)}"
+            )
+    print()
+
     shutdown()
     spark.stop()
     return 0
