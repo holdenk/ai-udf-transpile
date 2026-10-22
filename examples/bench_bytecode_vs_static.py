@@ -146,12 +146,16 @@ def main() -> int:
         udf = UserDefinedFunction(fn, rtype)
         st_udfs[name] = udf
         static_ok[name] = bool(udf.transpiled)
-    for name, _fn, _rtype, _df, cols, sample in functions:
+    for name, _fn, _rtype, df, cols, sample in functions:
         if not static_ok[name]:
             static_correct[name] = False
             continue
         got = [r[0] for r in sample.select(st_udfs[name](*cols)).collect()]
         static_correct[name] = got == py_expect[name]
+        if static_correct[name]:
+            assert "EvalPython" not in df.select(st_udfs[name](*cols))._jdf.queryExecution().toString(), (
+                f"static {name} claims transpiled but plan still has EvalPython"
+            )
 
     # -- bytecode phase: plugin on, backend="bytecode", inline_worker=False so
     # the fill is an explicit poll_once (deterministic, no race).
