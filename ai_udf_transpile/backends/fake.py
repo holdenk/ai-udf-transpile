@@ -297,6 +297,104 @@ def to_iso_date(ts: datetime) -> str:
     return ts.strftime("%Y-%m-%d")
 
 
+# --- Sample UDFs from the wild ---
+# Sources referenced in comments; each has a faithful Catalyst rewrite.
+
+
+# From apache/spark python/pyspark/sql/tests/test_udf.py test_udf_with_decorator:
+# add_one, to_upper, to_lower, trunc, as_double.  The None guards in the
+# originals map to SQL's implicit NULL propagation.
+
+
+def spark_add_one(x: int) -> int:
+    # Source: test_udf.py:719 add_one -- None guard then +1.
+    if x is not None:
+        return x + 1
+
+
+def spark_to_upper(x: str) -> str:
+    # Source: test_udf.py:729 to_upper -- None guard then .upper().
+    if x is not None:
+        return x.upper()
+
+
+def spark_to_lower(x: str) -> str:
+    # Source: test_udf.py:734 to_lower -- None guard then .lower().
+    if x is not None:
+        return x.lower()
+
+
+def spark_trunc(x: float) -> int:
+    # Source: test_udf.py:741 trunc -- int(x) truncates toward zero.
+    return int(x)
+
+
+def spark_as_double(x: int) -> float:
+    # Source: test_udf.py:747 as_double -- float(x) cast.
+    return float(x)
+
+
+# From TPC-DS modified queries (sql/core/src/test/resources/tpcds-modifiedQueries):
+# Patterns extracted from the WHERE clauses of real benchmark queries.
+
+
+def tpcds_zip5_mismatch(a: str, b: str) -> bool:
+    # Source: q19 substr(ca_zip, 1, 5) <> substr(s_zip, 1, 5).
+    if a is None or b is None:
+        return None
+    return a[:5] != b[:5]
+
+
+def tpcds_safe_ratio(num: float, denom: float) -> float:
+    # Source: q34 case when hd_vehicle_count > 0 then hd_dep_count /
+    # hd_vehicle_count else null end.
+    if num is None or denom is None or denom <= 0:
+        return None
+    return num / denom
+
+
+def tpcds_sales_deviation(actual: float, avg: float) -> float:
+    # Source: q53/q89 case when avg > 0 then abs(sum_sales - avg) / avg
+    # else null end.
+    if actual is None or avg is None or avg <= 0:
+        return None
+    return abs(actual - avg) / avg
+
+
+def tpcds_in_quarter(moy: int, start_moy: int, span: int) -> bool:
+    # Source: q10 d_moy between 4 and 4+3.
+    if moy is None or start_moy is None or span is None:
+        return None
+    return start_moy <= moy <= start_moy + span
+
+
+# Common real-world UDF patterns.
+
+
+def common_discount_price(price: float, pct: float) -> float:
+    # price * (1 - pct/100) -- the "apply discount" UDF.
+    return price * (1 - pct / 100.0)
+
+
+def common_pct_change(old: float, new: float) -> float:
+    # (new - old) / old * 100 -- None on zero old (division guard).
+    if old is None or new is None or old == 0:
+        return None
+    return (new - old) / old * 100.0
+
+
+def common_c2f(c: float) -> float:
+    # Celsius to Fahrenheit.
+    return c * 9.0 / 5.0 + 32.0
+
+
+def common_url_decode(s: str) -> str:
+    # Minimal URL decode: %20 -> space.
+    if s is None:
+        return None
+    return s.replace("%20", " ")
+
+
 # Java-UDF twins for the bench: same body, different def name, so the
 # canonical source maps to a DIFFERENT catalog key -- one key, one rewrite.
 # The bench measures a catalyst arm and a java arm for the same computation.
@@ -571,6 +669,36 @@ FIXTURES: dict[str, TranspileResult] = {
     canonical_source_from_func(math_log10): _result("log10(_udf_param_0)"),
     # datetime method calls -> SQL date functions.
     canonical_source_from_func(to_iso_date): _result("date_format(_udf_param_0, 'yyyy-MM-dd')"),
+    # --- Sample UDFs from the wild ---
+    # From apache/spark test_udf.py: None-guarded ops map to implicit NULL SQL.
+    canonical_source_from_func(spark_add_one): _result(
+        "CASE WHEN _udf_param_0 IS NOT NULL THEN _udf_param_0 + 1 END"
+    ),
+    canonical_source_from_func(spark_to_upper): _result("upper(_udf_param_0)"),
+    canonical_source_from_func(spark_to_lower): _result("lower(_udf_param_0)"),
+    canonical_source_from_func(spark_trunc): _result("cast(_udf_param_0 as bigint)"),
+    canonical_source_from_func(spark_as_double): _result("cast(_udf_param_0 as double)"),
+    # From TPC-DS modified queries.
+    canonical_source_from_func(tpcds_zip5_mismatch): _result(
+        "substr(_udf_param_0, 1, 5) <> substr(_udf_param_1, 1, 5)"
+    ),
+    canonical_source_from_func(tpcds_safe_ratio): _result(
+        "CASE WHEN _udf_param_1 > 0 THEN _udf_param_0 / _udf_param_1 END"
+    ),
+    canonical_source_from_func(tpcds_sales_deviation): _result(
+        "CASE WHEN _udf_param_1 > 0 THEN abs(_udf_param_0 - _udf_param_1) / _udf_param_1 END"
+    ),
+    canonical_source_from_func(tpcds_in_quarter): _result(
+        "CASE WHEN _udf_param_0 IS NULL OR _udf_param_1 IS NULL OR _udf_param_2 IS NULL THEN NULL "
+        "ELSE _udf_param_0 BETWEEN _udf_param_1 AND _udf_param_1 + _udf_param_2 END"
+    ),
+    # Common real-world patterns.
+    canonical_source_from_func(common_discount_price): _result("_udf_param_0 * (1 - _udf_param_1 / 100.0)"),
+    canonical_source_from_func(common_pct_change): _result(
+        "CASE WHEN _udf_param_0 <> 0 THEN (_udf_param_1 - _udf_param_0) / _udf_param_0 * 100.0 END"
+    ),
+    canonical_source_from_func(common_c2f): _result("_udf_param_0 * 9.0 / 5.0 + 32.0"),
+    canonical_source_from_func(common_url_decode): _result("replace(_udf_param_0, '%20', ' ')"),
 }
 
 
