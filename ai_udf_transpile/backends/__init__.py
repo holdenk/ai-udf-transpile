@@ -86,4 +86,11 @@ def get_backend(name: Optional[str] = None, spark: Any = None) -> Backend:
         from ai_udf_transpile.backends.codex import CodexBackend
 
         return CodexBackend(spark)
-    raise BackendError(f"unknown backend {chosen!r}; expected auto, fake, bytecode, coco, pi, claude, codex, or cursor")
+    if chosen == "ensemble":
+        from ai_udf_transpile.backends.ensemble import EnsembleBackend
+
+        return EnsembleBackend(spark=spark)
+    raise BackendError(
+        f"unknown backend {chosen!r}; expected "
+        "auto, fake, bytecode, coco, pi, claude, codex, cursor, or ensemble"
+    )
