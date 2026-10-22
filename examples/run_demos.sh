@@ -114,6 +114,7 @@ run_demo() {
 run_demo "quickstart" examples/demo_quickstart.py
 run_demo "full demo" examples/demo.py
 run_demo "inspect" examples/demo_transpile_inspect.py
+run_demo "multi-model" examples/demo_multi_model.py
 [ "$LIVE" -eq 1 ] && run_demo "live backends" examples/demo_live_backends.py
 if [ "$BENCH" -eq 1 ]; then
   if [ "$RUST_ACCEL" -eq 1 ] && [ "$RUST_PRESET" = "comet" ]; then

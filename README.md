@@ -96,6 +96,55 @@ Standalone worker when `inlineWorker` is false:
 python -m ai_udf_transpile.worker --sqlite-path /tmp/ai_udf_transpile.sqlite --backend fake
 ```
 
+## Multi-model ensemble
+
+`backend=ensemble` runs every configured AI backend on the same UDF and
+collects all non-declining candidates, so you can compare agreement across
+models and pick the fastest rewrite instead of whichever happened to
+finish first. Configure which sub-backends to try with
+`spark.sql.experimental.aiUdfTranspile.ensembleBackends` (default:
+`claude,codex,cursor`):
+
+```python
+spark.conf.set("spark.sql.experimental.aiUdfTranspile.ensembleBackends", "claude,codex")
+enable(spark, backend="ensemble")
+```
+
+The ensemble returns the first successful candidate so the normal worker
+pipeline (Hypothesis verify, mark success) proceeds unchanged; all
+candidates stay on `EnsembleBackend.candidates` for inspection.
+
+**Choose best by benchmark.** `ai_udf_transpile.benchmark.choose_best`
+runs each candidate SQL on a sample DataFrame and returns the fastest
+(rows/sec, min of N rounds, noop sink):
+
+```python
+from ai_udf_transpile.benchmark import choose_best
+
+best = choose_best(spark, candidates, input_df, cols=["x"], rounds=3)
+# best.backend, best.model, best.sql, best.rows_per_second
+```
+
+**Per-model success rates.** `ai_udf_transpile.model_stats.collect_stats`
+queries the catalog for per-(backend, model) success/failed/pending counts
+so you can see which models to prioritize:
+
+```python
+from ai_udf_transpile.model_stats import collect_stats, format_stats_table
+
+stats = collect_stats(catalog)
+print(format_stats_table(stats))
+# backend      model                     succ  fail other total   rate
+# --------------------------------------------------------------------
+# claude       claude-sonnet                3     1     0     4 75.0%
+# codex        codex-1                      2     2     0     4 50.0%
+```
+
+`examples/demo_multi_model.py` runs a set of UDFs through every available
+backend, shows agreement/divergence, the success-rate table, and picks the
+fastest rewrite by benchmark. `--live` hits real AI CLIs on PATH; without
+it the fake backend is used (CI-safe).
+
 ## Demos & benchmarks
 
 ```bash
@@ -114,7 +163,10 @@ is the full tour including the adversarial pack. `examples/demo_transpile_inspec
 shows what each UDF was transpiled to (the actual SQL/Java), how many
 worker attempts it took, and a multi-agent comparison where several
 candidate rewrites for the same UDF are run through Hypothesis to show
-which ship and which get rejected. `examples/bench_micro.py`
+which ship and which get rejected. `examples/demo_multi_model.py` runs
+UDFs through every available AI backend, shows agreement/divergence across
+models, the per-model success-rate table, and picks the fastest rewrite by
+benchmark (`--live` for real AI CLIs). `examples/bench_micro.py`
 measures up to four arms per function —
 regular Python, transpiled static (Spark's built-in `catalyst` transpiler,
 which converts only simple operations like `plus_one`; everything else
