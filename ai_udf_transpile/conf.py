@@ -36,6 +36,7 @@ MODEL_CURSOR = PREFIX + "model.cursor"
 MODEL_CLAUDE = PREFIX + "model.claude"
 MODEL_CODEX = PREFIX + "model.codex"
 AUTO_BACKEND_PRIORITY = PREFIX + "autoBackendPriority"
+ENSEMBLE_BACKENDS = PREFIX + "ensembleBackends"
 INPUT_CATEGORIES = PREFIX + "inputCategories"
 SAMPLING = PREFIX + "sampling"
 MAX_SAMPLES = PREFIX + "maxSamples"
@@ -57,6 +58,7 @@ DEFAULTS: dict[str, str] = {
     BINARY_CLAUDE: "claude",
     # first available binary on PATH wins when backend=auto
     AUTO_BACKEND_PRIORITY: "coco,pi,claude,codex,cursor",
+    ENSEMBLE_BACKENDS: "claude,codex,cursor",
     MAX_EXAMPLES: "20",
     TOLERANCE: "0",
     MAX_RETRIES: "3",
