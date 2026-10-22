@@ -71,7 +71,6 @@ PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
 PARTITIONS = os.cpu_count() or 16
 RUST_COMET_CONFS = {
     "spark.plugins": "org.apache.spark.CometPlugin",
-    "spark.shuffle.manager": "org.apache.spark.sql.comet.execution.shuffle.CometShuffleManager",
     "spark.comet.enabled": "true",
     "spark.comet.explain.fallback.enabled": "true",
     "spark.memory.offHeap.enabled": "true",
