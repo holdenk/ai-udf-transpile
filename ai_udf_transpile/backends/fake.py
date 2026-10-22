@@ -182,6 +182,121 @@ def always_decline(x: int) -> int:
     return len(os.getcwd())
 
 
+# --- AI-only examples: string ops, numpy, math, regex, datetime ---
+# Every function below uses method calls (.title, .strip, .replace, ...),
+# imports (re, math, numpy), or module-level functions that neither the
+# static transpiler (no rules for them) nor the bytecode backend
+# (LOAD_ATTR / IMPORT_NAME / CALL are unsupported) can handle. Only the
+# AI backend maps them to Catalyst SQL.
+
+
+# String method calls -> SQL string functions.
+
+
+def title_case(s: str) -> str:
+    return s.title()
+
+
+def trim_whitespace(s: str) -> str:
+    return s.strip()
+
+
+def snake_case(s: str) -> str:
+    return s.replace(" ", "_")
+
+
+def pad_left5(s: str) -> str:
+    # rjust never truncates; lpad does -- guard with a length check.
+    return s.rjust(5, "0")
+
+
+def lower_useragent(ua: str) -> str:
+    return ua.lower()
+
+
+# Regex (re module) -> SQL regex functions.
+
+
+def clean_phone(s: str) -> str:
+    import re
+
+    return re.sub(r"[^0-9]", "", s)
+
+
+def extract_domain(url: str) -> str:
+    import re
+
+    m = re.search(r"://([^/]+)", url)
+    return m.group(1) if m else ""
+
+
+def is_email(s: str) -> bool:
+    import re
+
+    return bool(re.match(r"^[^@]+@[^@]+\.[^@]+$", s))
+
+
+def count_vowels(s: str) -> int:
+    import re
+
+    return len(re.findall(r"[aeiouAEIOU]", s))
+
+
+# numpy -> SQL math functions.
+
+
+def np_sqrt(x: float) -> float:
+    import numpy as np
+
+    return float(np.sqrt(x))
+
+
+def np_log(x: float) -> float:
+    import numpy as np
+
+    return float(np.log(x))
+
+
+def np_clip(x: float, lo: float, hi: float) -> float:
+    import numpy as np
+
+    return float(np.clip(x, lo, hi))
+
+
+def np_exp(x: float) -> float:
+    import numpy as np
+
+    return float(np.exp(x))
+
+
+# math module -> SQL math functions.
+
+
+def math_floor(x: float) -> int:
+    import math
+
+    return math.floor(x)
+
+
+def math_ceil(x: float) -> int:
+    import math
+
+    return math.ceil(x)
+
+
+def math_log10(x: float) -> float:
+    import math
+
+    return math.log10(x)
+
+
+# datetime method calls -> SQL date functions.
+
+
+def to_iso_date(ts: datetime) -> str:
+    return ts.strftime("%Y-%m-%d")
+
+
 # Java-UDF twins for the bench: same body, different def name, so the
 # canonical source maps to a DIFFERENT catalog key -- one key, one rewrite.
 # The bench measures a catalyst arm and a java arm for the same computation.
@@ -428,6 +543,34 @@ FIXTURES: dict[str, TranspileResult] = {
     canonical_source_from_func(edit_distance): _result(
         "coalesce(levenshtein(_udf_param_0, _udf_param_1), -1)"
     ),
+    # --- AI-only examples: string ops, numpy, math, regex, datetime ---
+    # String method calls -> SQL string functions.
+    canonical_source_from_func(title_case): _result("initcap(_udf_param_0)"),
+    canonical_source_from_func(trim_whitespace): _result("trim(BOTH ' \t\n\r\f\v' FROM _udf_param_0)"),
+    canonical_source_from_func(snake_case): _result("replace(_udf_param_0, ' ', '_')"),
+    canonical_source_from_func(lower_useragent): _result("lower(_udf_param_0)"),
+    # rjust never truncates; lpad does -- guard with a length check.
+    canonical_source_from_func(pad_left5): _result(
+        "CASE WHEN length(_udf_param_0) >= 5 THEN _udf_param_0 ELSE lpad(_udf_param_0, 5, '0') END"
+    ),
+    # Regex (re module) -> SQL regex functions.
+    canonical_source_from_func(clean_phone): _result("regexp_replace(_udf_param_0, '[^0-9]', '')"),
+    canonical_source_from_func(extract_domain): _result("regexp_extract(_udf_param_0, '://([^/]+)', 1)"),
+    canonical_source_from_func(is_email): _result("_udf_param_0 rlike '^[^@]+@[^@]+\\\\.[^@]+$'"),
+    canonical_source_from_func(count_vowels): _result(
+        "length(regexp_replace(_udf_param_0, '[^aeiouAEIOU]', ''))"
+    ),
+    # numpy -> SQL math functions.
+    canonical_source_from_func(np_sqrt): _result("sqrt(_udf_param_0)"),
+    canonical_source_from_func(np_log): _result("ln(_udf_param_0)"),
+    canonical_source_from_func(np_clip): _result("least(greatest(_udf_param_0, _udf_param_1), _udf_param_2)"),
+    canonical_source_from_func(np_exp): _result("exp(_udf_param_0)"),
+    # math module -> SQL math functions.
+    canonical_source_from_func(math_floor): _result("floor(_udf_param_0)"),
+    canonical_source_from_func(math_ceil): _result("ceil(_udf_param_0)"),
+    canonical_source_from_func(math_log10): _result("log10(_udf_param_0)"),
+    # datetime method calls -> SQL date functions.
+    canonical_source_from_func(to_iso_date): _result("date_format(_udf_param_0, 'yyyy-MM-dd')"),
 }
 
 
