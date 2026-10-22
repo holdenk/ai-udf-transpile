@@ -8,6 +8,7 @@
 #   examples/run_demos.sh --bench --transpilation-timing-csv out_transpilation_timing.csv
 #   examples/run_demos.sh --bench --rust-accel [--rust-accel-conf key=value]
 #   examples/run_demos.sh --bench-bytecode        # bytecode backend vs built-in static transpiler
+#   examples/run_demos.sh --bench-tpcds           # TPC-DS-inspired UDF patterns vs vanilla SQL
 #   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 #
 # Env: SPARK_HOME (default ~/spark), PYTHON (default repo .venv).
@@ -48,6 +49,7 @@ export SPARK_LOCAL_IP=127.0.0.1 SPARK_LOCAL_HOSTNAME=localhost
 LIVE=0
 BENCH=0
 BENCH_BYTECODE=0
+BENCH_TPCDS=0
 CSV=""
 TRANSPILE_TIMING_CSV=""
 RUST_ACCEL=0
@@ -58,6 +60,7 @@ while [ $# -gt 0 ]; do
     --live) LIVE=1 ;;
     --bench) BENCH=1 ;;
     --bench-bytecode) BENCH_BYTECODE=1 ;;
+    --bench-tpcds) BENCH_TPCDS=1 ;;
     # Passed through to bench_micro.py; implies --bench (only the bench reads it).
     --csv)
       [ $# -ge 2 ] || { echo "error: --csv needs a path" >&2; exit 2; }
@@ -138,6 +141,16 @@ if [ "$BENCH_BYTECODE" -eq 1 ]; then
   BC_ARGS=(examples/bench_bytecode_vs_static.py)
   [ -n "$CSV" ] && BC_ARGS+=(--csv "$CSV")
   run_demo "bytecode vs static bench" "${BC_ARGS[@]}"
+fi
+
+if [ "$BENCH_TPCDS" -eq 1 ]; then
+  TPCDS_ARGS=(examples/bench_tpcds_udfs.py)
+  if [ -n "$CSV" ]; then
+    # Avoid clobbering the micro bench's CSV.
+    TPCDS_CSV="${CSV%.csv}_tpcds.csv"
+    TPCDS_ARGS+=(--csv "$TPCDS_CSV")
+  fi
+  run_demo "tpcds udf bench" "${TPCDS_ARGS[@]}"
 fi
 
 echo "===== SUMMARY ====="

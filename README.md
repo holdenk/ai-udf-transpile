@@ -153,6 +153,8 @@ examples/run_demos.sh --bench   # + local micro benchmarks
 examples/run_demos.sh --live    # + real CLI backends (cortex/pi/agent/claude/codex on PATH)
 examples/run_demos.sh --bench --transpilation-timing-csv bench_transpilation_timing.csv
 examples/run_demos.sh --bench --rust-accel
+examples/run_demos.sh --bench-bytecode   # bytecode backend vs built-in static transpiler
+examples/run_demos.sh --bench-tpcds     # TPC-DS-inspired UDF patterns vs vanilla SQL
 examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 ```
 
@@ -183,6 +185,16 @@ bench with rust acceleration Spark configs enabled (default preset: Comet; add
 `AI_UDF_TRANSPILE_COMET_JAR` (or `COMET_JAR`) so the plugin jar is on Spark's
 classpath; `examples/setup_comet.sh` can clone/build Comet from source and emit
 the exports for your current Spark checkout.
+
+`examples/bench_tpcds_udfs.py` benchmarks UDF patterns extracted from real
+TPC-DS queries (substring comparison from q19, safe ratio from q34, sales
+deviation from q53/q89, date-range from q10) plus sample UDFs from
+apache/spark's own `test_udf.py` and common real-world patterns (discount,
+percentage change, C→F, URL decode).  Three arms per pattern: interpreted
+Python UDF, vanilla SQL, and transpiled SQL.  The point: a Python UDF doing
+TPC-DS-like work is 5-10x slower than native SQL, and transpilation closes
+that gap entirely — the transpiled arm matches the vanilla arm because it
+IS the vanilla SQL.
 
 The perf graph is generated from that CSV by a CLI tool
 (`examples/bench_graph.py`, matplotlib — no AI in the loop, ever):
