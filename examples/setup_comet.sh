@@ -161,6 +161,9 @@ done
 require_cmd git
 require_cmd make
 require_cmd java
+if [ "$DRY_RUN" -eq 0 ] && [ "$SKIP_BUILD" -eq 0 ]; then
+  require_cmd cargo
+fi
 
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [ -z "$PYTHON_BIN" ]; then
