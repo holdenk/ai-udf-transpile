@@ -475,6 +475,47 @@ def common_is_adult(age: int) -> bool:
     return age >= 18
 
 
+# From UDFBench (VLDB 2025 Best Benchmark Paper, Foufoulas et al.)
+# https://github.com/athenarc/UDFBench -- 24 scalar UDFs from a real-world
+# OpenAIRE publication analytics schema.  We include the transpilable ones.
+
+
+def udfb_extractyear(s: str) -> int:
+    # U12: extract year from YYYY-MM-DD date string.
+    return int(s[: s.find("-")])
+
+
+def udfb_extractmonth(s: str) -> int:
+    # U10: extract month from YYYY-MM-DD date string.
+    return int(s[s.find("-") + 1 : s.rfind("-")])
+
+
+def udfb_extractday(s: str) -> int:
+    # U7: extract day from YYYY-MM-DD date string.
+    return int(s[s.rfind("-") + 1 :])
+
+
+def udfb_extractfunder(s: str) -> str:
+    # U8: extract funder from funder::class::projectid.
+    return s.split("::")[0]
+
+
+def udfb_extractclass(s: str) -> str:
+    # U5: extract class from funder::class::projectid.
+    return s.split("::")[1]
+
+
+def udfb_extractid(s: str) -> str:
+    # U9: extract project ID from funder::class::projectid.
+    return s.split("::")[2]
+
+
+def udfb_converttoeuro(amount: float, currency: str) -> float:
+    # U4: convert currency to euro via lookup table.
+    rates = {"EUR": 1.0, "USD": 1.09, "GBP": 0.85, "CHF": 0.98}
+    return amount / rates[currency]
+
+
 # Java-UDF twins for the bench: same body, different def name, so the
 # canonical source maps to a DIFFERENT catalog key -- one key, one rewrite.
 # The bench measures a catalyst arm and a java arm for the same computation.
@@ -803,6 +844,20 @@ FIXTURES: dict[str, TranspileResult] = {
     canonical_source_from_func(common_full_name): _result("_udf_param_0 || ' ' || _udf_param_1"),
     canonical_source_from_func(common_round2): _result("round(_udf_param_0, 2)"),
     canonical_source_from_func(common_is_adult): _result("_udf_param_0 >= 18"),
+    # From UDFBench (VLDB 2025, Foufoulas et al.) -- https://github.com/athenarc/UDFBench
+    canonical_source_from_func(udfb_extractyear): _result("cast(substr(_udf_param_0, 1, 4) as int)"),
+    canonical_source_from_func(udfb_extractmonth): _result("cast(substr(_udf_param_0, 6, 2) as int)"),
+    canonical_source_from_func(udfb_extractday): _result("cast(substr(_udf_param_0, 9, 2) as int)"),
+    canonical_source_from_func(udfb_extractfunder): _result("split_part(_udf_param_0, '::', 1)"),
+    canonical_source_from_func(udfb_extractclass): _result("split_part(_udf_param_0, '::', 2)"),
+    canonical_source_from_func(udfb_extractid): _result("split_part(_udf_param_0, '::', 3)"),
+    canonical_source_from_func(udfb_converttoeuro): _result(
+        "CASE _udf_param_1 "
+        "WHEN 'EUR' THEN _udf_param_0 / 1.0 "
+        "WHEN 'USD' THEN _udf_param_0 / 1.09 "
+        "WHEN 'GBP' THEN _udf_param_0 / 0.85 "
+        "WHEN 'CHF' THEN _udf_param_0 / 0.98 END"
+    ),
 }
 
 

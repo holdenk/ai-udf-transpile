@@ -60,6 +60,13 @@ from ai_udf_transpile.backends.fake import (  # noqa: E402
     tpcds_sales_deviation,
     tpcds_trunc30,
     tpcds_zip5_mismatch,
+    udfb_converttoeuro,
+    udfb_extractclass,
+    udfb_extractday,
+    udfb_extractfunder,
+    udfb_extractid,
+    udfb_extractmonth,
+    udfb_extractyear,
 )
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 
@@ -176,6 +183,60 @@ PATTERNS = [
     ),
     ("common_round2", common_round2, DoubleType(), [("x", "double")], "round(_udf_param_0, 2)"),
     ("common_is_adult", common_is_adult, BooleanType(), [("age", "bigint")], "_udf_param_0 >= 18"),
+    # From UDFBench (VLDB 2025, Foufoulas et al.)
+    (
+        "udfb_extractyear",
+        udfb_extractyear,
+        LongType(),
+        [("s", "string")],
+        "cast(substr(_udf_param_0, 1, 4) as int)",
+    ),
+    (
+        "udfb_extractmonth",
+        udfb_extractmonth,
+        LongType(),
+        [("s", "string")],
+        "cast(substr(_udf_param_0, 6, 2) as int)",
+    ),
+    (
+        "udfb_extractday",
+        udfb_extractday,
+        LongType(),
+        [("s", "string")],
+        "cast(substr(_udf_param_0, 9, 2) as int)",
+    ),
+    (
+        "udfb_extractfunder",
+        udfb_extractfunder,
+        StringType(),
+        [("s", "string")],
+        "split_part(_udf_param_0, '::', 1)",
+    ),
+    (
+        "udfb_extractclass",
+        udfb_extractclass,
+        StringType(),
+        [("s", "string")],
+        "split_part(_udf_param_0, '::', 2)",
+    ),
+    (
+        "udfb_extractid",
+        udfb_extractid,
+        StringType(),
+        [("s", "string")],
+        "split_part(_udf_param_0, '::', 3)",
+    ),
+    (
+        "udfb_converttoeuro",
+        udfb_converttoeuro,
+        DoubleType(),
+        [("amount", "double"), ("currency", "string")],
+        "CASE _udf_param_1 "
+        "WHEN 'EUR' THEN _udf_param_0 / 1.0 "
+        "WHEN 'USD' THEN _udf_param_0 / 1.09 "
+        "WHEN 'GBP' THEN _udf_param_0 / 0.85 "
+        "WHEN 'CHF' THEN _udf_param_0 / 0.98 END",
+    ),
 ]
 
 
