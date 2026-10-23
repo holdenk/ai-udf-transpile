@@ -89,6 +89,23 @@ EXAMPLES = [
     ("common_full_name", ["string", "string"], "string", "_udf_param_0 || ' ' || _udf_param_1"),
     ("common_round2", ["double"], "double", "round(_udf_param_0, 2)"),
     ("common_is_adult", ["bigint"], "boolean", "_udf_param_0 >= 18"),
+    # From UDFBench (VLDB 2025, Foufoulas et al.)
+    ("udfb_extractyear", ["string"], "bigint", "cast(substr(_udf_param_0, 1, 4) as int)"),
+    ("udfb_extractmonth", ["string"], "bigint", "cast(substr(_udf_param_0, 6, 2) as int)"),
+    ("udfb_extractday", ["string"], "bigint", "cast(substr(_udf_param_0, 9, 2) as int)"),
+    ("udfb_extractfunder", ["string"], "string", "split_part(_udf_param_0, '::', 1)"),
+    ("udfb_extractclass", ["string"], "string", "split_part(_udf_param_0, '::', 2)"),
+    ("udfb_extractid", ["string"], "string", "split_part(_udf_param_0, '::', 3)"),
+    (
+        "udfb_converttoeuro",
+        ["double", "string"],
+        "double",
+        "CASE _udf_param_1 "
+        "WHEN 'EUR' THEN _udf_param_0 / 1.0 "
+        "WHEN 'USD' THEN _udf_param_0 / 1.09 "
+        "WHEN 'GBP' THEN _udf_param_0 / 0.85 "
+        "WHEN 'CHF' THEN _udf_param_0 / 0.98 END",
+    ),
 ]
 
 
