@@ -37,16 +37,28 @@ from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.backends.fake import (  # noqa: E402
     common_c2f,
     common_discount_price,
+    common_full_name,
+    common_is_adult,
     common_pct_change,
+    common_round2,
     common_url_decode,
     spark_add_one,
+    spark_add_two,
     spark_as_double,
+    spark_eq,
+    spark_len_plus,
+    spark_str,
+    spark_strlen,
+    spark_substr,
     spark_to_lower,
     spark_to_upper,
     spark_trunc,
+    tpcds_below_threshold,
+    tpcds_day_sales,
     tpcds_in_quarter,
     tpcds_safe_ratio,
     tpcds_sales_deviation,
+    tpcds_trunc30,
     tpcds_zip5_mismatch,
 )
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
@@ -119,6 +131,51 @@ PATTERNS = [
         [("s", "string")],
         "replace(_udf_param_0, '%20', ' ')",
     ),
+    # More from apache/spark test_udf.py
+    ("spark_add_two", spark_add_two, DoubleType(), [("x", "bigint")], "cast(_udf_param_0 + 2 as double)"),
+    (
+        "spark_substr",
+        spark_substr,
+        StringType(),
+        [("s", "string"), ("start", "bigint"), ("end", "bigint")],
+        "substr(_udf_param_0, _udf_param_1 + 1, _udf_param_2 - _udf_param_1)",
+    ),
+    ("spark_strlen", spark_strlen, LongType(), [("s", "string")], "length(_udf_param_0)"),
+    (
+        "spark_len_plus",
+        spark_len_plus,
+        LongType(),
+        [("s", "string"), ("n", "bigint")],
+        "length(_udf_param_0) + _udf_param_1",
+    ),
+    ("spark_str", spark_str, StringType(), [("x", "bigint")], "cast(_udf_param_0 as string)"),
+    ("spark_eq", spark_eq, BooleanType(), [("a", "bigint"), ("b", "bigint")], "_udf_param_0 = _udf_param_1"),
+    # More from TPC-DS modified queries
+    (
+        "tpcds_day_sales",
+        tpcds_day_sales,
+        DoubleType(),
+        [("day_name", "string"), ("sales_price", "double")],
+        "CASE WHEN _udf_param_0 = 'Sunday' THEN _udf_param_1 END",
+    ),
+    (
+        "tpcds_below_threshold",
+        tpcds_below_threshold,
+        BooleanType(),
+        [("revenue", "double"), ("avg", "double")],
+        "CASE WHEN _udf_param_1 > 0 THEN _udf_param_0 <= 0.1 * _udf_param_1 END",
+    ),
+    ("tpcds_trunc30", tpcds_trunc30, StringType(), [("s", "string")], "substr(_udf_param_0, 1, 30)"),
+    # More common real-world patterns
+    (
+        "common_full_name",
+        common_full_name,
+        StringType(),
+        [("first", "string"), ("last", "string")],
+        "_udf_param_0 || ' ' || _udf_param_1",
+    ),
+    ("common_round2", common_round2, DoubleType(), [("x", "double")], "round(_udf_param_0, 2)"),
+    ("common_is_adult", common_is_adult, BooleanType(), [("age", "bigint")], "_udf_param_0 >= 18"),
 ]
 
 
