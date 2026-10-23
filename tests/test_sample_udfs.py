@@ -53,6 +53,42 @@ EXAMPLES = [
     ),
     ("common_c2f", ["double"], "double", "_udf_param_0 * 9.0 / 5.0 + 32.0"),
     ("common_url_decode", ["string"], "string", "replace(_udf_param_0, '%20', ' ')"),
+    # More from apache/spark test_udf.py
+    (
+        "spark_add_two",
+        ["bigint"],
+        "double",
+        "CASE WHEN _udf_param_0 IS NOT NULL THEN cast(_udf_param_0 + 2 as double) END",
+    ),
+    (
+        "spark_substr",
+        ["string", "bigint", "bigint"],
+        "string",
+        "CASE WHEN _udf_param_0 IS NOT NULL THEN "
+        "substr(_udf_param_0, _udf_param_1 + 1, _udf_param_2 - _udf_param_1) END",
+    ),
+    ("spark_strlen", ["string"], "bigint", "length(_udf_param_0)"),
+    ("spark_len_plus", ["string", "bigint"], "bigint", "length(_udf_param_0) + _udf_param_1"),
+    ("spark_str", ["bigint"], "string", "cast(_udf_param_0 as string)"),
+    ("spark_eq", ["bigint", "bigint"], "boolean", "_udf_param_0 = _udf_param_1"),
+    # More from TPC-DS modified queries
+    (
+        "tpcds_day_sales",
+        ["string", "double"],
+        "double",
+        "CASE WHEN _udf_param_0 = 'Sunday' THEN _udf_param_1 END",
+    ),
+    (
+        "tpcds_below_threshold",
+        ["double", "double"],
+        "boolean",
+        "CASE WHEN _udf_param_1 > 0 THEN _udf_param_0 <= 0.1 * _udf_param_1 END",
+    ),
+    ("tpcds_trunc30", ["string"], "string", "substr(_udf_param_0, 1, 30)"),
+    # More common real-world patterns
+    ("common_full_name", ["string", "string"], "string", "_udf_param_0 || ' ' || _udf_param_1"),
+    ("common_round2", ["double"], "double", "round(_udf_param_0, 2)"),
+    ("common_is_adult", ["bigint"], "boolean", "_udf_param_0 >= 18"),
 ]
 
 

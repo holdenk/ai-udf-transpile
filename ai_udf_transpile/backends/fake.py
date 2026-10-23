@@ -395,6 +395,86 @@ def common_url_decode(s: str) -> str:
     return s.replace("%20", " ")
 
 
+# More from apache/spark test_udf.py (lambdas promoted to defs).
+
+
+def spark_add_two(x: int) -> float:
+    # Source: test_udf.py:726 add_two -- None guard, +2, cast to double.
+    if x is not None:
+        return float(x + 2)
+
+
+def spark_substr(x: str, start: int, end: int) -> str:
+    # Source: test_udf.py:739 substr -- Python slice [start:end] is 0-indexed
+    # with exclusive end; SQL substr(s, pos, len) is 1-indexed.
+    if x is not None:
+        return x[start:end]
+
+
+def spark_strlen(s: str) -> int:
+    # Source: test_udf.py:113 strlen -- len(string) -> SQL length().
+    return len(s)
+
+
+def spark_len_plus(s: str, n: int) -> int:
+    # Source: test_udf.py:97 twoArgs -- len(x) + y.
+    return len(s) + n
+
+
+def spark_str(x: int) -> str:
+    # Source: test_udf.py:282 -- str(a) -> cast as string.
+    return str(x)
+
+
+def spark_eq(a: int, b: int) -> bool:
+    # Source: test_udf.py:257 -- a == b -> SQL =.
+    return a == b
+
+
+# More from TPC-DS modified queries.
+
+
+def tpcds_day_sales(day_name: str, sales_price: float) -> float:
+    # Source: q43/q59 case when d_day_name = 'Sunday' then ss_sales_price
+    # else null end.
+    if day_name == "Sunday":
+        return sales_price
+
+
+def tpcds_below_threshold(revenue: float, avg: float) -> bool:
+    # Source: q65 sc.revenue <= 0.1 * sb.ave (with avg > 0 guard).
+    if avg is None or avg <= 0:
+        return None
+    return revenue <= 0.1 * avg
+
+
+def tpcds_trunc30(s: str) -> str:
+    # Source: q79 substr(s_city, 1, 30) -- truncate to 30 chars.
+    if s is None:
+        return None
+    return s[:30]
+
+
+# More common real-world patterns.
+
+
+def common_full_name(first: str, last: str) -> str:
+    # first || ' ' || last -- NULL propagates in SQL || just like Python guard.
+    if first is None or last is None:
+        return None
+    return first + " " + last
+
+
+def common_round2(x: float) -> float:
+    # Round to 2 decimal places.
+    return round(x, 2)
+
+
+def common_is_adult(age: int) -> bool:
+    # age >= 18
+    return age >= 18
+
+
 # Java-UDF twins for the bench: same body, different def name, so the
 # canonical source maps to a DIFFERENT catalog key -- one key, one rewrite.
 # The bench measures a catalyst arm and a java arm for the same computation.
@@ -699,6 +779,30 @@ FIXTURES: dict[str, TranspileResult] = {
     ),
     canonical_source_from_func(common_c2f): _result("_udf_param_0 * 9.0 / 5.0 + 32.0"),
     canonical_source_from_func(common_url_decode): _result("replace(_udf_param_0, '%20', ' ')"),
+    # More from apache/spark test_udf.py.
+    canonical_source_from_func(spark_add_two): _result(
+        "CASE WHEN _udf_param_0 IS NOT NULL THEN cast(_udf_param_0 + 2 as double) END"
+    ),
+    canonical_source_from_func(spark_substr): _result(
+        "CASE WHEN _udf_param_0 IS NOT NULL THEN "
+        "substr(_udf_param_0, _udf_param_1 + 1, _udf_param_2 - _udf_param_1) END"
+    ),
+    canonical_source_from_func(spark_strlen): _result("length(_udf_param_0)"),
+    canonical_source_from_func(spark_len_plus): _result("length(_udf_param_0) + _udf_param_1"),
+    canonical_source_from_func(spark_str): _result("cast(_udf_param_0 as string)"),
+    canonical_source_from_func(spark_eq): _result("_udf_param_0 = _udf_param_1"),
+    # More from TPC-DS modified queries.
+    canonical_source_from_func(tpcds_day_sales): _result(
+        "CASE WHEN _udf_param_0 = 'Sunday' THEN _udf_param_1 END"
+    ),
+    canonical_source_from_func(tpcds_below_threshold): _result(
+        "CASE WHEN _udf_param_1 > 0 THEN _udf_param_0 <= 0.1 * _udf_param_1 END"
+    ),
+    canonical_source_from_func(tpcds_trunc30): _result("substr(_udf_param_0, 1, 30)"),
+    # More common real-world patterns.
+    canonical_source_from_func(common_full_name): _result("_udf_param_0 || ' ' || _udf_param_1"),
+    canonical_source_from_func(common_round2): _result("round(_udf_param_0, 2)"),
+    canonical_source_from_func(common_is_adult): _result("_udf_param_0 >= 18"),
 }
 
 
