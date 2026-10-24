@@ -331,6 +331,7 @@ class DeltaCatalog:
         *,
         origin: Optional[str] = None,
         model: Optional[str] = None,
+        result: Optional[TranspileResult] = None,
     ) -> None:
         now = iso_now()
         self.spark.sql(
@@ -343,6 +344,10 @@ class DeltaCatalog:
                 hypothesis_passed = FALSE,
                 origin = COALESCE({_sql_str(origin)}, origin),
                 model = COALESCE({_sql_str(model)}, model),
+                target_kind = COALESCE({_sql_str(result.kind if result else None)}, target_kind),
+                catalyst_sql = COALESCE({_sql_str(result.sql if result else None)}, catalyst_sql),
+                impl_source = COALESCE({_sql_str(result.java_source if result else None)}, impl_source),
+                impl_class = COALESCE({_sql_str(result.class_name if result else None)}, impl_class),
                 updated_at = {_sql_str(now)}
             WHERE udf_key = {_sql_str(udf_key)}
             """

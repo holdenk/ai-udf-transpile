@@ -332,7 +332,10 @@ class SqliteCatalog:
         *,
         origin: Optional[str] = None,
         model: Optional[str] = None,
+        result: Optional[TranspileResult] = None,
     ) -> None:
+        """Failed rows keep the rejected candidate: a decline produced nothing,
+        but a rewrite that failed Hypothesis is half the story."""
         now = iso_now()
         with self._lock:
             self._conn.execute(
@@ -346,10 +349,25 @@ class SqliteCatalog:
                     publish_ready = 0,
                     origin = COALESCE(?, origin),
                     model = COALESCE(?, model),
+                    target_kind = COALESCE(?, target_kind),
+                    catalyst_sql = COALESCE(?, catalyst_sql),
+                    impl_source = COALESCE(?, impl_source),
+                    impl_class = COALESCE(?, impl_class),
                     updated_at = ?
                 WHERE udf_key = ?
                 """,
-                (error, now, origin, model, now, udf_key),
+                (
+                    error,
+                    now,
+                    origin,
+                    model,
+                    result.kind if result else None,
+                    result.sql if result else None,
+                    result.java_source if result else None,
+                    result.class_name if result else None,
+                    now,
+                    udf_key,
+                ),
             )
 
     def upsert_success(

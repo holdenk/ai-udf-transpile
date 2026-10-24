@@ -8,6 +8,7 @@ from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.backends.fake import FakeBackend, always_decline, plus_one
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog
 from ai_udf_transpile.keys import canonical_source_from_func
+from ai_udf_transpile.targets import TranspileResult
 from ai_udf_transpile.worker import inline_thread_alive, poll_once, process_row
 
 
@@ -31,6 +32,57 @@ def test_process_row_fake_success(tmp_path):
     assert row.status == "success"
     assert row.catalyst_sql == "_udf_param_0 + 1"
     assert row.origin == "fake"
+
+
+def test_process_row_hypothesis_failure_keeps_candidate(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    src = canonical_source_from_func(plus_one)
+    cat.insert_pending(
+        udf_key="k",
+        source_text=src,
+        param_names=["x"],
+        input_types=["bigint"],
+        input_categories=["numeric"],
+        return_type="bigint",
+        spark_version="test",
+        closure_fingerprint="",
+        captures={},
+    )
+    assert cat.claim("k", "fake")
+    process_row(cat, cat.get("k"), FakeBackend(), spark=None, verify_fn=lambda **k: (False, "mismatch"))
+    row = cat.get("k")
+    assert row.status == "failed"
+    assert "mismatch" in row.error
+    assert row.catalyst_sql == "_udf_param_0 + 1"  # the rejected rewrite survives
+
+
+def test_rejected_human_candidate_retries_on_backend(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    src = canonical_source_from_func(plus_one)
+    cat.insert_pending(
+        udf_key="k",
+        source_text=src,
+        param_names=["x"],
+        input_types=["bigint"],
+        input_categories=["numeric"],
+        return_type="bigint",
+        spark_version="test",
+        closure_fingerprint="",
+        captures={},
+    )
+    assert cat.claim("k", "human")
+    cat.mark_failed(
+        "k", "mismatch", origin="human", result=TranspileResult(kind="catalyst", sql="_udf_param_0 + 2")
+    )
+    # cooldown expires -> the row re-pends; the backend gets a fresh shot,
+    # not another round of verifying the payload that already failed
+    cat._conn.execute("UPDATE cache SET status = 'pending' WHERE udf_key = 'k'")
+    assert cat.claim("k", "fake")
+    process_row(cat, cat.get("k"), FakeBackend(), spark=None, verify_fn=lambda **k: (True, None))
+    row = cat.get("k")
+    assert row.status == "success"
+    assert row.origin == "fake"
+    assert row.catalyst_sql == "_udf_param_0 + 1"
 
 
 def test_process_row_records_the_tolerance_it_checked(tmp_path):

@@ -182,6 +182,7 @@ class Catalog(Protocol):
         *,
         origin: Optional[str] = None,
         model: Optional[str] = None,
+        result: Optional[TranspileResult] = None,
     ) -> None: ...
 
     def upsert_success(

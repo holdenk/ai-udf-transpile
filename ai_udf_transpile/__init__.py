@@ -274,10 +274,10 @@ def register_impl(
                     closure_fingerprint=fingerprint,
                     captures=captures,
                 )
-                catalog.mark_failed(key, err or "register_impl verify failed", origin=ORIGIN)
+                catalog.mark_failed(key, err or "register_impl verify failed", origin=ORIGIN, result=result)
             elif not existing.reconstructable():
                 # No live verified payload to protect; record the failure.
-                catalog.mark_failed(key, err or "register_impl verify failed", origin=ORIGIN)
+                catalog.mark_failed(key, err or "register_impl verify failed", origin=ORIGIN, result=result)
             # else: a verified success already serves this key; leave it alone.
             raise ValueError(f"register_impl Hypothesis failed: {err}")
         hyp = True

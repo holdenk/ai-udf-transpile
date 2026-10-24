@@ -69,8 +69,16 @@ def process_row(
     verify_fn = verify_fn or hypothesis_check
     origin = getattr(backend, "name", "unknown")
     model: Optional[str] = None
+    result: Optional[TranspileResult] = None
     try:
-        if (row.origin == "human") and (row.catalyst_sql or row.impl_class or row.impl_source):
+        if (
+            (row.origin == "human")
+            and (row.catalyst_sql or row.impl_class or row.impl_source)
+            and row.hypothesis_passed is not False
+        ):
+            # hypothesis_passed=False means this payload was already rejected;
+            # re-verifying it would burn every retry on the same failure, so
+            # let the row go to the backend instead.
             result = TranspileResult(
                 kind=row.target_kind or "catalyst",
                 sql=row.catalyst_sql,
@@ -87,7 +95,9 @@ def process_row(
         model = result.model
         rejected = rejected_rewrite(result)
         if rejected:
-            catalog.mark_failed(key, rejected, origin=origin, model=model or _reported_model(backend))
+            catalog.mark_failed(
+                key, rejected, origin=origin, model=model or _reported_model(backend), result=result
+            )
             logger.info("transpile rejected key=%s: %s", key[:12], rejected)
             return
         if result.kind == "java_udf" and result.java_source and not result.binary and spark is not None:
@@ -170,7 +180,7 @@ def process_row(
                 result.kind,
             )
             return
-        catalog.mark_failed(key, err or "hypothesis failed", origin=origin, model=model)
+        catalog.mark_failed(key, err or "hypothesis failed", origin=origin, model=model, result=result)
         logger.info("transpile failed key=%s origin=%s: %s", key[:12], origin, err)
     except BackendDecline as exc:
         try:
@@ -188,6 +198,7 @@ def process_row(
                 f"{type(exc).__name__}: {exc}",
                 origin=origin,
                 model=model or _reported_model(backend),
+                result=result,  # e.g. the java UDF that failed to compile
             )
         except Exception:
             logger.exception("failed to mark error row %s", key)

@@ -175,7 +175,13 @@ def _ai_section(row: CacheRow) -> list[str]:
             return [f"- **AI ({label})**: java UDF:{tail}", "", "```java", row.impl_source or "", "```"]
         return [f"- **AI ({label})**: `{row.catalyst_sql}`{tail}"]
     if row.status == "failed":
-        return [f"- **AI ({label})**: failed: {row.error}{tail}"]
+        lines = [f"- **AI ({label})**: failed: {row.error}{tail}"]
+        # The rejected candidate is half the story: show it when the row kept it.
+        if row.target_kind == KIND_JAVA_UDF and row.impl_source:
+            return lines + ["", "```java", row.impl_source, "```"]
+        if row.catalyst_sql:
+            lines.append(f"- **rejected rewrite**: `{row.catalyst_sql}`")
+        return lines
     return [f"- **AI ({label})**: status={row.status}{tail}"]
 
 

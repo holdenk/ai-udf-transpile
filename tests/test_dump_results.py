@@ -26,6 +26,7 @@ HAS_ITEM_SRC = canonical_source_text("def has_item(x: int, xs: list) -> bool:\n 
 ALWAYS_DECLINE_SRC = canonical_source_text(
     "def always_decline(x: int) -> int:\n    import os\n    return len(os.getcwd())\n"
 )
+REJECTED_SRC = canonical_source_text("def rejected_cand(x: int) -> int:\n    return x + 1\n")
 
 BACKWARDS_JAVA = "package ai_udf;\n\npublic class Backwards {}\n"
 
@@ -85,6 +86,31 @@ def _fill_catalog(path: Path) -> None:
     _insert(cat, "k_always_decline", ALWAYS_DECLINE_SRC, ["x"], ["bigint"], ["numeric"], "bigint")
     cat.claim("k_always_decline", "coco")
     cat.mark_failed("k_always_decline", "model declined: no faithful rewrite", origin="coco")
+
+    # a hypothesis failure keeps the rewrite that was rejected
+    _insert(cat, "k_rejected", REJECTED_SRC, ["x"], ["bigint"], ["numeric"], "bigint")
+    cat.claim("k_rejected", "coco")
+    cat.mark_failed(
+        "k_rejected",
+        "mismatch on (3,): python=4 sql=5",
+        origin="coco",
+        model="auto",
+        result=TranspileResult(kind=KIND_CATALYST, sql="_udf_param_0 + 2"),
+    )
+    # ... and a rejected java UDF keeps its source, in a fence
+    _insert(cat, "k_rejected_java", REJECTED_SRC, ["x"], ["bigint"], ["numeric"], "bigint")
+    cat.claim("k_rejected_java", "coco")
+    cat.mark_failed(
+        "k_rejected_java",
+        "JavaCompileError: not a class",
+        origin="coco",
+        model="auto",
+        result=TranspileResult(
+            kind=KIND_JAVA_UDF,
+            java_source="package ai_udf;\npublic class Nope {}\n",
+            class_name="ai_udf.Nope",
+        ),
+    )
     cat.close()
 
 
@@ -123,6 +149,15 @@ def test_dump_writes_all_three_paths(spark, tmp_path):
     assert "failed: model declined: no faithful rewrite" in text
     assert "AI (coco / coco-model)" in text
     assert "AI (coco)" in text  # k_has_item has no model
+    # hypothesis failure: the error AND the rejected rewrite
+    assert "failed: mismatch on (3,): python=4 sql=5" in text
+    assert "- **rejected rewrite**: `_udf_param_0 + 2`" in text
+    # a rejected java UDF keeps its source, in a fence
+    assert "failed: JavaCompileError: not a class" in text
+    assert "public class Nope {}" in text
+    # a decline produced nothing: no rejected-rewrite bullet
+    always = text.split("## always_decline")[1].split("## ")[0]
+    assert "rejected rewrite" not in always
 
 
 def test_dump_rejects_rows_from_another_backend(tmp_path):

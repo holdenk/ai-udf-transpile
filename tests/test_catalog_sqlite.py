@@ -192,6 +192,36 @@ def test_failure_records_origin_and_model(tmp_path):
     assert row.failed_at is not None
 
 
+def test_mark_failed_keeps_rejected_candidate(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    assert cat.claim("k1", "coco")
+    cat.mark_failed(
+        "k1",
+        "mismatch on (3,): python=True sql=False",
+        origin="coco",
+        result=TranspileResult(kind="catalyst", sql="_udf_param_0 + 1"),
+    )
+    row = cat.get("k1")
+    assert row is not None
+    assert row.status == "failed"
+    assert row.target_kind == "catalyst"
+    assert row.catalyst_sql == "_udf_param_0 + 1"
+    # a later failure with no candidate must not clobber it
+    cat.mark_failed("k1", "again")
+    row = cat.get("k1")
+    assert row is not None
+    assert row.error == "again"
+    assert row.catalyst_sql == "_udf_param_0 + 1"
+    # a retry failing with a different candidate replaces it
+    cat.mark_failed("k1", "third", result=TranspileResult(kind="catalyst", sql="_udf_param_0 + 2"))
+    row = cat.get("k1")
+    assert row is not None
+    assert row.catalyst_sql == "_udf_param_0 + 2"
+    # safety: a failed row with a candidate is never a lookup HIT
+    assert cat.lookup("k1")[0] is not HIT
+
+
 def test_mark_failed_without_origin_keeps_existing(tmp_path):
     cat = SqliteCatalog(tmp_path / "c.sqlite")
     _pending(cat)
