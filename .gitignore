@@ -232,4 +232,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+NOTES.md
 .comet-env
