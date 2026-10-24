@@ -314,3 +314,9 @@ The Spark tests need a package-only build of `apache/spark@master`
 CI uses `backend=fake` with a handful of annotated fixtures (`plus_one`,
 `is_none_branch`, `both_positive`, `greet`). Live CoCo/Cursor/Claude CLIs
 are not invoked in default GHA.
+
+## References
+
+Prior art, upstream Spark tickets, and the papers this experiment leans
+on — Numba, PyPy, Cython, Truffle, and the AST-vs-bytecode question — are
+in [REFERENCES.md](REFERENCES.md).
