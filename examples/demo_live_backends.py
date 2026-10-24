@@ -63,6 +63,7 @@ def run_backend(spark, backend: str) -> dict:
     sqlite = os.path.join(tempfile.mkdtemp(prefix=f"ai-udf-live-{backend}-"), "cache.sqlite")
     enable(spark, sqlite_path=sqlite, backend=backend, inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
     catalog = get_catalog()
     out = {"backend": backend}
 

@@ -23,7 +23,7 @@ pytest.importorskip("pyspark")
 from pyspark.sql.types import StringType
 from pyspark.sql.udf import UserDefinedFunction
 
-from ai_udf_transpile import enable
+from ai_udf_transpile import conf, enable
 from ai_udf_transpile.backends.fake import upper_useragent
 from ai_udf_transpile.keys import canonical_source_from_func
 from ai_udf_transpile.targets import KIND_CATALYST, TranspileResult
@@ -88,6 +88,8 @@ def test_end_to_end_transpile_removes_python_worker(spark, sqlite_path):
     # but actually executing the Python UDF on null data errors out.
     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    # upper(None) raises, and the worker verifies before sampled rows land.
+    conf.set_value(conf.PARTY_ON_STRINGS, "true")
     df = spark.createDataFrame([(s[0],) for s in REAL_UA_SAMPLES], ["ua"])
     expected = [s[0].upper() for s in REAL_UA_SAMPLES]
 

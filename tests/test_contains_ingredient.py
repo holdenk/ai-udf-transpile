@@ -66,8 +66,8 @@ def test_correct_rewrite_passes(spark):
 
 
 def test_naive_instr_rejected_null_trap(spark):
-    # (None, 'salt'): python False, naive SQL NULL. Caught even without
-    # samples: built-in string examples put None in the recipe position.
+    # (None, None): python False, naive SQL NULL. String contents are not
+    # invented, so this is the null pair, not a sampled recipe.
     ok, err = _check(NAIVE_SQL, spark)
     assert not ok
     assert "mismatch" in (err or "")

@@ -81,7 +81,7 @@ BSP_SAMPLES = [
 ARRAY_CATEGORIES = "numeric,string,bool,binary,array"
 
 
-def _check(sql, spark, samples=None):
+def _check(sql, spark, samples=None, party_on_strings=False):
     return hypothesis_check(
         source_text=canonical_source_from_func(BSPIn),
         captures={},
@@ -91,6 +91,7 @@ def _check(sql, spark, samples=None):
         spark=spark,
         max_examples=20,
         samples=samples,
+        party_on_strings=party_on_strings,
     )
 
 
@@ -136,7 +137,7 @@ def test_swapped_lists_rejected(spark):
 def test_or_instead_of_and_rejected(spark):
     # Deterministic without samples: the cross-combined built-ins pair a
     # scalar with a singleton list containing it on one side only.
-    ok, err = _check(OR_SQL, spark)
+    ok, err = _check(OR_SQL, spark, party_on_strings=True)
     assert not ok
     assert "mismatch" in (err or "")
 

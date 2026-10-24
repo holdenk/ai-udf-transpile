@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import pytest
 
-from ai_udf_transpile.benchmark import benchmark_all, choose_best
+pytest.importorskip("pyspark")  # ai_udf_transpile.benchmark imports it at module level
+
+from ai_udf_transpile.benchmark import benchmark_all, choose_best  # noqa: E402
 
 pytestmark = pytest.mark.spark
 

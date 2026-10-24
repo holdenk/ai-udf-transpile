@@ -8,7 +8,7 @@ a wrong rewrite look fine -- a JSON-parser UDF raises on random text and so
 does the SQL side, a vacuous match -- so the worker feeds these real rows to
 Hypothesis as explicit examples. Sampling is a no-op when the catalog is not
 reachable from the executor (e.g. cluster mode with a driver-local sqlite
-path); verification then falls back to the built-in interesting strings.
+path). Built-in string examples run only when partyOnStrings is set.
 """
 
 from __future__ import annotations

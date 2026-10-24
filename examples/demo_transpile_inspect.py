@@ -97,6 +97,7 @@ def verify_candidate(spark, func, return_type, candidate_sql):
         func=func,
         samples=[],
         tolerance=configured_tolerance(spark),
+        party_on_strings=conf.get_bool(conf.PARTY_ON_STRINGS, spark, False),
     )
     return ok, err
 
@@ -135,6 +136,8 @@ def main() -> int:
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     # weekday_of takes a datetime (timestamp category); opt in.
     conf.set_value(conf.INPUT_CATEGORIES, "numeric,string,bool,binary,timestamp", spark)
+    # These fixtures' strings are text (greet, upper, zfill), not dates-in-strings.
+    conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
 
     print("=== TRANSPILATION RESULTS (what each UDF became) ===")
     udfs = [

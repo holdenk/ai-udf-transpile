@@ -665,6 +665,24 @@ public class EditDistanceJava implements UDF2<Object, Object, Object> {
 }
 """
 
+# Faithful s[start:end] over bigint indexes: python clamps (negatives count
+# from the end, out-of-range collapses to the string bounds, NULL is the
+# default bound) while a bare substr raises SUBSTRING_OVERFLOW under ANSI.
+# The <= guard also covers the empty-slice case; substr never sees a
+# negative or oversized argument.
+_SUBSTR_START = (
+    "(CASE WHEN _udf_param_1 IS NULL THEN 0 "
+    "WHEN _udf_param_1 >= 0 THEN least(_udf_param_1, length(_udf_param_0)) "
+    "ELSE CASE WHEN _udf_param_1 <= -length(_udf_param_0) THEN 0 "
+    "ELSE length(_udf_param_0) + _udf_param_1 END END)"
+)
+_SUBSTR_END = (
+    "(CASE WHEN _udf_param_2 IS NULL THEN length(_udf_param_0) "
+    "WHEN _udf_param_2 >= 0 THEN least(_udf_param_2, length(_udf_param_0)) "
+    "ELSE CASE WHEN _udf_param_2 <= -length(_udf_param_0) THEN 0 "
+    "ELSE length(_udf_param_0) + _udf_param_2 END END)"
+)
+
 FIXTURES: dict[str, TranspileResult] = {
     canonical_source_from_func(plus_one): _result("_udf_param_0 + 1"),
     canonical_source_from_func(is_none_branch): _result(
@@ -825,13 +843,17 @@ FIXTURES: dict[str, TranspileResult] = {
         "CASE WHEN _udf_param_0 IS NOT NULL THEN cast(_udf_param_0 + 2 as double) END"
     ),
     canonical_source_from_func(spark_substr): _result(
-        "CASE WHEN _udf_param_0 IS NOT NULL THEN "
-        "substr(_udf_param_0, _udf_param_1 + 1, _udf_param_2 - _udf_param_1) END"
+        "CASE WHEN _udf_param_0 IS NULL THEN NULL "
+        f"WHEN {_SUBSTR_END} <= {_SUBSTR_START} THEN '' "
+        f"ELSE substr(_udf_param_0, {_SUBSTR_START} + 1, {_SUBSTR_END} - {_SUBSTR_START}) END"
     ),
     canonical_source_from_func(spark_strlen): _result("length(_udf_param_0)"),
     canonical_source_from_func(spark_len_plus): _result("length(_udf_param_0) + _udf_param_1"),
-    canonical_source_from_func(spark_str): _result("cast(_udf_param_0 as string)"),
-    canonical_source_from_func(spark_eq): _result("_udf_param_0 = _udf_param_1"),
+    canonical_source_from_func(spark_str): _result(
+        # str(None) is the string 'None', not NULL.
+        "CASE WHEN _udf_param_0 IS NULL THEN 'None' ELSE cast(_udf_param_0 as string) END"
+    ),
+    canonical_source_from_func(spark_eq): _result("(_udf_param_0 <=> _udf_param_1)"),
     # More from TPC-DS modified queries.
     canonical_source_from_func(tpcds_day_sales): _result(
         "CASE WHEN _udf_param_0 = 'Sunday' THEN _udf_param_1 END"
@@ -845,9 +867,10 @@ FIXTURES: dict[str, TranspileResult] = {
     canonical_source_from_func(common_round2): _result("round(_udf_param_0, 2)"),
     canonical_source_from_func(common_is_adult): _result("_udf_param_0 >= 18"),
     # From UDFBench (VLDB 2025, Foufoulas et al.) -- https://github.com/athenarc/UDFBench
-    canonical_source_from_func(udfb_extractyear): _result("cast(substr(_udf_param_0, 1, 4) as int)"),
-    canonical_source_from_func(udfb_extractmonth): _result("cast(substr(_udf_param_0, 6, 2) as int)"),
-    canonical_source_from_func(udfb_extractday): _result("cast(substr(_udf_param_0, 9, 2) as int)"),
+    # udfb_extract{year,month,day} deliberately have NO fixture: int() over a
+    # free-form string prefix (underscores, whitespace, sign, the find(-1)
+    # last-char drop) has no faithful SQL, and Hypothesis proves it -- the
+    # date-shaped domain is an assumption, not something the gate can certify.
     canonical_source_from_func(udfb_extractfunder): _result("split_part(_udf_param_0, '::', 1)"),
     canonical_source_from_func(udfb_extractclass): _result("split_part(_udf_param_0, '::', 2)"),
     canonical_source_from_func(udfb_extractid): _result("split_part(_udf_param_0, '::', 3)"),
@@ -865,6 +888,11 @@ class FakeBackend:
     name = "fake"
 
     def run(self, job: TranspileJob, sandbox: Path) -> TranspileResult:
+        # The fake recognizes fixtures by source. With aiRepresentation=bytecode
+        # there is no source to see -- a real model could still succeed, the
+        # fake honestly cannot.
+        if not (sandbox / "udf.py").exists():
+            raise BackendDecline("fake backend needs source; aiRepresentation=bytecode hides it")
         try:
             key = canonical_source_text(job.source_text)
         except Exception:

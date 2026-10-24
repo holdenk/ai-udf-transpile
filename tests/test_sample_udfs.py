@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai_udf_transpile.backends.fake import FakeBackend, canonical_source_from_func
+from ai_udf_transpile.backends.fake import _SUBSTR_END, _SUBSTR_START, FakeBackend, canonical_source_from_func
 from ai_udf_transpile.sandbox import make_sandbox
 from ai_udf_transpile.targets import KIND_CATALYST, TranspileJob
 
@@ -60,17 +60,26 @@ EXAMPLES = [
         "double",
         "CASE WHEN _udf_param_0 IS NOT NULL THEN cast(_udf_param_0 + 2 as double) END",
     ),
+    # Faithful s[start:end]: python clamps (NULL bound = default, negatives
+    # from the end, out-of-range to the length); bare substr overflows.
     (
         "spark_substr",
         ["string", "bigint", "bigint"],
         "string",
-        "CASE WHEN _udf_param_0 IS NOT NULL THEN "
-        "substr(_udf_param_0, _udf_param_1 + 1, _udf_param_2 - _udf_param_1) END",
+        "CASE WHEN _udf_param_0 IS NULL THEN NULL "
+        f"WHEN {_SUBSTR_END} <= {_SUBSTR_START} THEN '' "
+        f"ELSE substr(_udf_param_0, {_SUBSTR_START} + 1, {_SUBSTR_END} - {_SUBSTR_START}) END",
     ),
     ("spark_strlen", ["string"], "bigint", "length(_udf_param_0)"),
     ("spark_len_plus", ["string", "bigint"], "bigint", "length(_udf_param_0) + _udf_param_1"),
-    ("spark_str", ["bigint"], "string", "cast(_udf_param_0 as string)"),
-    ("spark_eq", ["bigint", "bigint"], "boolean", "_udf_param_0 = _udf_param_1"),
+    # str(None) is the string 'None', not NULL.
+    (
+        "spark_str",
+        ["bigint"],
+        "string",
+        "CASE WHEN _udf_param_0 IS NULL THEN 'None' ELSE cast(_udf_param_0 as string) END",
+    ),
+    ("spark_eq", ["bigint", "bigint"], "boolean", "(_udf_param_0 <=> _udf_param_1)"),
     # More from TPC-DS modified queries
     (
         "tpcds_day_sales",
@@ -90,9 +99,8 @@ EXAMPLES = [
     ("common_round2", ["double"], "double", "round(_udf_param_0, 2)"),
     ("common_is_adult", ["bigint"], "boolean", "_udf_param_0 >= 18"),
     # From UDFBench (VLDB 2025, Foufoulas et al.)
-    ("udfb_extractyear", ["string"], "bigint", "cast(substr(_udf_param_0, 1, 4) as int)"),
-    ("udfb_extractmonth", ["string"], "bigint", "cast(substr(_udf_param_0, 6, 2) as int)"),
-    ("udfb_extractday", ["string"], "bigint", "cast(substr(_udf_param_0, 9, 2) as int)"),
+    # udfb_extract{year,month,day} have no fixture on purpose: int() over a
+    # free-form prefix has no faithful SQL, so the fake backend declines them.
     ("udfb_extractfunder", ["string"], "string", "split_part(_udf_param_0, '::', 1)"),
     ("udfb_extractclass", ["string"], "string", "split_part(_udf_param_0, '::', 2)"),
     ("udfb_extractid", ["string"], "string", "split_part(_udf_param_0, '::', 3)"),

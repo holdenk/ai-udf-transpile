@@ -12,6 +12,11 @@ Supports the common single-expression and if/else shapes:
   - boolean and/or via short-circuit jumps
   - if/else via POP_JUMP_IF_FALSE / POP_JUMP_IF_NOT_NONE
 
+Python truthiness is not SQL truthiness (None and 0 and '' are falsy;
+CASE WHEN NULL falls through but NOT NULL is NULL), so every jump
+condition and `not` operand goes through _truth(), built from the kind
+the symbolic stack tracks for each fragment.
+
 % is floored in Python but truncated in Spark, so the emitted SQL carries
 the sign-correction CASE (same form the fake backend uses).  == and != use
 <=> (null-safe) because Python returns False for None == x but Spark's ==
@@ -21,6 +26,7 @@ returns NULL.  // and ** are declined: Spark has no infix // or **.
 from __future__ import annotations
 
 import dis
+import sys
 import types
 from typing import Any, Optional
 
@@ -49,11 +55,46 @@ _COMPARE_OPS: dict[str, str] = {
     ">=": ">=",
 }
 
+# input_types -> truthiness class. "other" params are declined if a jump
+# or `not` consumes them (no faithful generic SQL).
+_TRUTH_KINDS: dict[str, str] = {
+    "boolean": "bool",
+    "bool": "bool",
+    "string": "string",
+    "bigint": "numeric",
+    "long": "numeric",
+    "int": "numeric",
+    "integer": "numeric",
+    "smallint": "numeric",
+    "tinyint": "numeric",
+    "byte": "numeric",
+    "short": "numeric",
+    "double": "numeric",
+    "float": "numeric",
+}
+
+
+def _truth_kind(spark_type: str) -> str:
+    """Kind for a (possibly parameterized) type spelling: decimal(10,2),
+    varchar(20) and friends must not fall to "other" and decline."""
+    name = spark_type.strip().lower()
+    if name.startswith("decimal"):
+        return "numeric"
+    if name.startswith(("varchar", "char")):
+        return "string"
+    return _TRUTH_KINDS.get(name, "other")
+
 
 class BytecodeBackend:
     name = "bytecode"
 
     def run(self, job: TranspileJob, sandbox: Any) -> TranspileResult:
+        # The walker is written against 3.13 instruction shapes (fused
+        # TO_BOOL/RETURN_CONST/LOAD_FAST_LOAD_FAST, jump-argval rules).
+        # Other versions decline rather than emit SQL from mismatched
+        # bytecode -- fail closed.
+        if sys.version_info[:2] != (3, 13):
+            raise BackendDecline(f"CPython 3.13 bytecode required (running {sys.version.split()[0]})")
         try:
             key = canonical_source_text(job.source_text)
         except Exception:
@@ -64,28 +105,30 @@ class BytecodeBackend:
             raise BackendDecline("no function code object found")
         if func_code.co_exceptiontable:
             raise BackendDecline("try/except not supported")
-        string_params = {i for i, t in enumerate(job.input_types) if t == "string"}
-        evaluator = _Evaluator(job.param_names, func_code, string_params)
+        param_kinds = [_truth_kind(t) for t in job.input_types]
+        evaluator = _Evaluator(job.param_names, func_code, param_kinds)
         result = evaluator.evaluate(list(dis.get_instructions(func_code)))
         if result is None:
             raise BackendDecline("function has no return path")
-        (sandbox / "OUT.sql").write_text(result + "\n", encoding="utf-8")
-        return TranspileResult(kind=KIND_CATALYST, sql=result)
+        (sandbox / "OUT.sql").write_text(result[0] + "\n", encoding="utf-8")
+        return TranspileResult(kind=KIND_CATALYST, sql=result[0])
+
+
+# One entry per value on the symbolic stack: (sql, truthiness kind).
+# kind is one of "bool", "numeric", "string", "null", "mixed", "other".
+_Entry = tuple[str, str]
 
 
 class _Evaluator:
-    def __init__(self, param_names: list[str], code: types.CodeType, string_params: set[int]):
+    def __init__(self, param_names: list[str], code: types.CodeType, param_kinds: list[str]):
         self.param_names = param_names
         self.co_consts = code.co_consts
-        self.string_params = string_params
+        self.param_kinds = param_kinds
 
-    def _is_string(self, expr: str) -> bool:
-        """True if expr is a string literal, concat(...), or string-typed param."""
-        if expr.startswith("'") or expr.startswith("concat("):
-            return True
-        return any(expr == f"_udf_param_{i}" for i in self.string_params)
+    def _is_string(self, _sql: str, kind: str) -> bool:
+        return kind == "string"
 
-    def evaluate(self, instrs: list[dis.Instruction]) -> Optional[str]:
+    def evaluate(self, instrs: list[dis.Instruction]) -> Optional[_Entry]:
         self._idx = {ins.offset: n for n, ins in enumerate(instrs)}
         return self._eval_range(instrs, 0, len(instrs), [])
 
@@ -94,8 +137,8 @@ class _Evaluator:
         instrs: list[dis.Instruction],
         start: int,
         end: int,
-        stack: list[str],
-    ) -> Optional[str]:
+        stack: list[_Entry],
+    ) -> Optional[_Entry]:
         i = start
         while i < end:
             ins = instrs[i]
@@ -110,11 +153,13 @@ class _Evaluator:
                 for nm in names:
                     if nm not in self.param_names:
                         raise BackendDecline(f"{op} unknown var {nm}")
-                    stack.append(f"_udf_param_{self.param_names.index(nm)}")
+                    idx = self.param_names.index(nm)
+                    stack.append((f"_udf_param_{idx}", self.param_kinds[idx]))
                 i += 1
                 continue
             if op == "LOAD_CONST":
-                stack.append(self._const_sql(ins.argval))
+                sql, kind = self._const_sql(ins.argval)
+                stack.append((sql, kind))
                 i += 1
                 continue
             if op == "RETURN_VALUE":
@@ -135,52 +180,67 @@ class _Evaluator:
                 i += 1
                 continue
             if op == "BINARY_OP":
-                b, a = stack.pop(), stack.pop()
+                (b_sql, b_kind), (a_sql, a_kind) = stack.pop(), stack.pop()
                 r = ins.argrepr
                 if r == "%":
-                    stack.append(_floored(a, b))
-                elif r == "+" and (self._is_string(a) or self._is_string(b)):
-                    stack.append(f"concat({a}, {b})")
+                    self._numeric_only(r, a_kind, b_kind)
+                    stack.append((_floored(a_sql, b_sql), "numeric"))
+                elif r == "+":
+                    if self._is_string(a_sql, a_kind) or self._is_string(b_sql, b_kind):
+                        stack.append((f"concat({a_sql}, {b_sql})", "string"))
+                    else:
+                        self._numeric_only(r, a_kind, b_kind)
+                        stack.append((f"({a_sql} + {b_sql})", "numeric"))
                 elif r in _BINARY_OPS:
-                    stack.append(f"({a} {_BINARY_OPS[r]} {b})")
+                    self._numeric_only(r, a_kind, b_kind)
+                    stack.append((f"({a_sql} {_BINARY_OPS[r]} {b_sql})", "numeric"))
                 else:
                     raise BackendDecline(f"unsupported BINARY_OP {r!r}")
                 i += 1
                 continue
             if op == "UNARY_NEGATIVE":
-                stack.append(f"(-{stack.pop()})")
+                a_sql, a_kind = stack.pop()
+                self._numeric_only("unary -", a_kind, None)
+                stack.append((f"(-{a_sql})", "numeric"))
                 i += 1
                 continue
             if op == "UNARY_NOT":
-                stack.append(f"(NOT {stack.pop()})")
+                sql = self._not_sql(stack.pop())
+                stack.append((sql, "bool"))
                 i += 1
                 continue
             if op == "COMPARE_OP":
-                b, a = stack.pop(), stack.pop()
+                (b_sql, b_kind), (a_sql, a_kind) = stack.pop(), stack.pop()
                 cmp = _COMPARE_OPS.get(ins.argval)
                 if cmp is None:
                     raise BackendDecline(f"unsupported COMPARE_OP {ins.argval!r}")
+                if not self._comparable(a_kind, b_kind):
+                    # Spark would implicitly coerce ('5' == 5 is true in SQL,
+                    # False in python) or fail analysis: not a rewrite, a lie.
+                    raise BackendDecline(f"comparison of {a_kind} and {b_kind} operands not supported")
                 if ins.argval == "!=":
-                    stack.append(f"(NOT ({a} <=> {b}))")
+                    stack.append((f"(NOT ({a_sql} <=> {b_sql}))", "bool"))
                 else:
-                    stack.append(f"({a} {cmp} {b})")
+                    stack.append((f"({a_sql} {cmp} {b_sql})", "bool"))
                 i += 1
                 continue
             if op == "IS_OP":
-                b, a = stack.pop(), stack.pop()
+                (b_sql, b_kind), (a_sql, a_kind) = stack.pop(), stack.pop()
                 kw = "IS NOT" if ins.arg else "IS"
-                if b == "NULL":
-                    stack.append(f"({a} {kw} NULL)")
-                elif a == "NULL":
-                    stack.append(f"({b} {kw} NULL)")
+                if b_sql == "NULL":
+                    stack.append((f"({a_sql} {kw} NULL)", "bool"))
+                elif a_sql == "NULL":
+                    stack.append((f"({b_sql} {kw} NULL)", "bool"))
                 else:
                     raise BackendDecline("IS_OP on non-None not supported")
                 i += 1
                 continue
             if op in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"):
-                return self._branch(instrs, i, end, stack, stack.pop(), op == "POP_JUMP_IF_TRUE")
+                cond = self._truth(stack.pop())
+                return self._branch(instrs, i, end, stack, cond, op == "POP_JUMP_IF_TRUE")
             if op in ("POP_JUMP_IF_NONE", "POP_JUMP_IF_NOT_NONE"):
-                return self._branch(instrs, i, end, stack, f"{stack.pop()} IS NULL", op == "POP_JUMP_IF_NONE")
+                cond = stack.pop()[0]
+                return self._branch(instrs, i, end, stack, f"{cond} IS NULL", op == "POP_JUMP_IF_NONE")
             raise BackendDecline(f"unsupported bytecode: {op}")
         # Fall-through with no RETURN: a branch's top-of-stack is the result
         # (short-circuit and/or fall through to a shared RETURN_VALUE).
@@ -191,10 +251,10 @@ class _Evaluator:
         instrs: list[dis.Instruction],
         i: int,
         end: int,
-        stack: list[str],
+        stack: list[_Entry],
         cond: str,
         jump_if_cond: bool,
-    ) -> str:
+    ) -> _Entry:
         """Split at a conditional jump.  Both sub-ranges run to `end` so shared
         code after the join point (e.g. the NOT in `not (a and b)`) is seen by
         both branches.  jump_if_cond=True means the jump target is the THEN
@@ -207,21 +267,65 @@ class _Evaluator:
         if fall is None or jump is None:
             raise BackendDecline("branch with no return")
         then, other = (jump, fall) if jump_if_cond else (fall, jump)
-        return f"CASE WHEN {cond} THEN {then} ELSE {other} END"
+        kind = then[1] if then[1] == other[1] else "mixed"
+        return (f"CASE WHEN {cond} THEN {then[0]} ELSE {other[0]} END", kind)
 
-    def _const_sql(self, val: Any) -> str:
+    def _truth(self, entry: _Entry) -> str:
+        """SQL matching Python truthiness: None, 0, and '' are falsy."""
+        sql, kind = entry
+        if kind == "bool":
+            return sql
+        if kind == "numeric":
+            return f"({sql} IS NOT NULL AND {sql} <> 0)"
+        if kind == "string":
+            return f"({sql} IS NOT NULL AND length({sql}) > 0)"
+        raise BackendDecline(f"no truthiness SQL for a {kind or 'unknown'}-typed value")
+
+    def _not_sql(self, entry: _Entry) -> str:
+        """`not v`. NOT NULL is NULL in SQL, but `not None` is True."""
+        cond = self._truth(entry)
+        return f"CASE WHEN {cond} THEN false ELSE true END"
+
+    def _numeric_only(self, op: str, a_kind: Optional[str], b_kind: Optional[str]) -> None:
+        # numeric only, NULL folds in. "other" params (timestamp/binary/array)
+        # are declined: python raises on ts + 5 and Spark would happily
+        # date-shift -- inventing semantics the function never had.
+        for kind in (a_kind, b_kind):
+            if kind is not None and kind not in ("numeric", "null"):
+                raise BackendDecline(f"{op!r} on a {kind} operand not supported")
+
+    @staticmethod
+    def _comparable(a_kind: str, b_kind: str) -> bool:
+        """True when Spark compares these without changing python semantics.
+
+        NULL folds with anything (python returns False for None == x, and
+        NULL <=> x is false). Anything else must be the same class: Spark's
+        implicit string->number coercion makes '5' == 5 true in SQL where
+        python says False.
+        """
+        if a_kind == "null" or b_kind == "null":
+            return True
+        return a_kind == b_kind and a_kind in ("numeric", "string", "bool")
+
+    def _const_sql(self, val: Any) -> _Entry:
         if val is None:
-            return "NULL"
+            return "NULL", "null"
         if val is True:
-            return "true"
+            return "true", "bool"
         if val is False:
-            return "false"
+            return "false", "bool"
         if isinstance(val, (int, float)):
-            return str(val)
+            if isinstance(val, float) and val != val:
+                return "cast('NaN' as double)", "numeric"
+            if val == float("inf"):
+                return "cast('Infinity' as double)", "numeric"
+            if val == float("-inf"):
+                return "cast('-Infinity' as double)", "numeric"
+            return str(val), "numeric"
         if isinstance(val, str):
             if "\\" in val:
                 raise BackendDecline("backslash in string const not supported")
-            return f"'{val.replace(chr(39), chr(39) + chr(39))}'"
+            return f"'{val.replace(chr(39), chr(39) + chr(39))}'", "string"
         raise BackendDecline(f"unsupported const type {type(val).__name__}")
 
 

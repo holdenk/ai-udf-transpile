@@ -255,6 +255,7 @@ def register_impl(
             func=func,
             samples=samples,
             tolerance=tolerance,
+            party_on_strings=conf.get_bool(conf.PARTY_ON_STRINGS, spark, False),
         )
         if not ok:
             existing = catalog.get(key)

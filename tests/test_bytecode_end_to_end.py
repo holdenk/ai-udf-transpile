@@ -10,7 +10,7 @@ pytest.importorskip("pyspark")
 from pyspark.sql.types import BooleanType, LongType, StringType
 from pyspark.sql.udf import UserDefinedFunction
 
-from ai_udf_transpile import enable, shutdown
+from ai_udf_transpile import conf, enable, shutdown
 from ai_udf_transpile.backends.bytecode import BytecodeBackend
 from ai_udf_transpile.backends.fake import both_positive, greet, is_none_branch, mod_bucket, plus_one
 from ai_udf_transpile.keys import canonical_source_from_func
@@ -58,6 +58,8 @@ def test_is_none_branch_end_to_end(spark, sqlite_path):
 
 
 def test_greet_hypothesis_verified(spark, sqlite_path):
+    # greet raises on None, and the strings here really are text.
+    conf.set_value(conf.PARTY_ON_STRINGS, "true")
     # Bytecode emits 'hi ' + name; Hypothesis must confirm it matches python.
     sql = _transpile(spark, sqlite_path, greet, StringType(), input_types=["string"])
     assert sql == "concat('hi ', _udf_param_0)"
@@ -70,6 +72,7 @@ def test_greet_hypothesis_verified(spark, sqlite_path):
         spark=spark,
         max_examples=20,
         func=greet,
+        party_on_strings=True,
     )
     assert ok, f"bytecode greet SQL failed Hypothesis: {err}"
     shutdown()

@@ -59,7 +59,7 @@ class EnsembleBackend:
         errors: list[str] = []
         for name, backend in self._sub_backends():
             sub = sandbox / f"sub_{name}"
-            write_sandbox(sub, job)
+            write_sandbox(sub, job, inputs=conf.get_value(conf.AI_REPRESENTATION, self.spark))
             try:
                 result = backend.run(job, sub)
             except BackendDecline as exc:

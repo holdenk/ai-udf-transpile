@@ -37,7 +37,7 @@ public class BackwardsBad implements UDF1<Object, Object> {
 """
 
 
-def _check(source, result, input_types, return_type, spark, max_examples=50):
+def _check(source, result, input_types, return_type, spark, max_examples=50, party_on_strings=False):
     return hypothesis_check(
         source_text=source,
         captures={},
@@ -46,6 +46,7 @@ def _check(source, result, input_types, return_type, spark, max_examples=50):
         return_type=return_type,
         spark=spark,
         max_examples=max_examples,
+        party_on_strings=party_on_strings,
     )
 
 
@@ -131,8 +132,27 @@ def test_java_udf_correct_passes(spark):
         ["string"],
         "string",
         spark,
+        party_on_strings=True,
     )
     assert ok, err
+
+
+def test_string_contents_ignored_unless_party_on(spark):
+    # Identity is not a reversal, but None matches None. Without the flag
+    # there is no string content to disagree on.
+    ok, err = _check(BACKWARDS_PY, _sql("_udf_param_0"), ["string"], "string", spark, max_examples=5)
+    assert ok, err
+    ok, err = _check(
+        BACKWARDS_PY,
+        _sql("_udf_param_0"),
+        ["string"],
+        "string",
+        spark,
+        max_examples=20,
+        party_on_strings=True,
+    )
+    assert not ok
+    assert "mismatch" in (err or "")
 
 
 def test_java_udf_wrong_impl_rejected(spark):
@@ -146,6 +166,7 @@ def test_java_udf_wrong_impl_rejected(spark):
         ["string"],
         "string",
         spark,
+        party_on_strings=True,
     )
     assert not ok
     assert "mismatch" in (err or "")
@@ -166,9 +187,12 @@ def test_java_udf_verify_requires_spark():
 
 def test_strategies_generate_null_zero_and_text():
     from hypothesis import find
+    from hypothesis.errors import NoSuchExample
 
     # find() raises NoSuchExample if the value cannot be generated.
     assert find(_strategy_for("string"), lambda v: v is None) is None
-    assert find(_strategy_for("string"), lambda v: isinstance(v, str) and len(v) > 3)
+    with pytest.raises(NoSuchExample):
+        find(_strategy_for("string"), lambda v: isinstance(v, str))
+    assert find(_strategy_for("string", party_on_strings=True), lambda v: isinstance(v, str) and len(v) > 3)
     assert find(_strategy_for("bigint"), lambda v: v == 0) == 0
     assert find(_strategy_for("boolean"), lambda v: v is False) is False

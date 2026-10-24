@@ -9,8 +9,12 @@ comment).  We run three arms per pattern:
   transpiled  the UDF after AI transpilation (fake backend, inline worker)
 
 The point: a Python UDF doing TPC-DS-like work is 5-10x slower than native
-SQL, and transpilation closes that gap entirely -- the transpiled arm matches
-the vanilla arm because it IS the vanilla SQL.
+SQL, and transpilation closes that gap for the patterns whose faithful
+rewrite IS the vanilla SQL (most of them). The python-semantics rewrites
+(spark_substr's clamped slice, spark_str's 'None', spark_eq's NULL-safe =)
+carry guards the naive vanilla expression lacks, and run a little slower
+than vanilla as a result; three UDFBench date parsers are declined outright
+-- no faithful SQL exists for int() over a free-form prefix.
 
   export SPARK_HOME=~/spark
   python examples/bench_tpcds_udfs.py [rows] [--rounds N] [--csv PATH]
@@ -240,6 +244,45 @@ PATTERNS = [
 ]
 
 
+# Per-pattern column expressions. The default frame is numeric strings and
+# small doubles, which is garbage for a date parser, a '::' splitter, or a
+# currency lookup -- python itself would crash (or Hypothesis would see no
+# signal) on rows that are not shaped like the pattern's real domain.
+_SEP_EXPR = (
+    "concat('funder', cast(x % 100 as string), '::', "
+    "'class', cast(x % 10 as string), '::', 'proj', cast(x % 1000 as string))"
+)
+_DATE_EXPR = "date_format(make_date(2000 + (x % 50), 1 + (x % 12), 1 + (x % 28)), 'yyyy-MM-dd')"
+FRAME_EXPRS: dict[str, dict[str, str]] = {
+    "udfb_extractyear": {"s": _DATE_EXPR},
+    "udfb_extractmonth": {"s": _DATE_EXPR},
+    "udfb_extractday": {"s": _DATE_EXPR},
+    "udfb_extractfunder": {"s": _SEP_EXPR},
+    "udfb_extractclass": {"s": _SEP_EXPR},
+    "udfb_extractid": {"s": _SEP_EXPR},
+    "udfb_converttoeuro": {
+        "currency": "element_at(array('EUR', 'USD', 'GBP', 'CHF'), cast(x % 4 as int) + 1)"
+    },
+}
+
+
+def _frame(spark, pattern: str, cols: list[tuple[str, str]], n: int):
+    exprs = FRAME_EXPRS.get(pattern, {})
+    base = spark.range(0, n, numPartitions=PARTITIONS).toDF("x")
+    sel = []
+    for name, dtype in cols:
+        if name in exprs:
+            sel.append(F.expr(exprs[name]).alias(name))
+        elif dtype == "string":
+            sel.append(F.col("x").cast("string").alias(name))
+        elif dtype == "double":
+            sel.append((F.col("x") % 10000).cast("double").alias(name))
+        else:
+            sel.append(F.col("x").alias(name))
+    df = base.select(*sel)
+    return df.cache() if n > 8 else df
+
+
 def _substitute(sql: str, cols: list[str]) -> str:
     """Replace _udf_param_N with actual column names."""
     for i, col in enumerate(cols):
@@ -290,21 +333,11 @@ def main() -> int:
     # Build one cached frame per distinct column signature.
     frames: dict[tuple, object] = {}
 
-    def get_frame(cols: list[tuple[str, str]]):
-        key = tuple(cols)
+    def get_frame(cols: list[tuple[str, str]], name: str):
+        key = (name, tuple(cols))
         if key not in frames:
-            base = spark.range(0, rows, numPartitions=PARTITIONS).toDF("x")
-            sel = []
-            for name, dtype in cols:
-                if dtype == "string":
-                    sel.append(F.col("x").cast("string").alias(name))
-                elif dtype == "double":
-                    sel.append((F.col("x") % 10000).cast("double").alias(name))
-                else:
-                    sel.append(F.col("x").alias(name))
-            df = base.select(*sel).cache()
-            df.count()
-            frames[key] = df
+            frames[key] = _frame(spark, name, cols, rows)
+            frames[key].count()
         return frames[key]
 
     # -- Python arm: transpile off, all UDFs are interpreted python.
@@ -323,26 +356,49 @@ def main() -> int:
     sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-tpcds-"), "cache.sqlite")
     catalog = enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
+    # strlen/upper raise on NULL. These patterns' strings are the values under test.
+    conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
     conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
 
+    # -- Seed samples: run each UDF once on domain-shaped rows so Hypothesis
+    # verifies against real inputs -- a '::' parser or currency lookup has no
+    # signal on random text (python raises on every example, fail closed).
+    # The worker polls slowly during seeding so a pending row is never
+    # claimed before its samples land.
+    conf.set_value(conf.POLL_INTERVAL, "60", spark)
+    for name, func, rtype, cols, _sql in PATTERNS:
+        seed_udf = UserDefinedFunction(func, rtype)
+        seed = _frame(spark, name, cols, 8)
+        col_names = [c[0] for c in cols]
+        seed.select(seed_udf(*col_names)).collect()
+    conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
+
+    declined: dict[str, bool] = {}
     for name, func, rtype, _cols, _sql in PATTERNS:
         UserDefinedFunction(func, rtype)  # construction queues the pending row
         status, error = wait_for_catalog(catalog, canonical_source_from_func(func))
-        assert status == "success", f"transpile failed for {name}: {error!r}"
+        declined[name] = status != "success"
+        if declined[name]:
+            print(f"transpile declined/failed for {name}: {error!r}")
+            continue
 
     ai_udfs: dict[str, UserDefinedFunction] = {}
     for name, func, rtype, _cols, _sql in PATTERNS:
+        if declined[name]:
+            continue
         ai_udfs[name] = UserDefinedFunction(func, rtype)
         assert ai_udfs[name].transpiled, f"{name} did not transpile"
 
     # -- Benchmark: interleave arms so warmup is fair.
     arms: list[tuple[str, object]] = []
     for name, _func, _rtype, cols, _sql in PATTERNS:
-        df = get_frame(cols)
+        df = get_frame(cols, name)
         col_names = [c[0] for c in cols]
         arms.append((f"python   {name}", df.select(py_udfs[name](*col_names))))
         arms.append((f"vanilla  {name}", df.select(F.expr(vanilla_exprs[name]).alias("out"))))
-        arms.append((f"transpiled {name}", df.select(ai_udfs[name](*col_names))))
+        # A declined pattern has no rewrite: its transpiled perf IS python's.
+        arm_udf = ai_udfs.get(name, py_udfs[name])
+        arms.append((f"transpiled {name}", df.select(arm_udf(*col_names))))
 
     for _name, arm_df in arms:  # warmup
         noop_seconds(arm_df)
@@ -363,10 +419,15 @@ def main() -> int:
         tx_s = secs[f"transpiled {name}"]
         tx_speedup = py_s / tx_s if tx_s > 0 else 0
         va_speedup = py_s / va_s if va_s > 0 else 0
-        print(f"{name:<30} {py_s:>9.2f}s {va_s:>9.2f}s {tx_s:>9.2f}s {tx_speedup:>9.1f}x {va_speedup:>9.1f}x")
+        mark = " (python fallback)" if declined[name] else ""
+        print(
+            f"{name:<30} {py_s:>9.2f}s {va_s:>9.2f}s {tx_s:>9.2f}s "
+            f"{tx_speedup:>9.1f}x {va_speedup:>9.1f}x{mark}"
+        )
         csv_rows.append(
             [
                 name,
+                declined[name],
                 rows,
                 round(rows / py_s),
                 round(rows / va_s),
@@ -382,6 +443,7 @@ def main() -> int:
             w.writerow(
                 [
                     "function",
+                    "declined",
                     "rows",
                     "python_rows_per_second",
                     "vanilla_rows_per_second",

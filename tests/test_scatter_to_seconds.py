@@ -40,7 +40,7 @@ pytest.importorskip("pyspark")
 from pyspark.sql.types import ArrayType, StringType
 from pyspark.sql.udf import UserDefinedFunction
 
-from ai_udf_transpile import enable, register_impl
+from ai_udf_transpile import conf, enable, register_impl
 from ai_udf_transpile.backends.fake import scatter_to_seconds
 from ai_udf_transpile.keys import canonical_source_from_func
 from ai_udf_transpile.targets import KIND_CATALYST, TranspileResult
@@ -118,7 +118,7 @@ SCATTER_SAMPLES = [
 ]
 
 
-def _check(sql, spark, samples=None):
+def _check(sql, spark, samples=None, party_on_strings=False):
     return hypothesis_check(
         source_text=canonical_source_from_func(scatter_to_seconds),
         captures={},
@@ -128,6 +128,7 @@ def _check(sql, spark, samples=None):
         spark=spark,
         max_examples=20,
         samples=samples,
+        party_on_strings=party_on_strings,
     )
 
 
@@ -165,7 +166,7 @@ def test_missing_nan_inf_guards_rejected_without_samples(spark):
     # with 'nan'/'inf' durations. The one-param-at-a-time built-ins never
     # produce that pair (the other param is always NULL), which is how a
     # guard-less rewrite slips through value verification otherwise.
-    ok, err = _check(NO_NAN_INF_GUARDS_SQL, spark)
+    ok, err = _check(NO_NAN_INF_GUARDS_SQL, spark, party_on_strings=True)
     assert not ok
     assert "mismatch" in (err or "") or "raised" in (err or "")
 
@@ -206,11 +207,15 @@ def test_lambda_closing_param_fails_reconstruction_even_with_verify_false(spark,
 
 
 def _record_samples(spark, sqlite_path):
-    """Run a sampling-wrapped UDF over the sample rows so register_impl verifies
-    against real inputs (built-in examples vary one param at a time, so a valid
-    (start, duration) pair never occurs without them)."""
+    """Queue a sampling run, and opt in to string generation.
+
+    SPARK-55206: the hook never runs for an array return, so no samples land.
+    The start/duration columns are strings, and the off-by-one only shows up
+    on a real pair, which requires partyOnStrings.
+    """
     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    conf.set_value(conf.PARTY_ON_STRINGS, "true")
     df = spark.createDataFrame([(s[0], s[1]) for s in SCATTER_SAMPLES], ["start", "duration"])
     sampling_udf = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
     df.select(sampling_udf("start", "duration")).collect()

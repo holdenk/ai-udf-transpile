@@ -84,6 +84,8 @@ def _check(func, sql, spark, input_types, return_type):
         return_type=return_type,
         spark=spark,
         max_examples=20,
+        # These tests assert on string contents (split, zfill, int('1_000')).
+        party_on_strings=any(t.strip().lower() == "string" for t in input_types),
     )
 
 

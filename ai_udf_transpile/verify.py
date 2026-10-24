@@ -388,7 +388,7 @@ def load_python_udf(
     return callables[-1]
 
 
-def _strategy_for(spark_type: str):
+def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
     from hypothesis import strategies as st
 
     t = spark_type.strip().lower()
@@ -406,6 +406,8 @@ def _strategy_for(spark_type: str):
             st.none(),
             st.floats(allow_nan=False, allow_infinity=False, width=32),
         )
+    if t == "string" and not party_on_strings:
+        return st.none()
     if t == "string":
         # Exclude surrogates (invalid in Spark strings) and codepoints
         # unassigned in this Python's Unicode: the JVM may run a newer
@@ -750,8 +752,14 @@ def hypothesis_check(
     func: Any = None,
     samples: Optional[list] = None,
     tolerance: float = 0.0,
+    party_on_strings: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Return (ok, error). Analysis failure / mismatch → (False, msg). Never raises to the worker."""
+    """Return (ok, error). Analysis failure / mismatch → (False, msg). Never raises to the worker.
+
+    ``party_on_strings`` invents string values. Off by default: a declared
+    string may be a date, JSON, or a number, and invented text is not
+    evidence. Real sampled rows still run either way.
+    """
     rejected = rejected_rewrite(result)
     if rejected:
         return False, rejected
@@ -787,7 +795,7 @@ def hypothesis_check(
     from hypothesis import strategies as st
 
     try:
-        strategies = [_strategy_for(t) for t in input_types]
+        strategies = [_strategy_for(t, party_on_strings=party_on_strings) for t in input_types]
     except VerifyFailed as exc:
         # e.g. register_impl input_types with an unknown simple string;
         # the docstring says never raises.
@@ -864,7 +872,8 @@ def hypothesis_check(
 
         Random text rarely exercises parsers (a JSON UDF raises on random
         strings and so does the SQL side -- a vacuous match), so real sampled
-        values and a fixed set of structured strings run as @example first.
+        values always run as @example. Structured string examples run only
+        when party_on_strings is set.
         """
         from ai_udf_transpile.sampling import (
             BUILTIN_ARRAY_EXAMPLES,
@@ -889,7 +898,7 @@ def hypothesis_check(
                 examples.append(values)
         for i, spark_type in enumerate(input_types):
             stype = spark_type.strip().lower()
-            if stype == "string":
+            if stype == "string" and party_on_strings:
                 for text in BUILTIN_STRING_EXAMPLES:
                     examples.append(tuple(text if j == i else None for j in range(arity)))
             elif stype in {"bigint", "long", "int", "integer", "smallint", "tinyint"}:
@@ -928,7 +937,7 @@ def hypothesis_check(
             for spark_type in input_types:
                 stype = spark_type.strip().lower()
                 if stype == "string":
-                    per_param.append(list(CROSS_STRING_EXAMPLES))
+                    per_param.append(list(CROSS_STRING_EXAMPLES) if party_on_strings else [None])
                 elif stype in {"bigint", "long", "int", "integer", "smallint", "tinyint"}:
                     per_param.append(list(BUILTIN_INT_EXAMPLES))
                 elif stype in {"double", "float"}:

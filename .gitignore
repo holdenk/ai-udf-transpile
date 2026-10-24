@@ -6,6 +6,10 @@
 spark-warehouse/
 metastore_db/
 derby.log
+# Bench CSVs are generated artifacts (docs PNGs are committed, the CSVs
+# they came from are not) and .#* are editor lockfiles.
+bench*.csv
+.#*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

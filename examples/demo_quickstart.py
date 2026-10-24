@@ -22,7 +22,7 @@ from pyspark.sql import SparkSession  # noqa: E402
 from pyspark.sql.types import LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
-from ai_udf_transpile import enable, shutdown  # noqa: E402
+from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
 
 
@@ -58,6 +58,7 @@ def main() -> int:
     sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-quickstart-"), "cache.sqlite")
     enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
 
     df = spark.createDataFrame([(1,), (41,), (None,)], ["x"])
     names = spark.createDataFrame([("holden",), (None,)], ["name"])

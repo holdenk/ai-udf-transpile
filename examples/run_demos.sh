@@ -7,7 +7,7 @@
 #   examples/run_demos.sh --bench --csv out.csv   # + also write the wide per-function CSV
 #   examples/run_demos.sh --bench --transpilation-timing-csv out_transpilation_timing.csv
 #   examples/run_demos.sh --bench --rust-accel [--rust-accel-conf key=value]
-#   examples/run_demos.sh --bench-bytecode        # bytecode backend vs built-in static transpiler
+#   examples/run_demos.sh --bench-bytecode        # python vs static (AST) vs bytecode->SQL vs Java bytecode eval
 #   examples/run_demos.sh --bench-tpcds           # TPC-DS-inspired UDF patterns vs vanilla SQL
 #   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 #

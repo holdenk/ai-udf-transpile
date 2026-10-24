@@ -25,6 +25,11 @@ BINARY_CURSOR = PREFIX + "binary.cursor"
 BINARY_CLAUDE = PREFIX + "binary.claude"
 BINARY_CODEX = PREFIX + "binary.codex"
 MAX_EXAMPLES = PREFIX + "maxExamples"
+# What the AI backends see: source (AST), bytecode, or source+bytecode.
+AI_REPRESENTATION = PREFIX + "aiRepresentation"
+# Invent string values during Hypothesis. Off: a string column may hold a
+# date, JSON, or a number, so random text is not evidence.
+PARTY_ON_STRINGS = PREFIX + "partyOnStrings"
 # Absolute numeric tolerance used while checking a rewrite, and the loosest
 # tested tolerance a cached rewrite may have and still be served.
 TOLERANCE = PREFIX + "tolerance"
@@ -60,6 +65,8 @@ DEFAULTS: dict[str, str] = {
     AUTO_BACKEND_PRIORITY: "coco,pi,claude,codex,cursor",
     ENSEMBLE_BACKENDS: "claude,codex,cursor",
     MAX_EXAMPLES: "20",
+    AI_REPRESENTATION: "source",
+    PARTY_ON_STRINGS: "false",
     TOLERANCE: "0",
     MAX_RETRIES: "3",
     FAIL_COOLDOWN: "86400",

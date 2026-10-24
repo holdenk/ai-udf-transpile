@@ -82,7 +82,7 @@ def process_row(
             origin = "human"
         else:
             job = row.as_job()
-            with make_sandbox(job) as sandbox:
+            with make_sandbox(job, inputs=conf.get_value(conf.AI_REPRESENTATION, spark)) as sandbox:
                 result = backend.run(job, sandbox)
         model = result.model
         rejected = rejected_rewrite(result)
@@ -97,6 +97,7 @@ def process_row(
             result.binary = compiled.jar_bytes
             result.class_name = compiled.class_name
         max_examples = conf.get_int(conf.MAX_EXAMPLES, spark, int(conf.default_max_examples()))
+        party_on_strings = conf.get_bool(conf.PARTY_ON_STRINGS, spark, False)
         tolerance = configured_tolerance(spark)
         samples: list = []
         try:
@@ -113,6 +114,7 @@ def process_row(
             max_examples=max_examples,
             samples=samples,
             tolerance=tolerance,
+            party_on_strings=party_on_strings,
         )
         if ok:
             # Provisional until the smoke test passes, so a concurrent query

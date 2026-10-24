@@ -24,7 +24,10 @@ A working experiment, not a dependency:
   and compares outputs at a tolerance; a wrong-but-lucky rewrite can pass.
   The vacuous-pass traps (python raises on every example, SQL returns
   anything) are closed, but "verified" means "matched every sampled input",
-  not "faithful".
+  not "faithful". String columns are not invented: a string may hold a
+  date, JSON, or a number. Set
+  `spark.sql.experimental.aiUdfTranspile.partyOnStrings` to generate
+  string values anyway.
 - **Generated code runs in your driver.** The rewrite is SQL you execute
   and, for java UDFs, javac output loaded into the session. The CLI
   backends write into a sandbox directory — that is a work dir, not a
@@ -96,6 +99,38 @@ Standalone worker when `inlineWorker` is false:
 python -m ai_udf_transpile.worker --sqlite-path /tmp/ai_udf_transpile.sqlite --backend fake
 ```
 
+## Backends: the six paths
+
+Three deterministic static paths, no AI anywhere, then the AI paths:
+
+| path | what it is | where |
+|---|---|---|
+| built-in static | Spark's own AST transpiler (`pyTranspilers=catalyst`) | Spark itself |
+| bytecode → SQL | the supported bytecode subset lowered to Catalyst SQL | `backend=bytecode` |
+| bytecode eval | the same subset, interpreted inside a Java UDF (`BytecodeEval`) | `backends/bytecode_eval.py` (bench/experimental; not served by the plugin) |
+
+The bytecode backend is held to the same standard of correctness as the
+built-in transpiler: `tests/test_static_parity.py` runs both against
+Python over a corpus of the shared subset (arithmetic, comparisons,
+and/or/not, branches, chained compares, string concat) with NULLs and
+negatives in the grid. The parity suite also caught and fixed Python
+truthiness: SQL `NOT NULL` is NULL but `not None` is `True`, so jump
+conditions and `not` operands are emitted with explicit truthiness SQL.
+
+`ai_udf_transpile.backends.bytecode_eval.emit_java_eval(func)` emits a
+self-contained Java UDF source for a function's bytecode: opcode pairs as
+data plus a fixed Java interpreter pasted in as a nested class
+(`javac.compile_java` turns it into the jar). Integral math is Java
+long, `%` is Python's floor remainder, `==`/`!=` are Python equality
+(null-safe, long-vs-double exact past 2^53).
+
+The main show is AI transpile. What the model sees is
+`spark.sql.experimental.aiUdfTranspile.aiRepresentation`:
+`source` (default; `udf.py`, the AST path), `bytecode` (CPython `dis`
+output instead of the source), or `source+bytecode` (both). The fake
+backend declines in `bytecode` mode because it recognizes fixtures by
+source — an honest stand-in for "the model only has the bytecode".
+
 ## Multi-model ensemble
 
 `backend=ensemble` runs every configured AI backend on the same UDF and
@@ -153,7 +188,7 @@ examples/run_demos.sh --bench   # + local micro benchmarks
 examples/run_demos.sh --live    # + real CLI backends (cortex/pi/agent/claude/codex on PATH)
 examples/run_demos.sh --bench --transpilation-timing-csv bench_transpilation_timing.csv
 examples/run_demos.sh --bench --rust-accel
-examples/run_demos.sh --bench-bytecode   # bytecode backend vs built-in static transpiler
+examples/run_demos.sh --bench-bytecode   # static (AST) vs bytecode->SQL vs Java bytecode eval vs python
 examples/run_demos.sh --bench-tpcds     # TPC-DS-inspired UDF patterns vs vanilla SQL
 examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 ```
@@ -193,15 +228,22 @@ apache/spark's own `test_udf.py` and common real-world patterns (discount,
 percentage change, C→F, URL decode).  Three arms per pattern: interpreted
 Python UDF, vanilla SQL, and transpiled SQL.  The point: a Python UDF doing
 TPC-DS-like work is 5-10x slower than native SQL, and transpilation closes
-that gap entirely — the transpiled arm matches the vanilla arm because it
-IS the vanilla SQL.
+that gap for the patterns whose faithful rewrite IS the vanilla SQL. The
+python-semantics rewrites (spark_substr's clamped slice, spark_str's
+'None', spark_eq's NULL-safe `=`) carry guards the naive vanilla expression
+lacks, and three UDFBench date parsers are declined outright — no faithful
+SQL exists for int() over a free-form prefix.
 
-The perf graph is generated from that CSV by a CLI tool
-(`examples/bench_graph.py`, matplotlib — no AI in the loop, ever):
+The perf graphs are generated from that CSV by a CLI tool
+(`examples/bench_graph.py`, matplotlib — no AI in the loop, ever). One
+command writes the linear chart and a log-scale sibling
+(`docs/bench_perf_log.png`):
 
-![throughput by function and arm](docs/bench_perf.png)
+![throughput by function and arm, linear scale](docs/bench_perf.png)
 
-Regenerate it the same way the committed PNG was made — a 10M-row,
+![throughput by function and arm, log scale](docs/bench_perf_log.png)
+
+Regenerate them the same way the committed PNGs were made — a 10M-row,
 min-of-3 local run against a Spark checkout with the transpiler surface
 (here `upstream/branch-4.x`; master works too). CI uploads the same CSV
 from its reduced-settings run as the `bench-micro-csv` artifact, so the
@@ -210,6 +252,20 @@ second command re-plots that one too:
 ```bash
 examples/run_demos.sh --bench --csv bench_micro.csv   # or: python examples/bench_micro.py --csv bench_micro.csv
 python examples/bench_graph.py bench_micro.csv docs/bench_perf.png
+```
+
+The static-path benches get the same graphs — `bench_graph.py` sniffs the
+CSV schema, so the `bench_bytecode_vs_static.py` table (python, built-in
+static, bytecode→SQL, Java bytecode eval) plots straight into
+`docs/bench_bytecode.png` + `_log`:
+
+![static bytecode paths, throughput by function and arm, linear scale](docs/bench_bytecode.png)
+
+![static bytecode paths, throughput by function and arm, log scale](docs/bench_bytecode_log.png)
+
+```bash
+python examples/bench_bytecode_vs_static.py --csv bench_bytecode_vs_static.csv
+python examples/bench_graph.py bench_bytecode_vs_static.csv docs/bench_bytecode.png
 ```
 
 `backend=auto` picks the first available backend from

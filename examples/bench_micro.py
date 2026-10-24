@@ -357,6 +357,8 @@ def main() -> int:
     sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-bench-"), "cache.sqlite")
     catalog = enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
+    # zfill/backwards/edit_distance take text, and zfill raises on NULL.
+    conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
     conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
     fills: dict[tuple[str, str], float] = {}
     decline_error: str | None = None

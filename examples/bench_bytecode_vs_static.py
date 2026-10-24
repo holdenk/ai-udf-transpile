@@ -1,22 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """Micro benchmark: bytecode backend vs Spark's built-in static transpiler.
 
-Three arms per function on one local SparkSession:
+Four arms per function on one local SparkSession:
 
   python    interpreted python (transpilePyUDFs=false) -- the baseline
   static    Spark's BUILT-IN catalyst transpiler (pyTranspilers=catalyst,
             plugin not enabled). It converts the simple single-expression
             bodies and declines the multi-statement one (is_none_branch).
             Correctness is checked per-sample rather than assumed.
-  bytecode  the deterministic bytecode backend (pyTranspilers=ai, plugin on,
-            backend="bytecode"). No AI round-trip, no Hypothesis fill latency
-            in the hot path -- the catalog is filled once up front.
+  bytecode_static
+            static transpile FROM bytecode: the deterministic bytecode backend
+            (pyTranspilers=ai, plugin on, backend="bytecode") lowers the
+            supported bytecode subset to Catalyst SQL. No AI round-trip, no
+            Hypothesis fill latency in the hot path -- the catalog is filled
+            once up front.
+  java_eval   static bytecode eval as a Java UDF: the same subset, compiled
+            into a jar whose call() runs the fixed Java interpreter
+            (BytecodeEval). No SQL lowering at all.
 
 The point: where both convert (plus_one, both_positive, greet, mod_bucket)
 the perf is comparable; where only bytecode converts (is_none_branch, which
 is multi-statement) the speedup over interpreted python is the whole story
-and static has no number. A wrong-but-converted rewrite gets no perf number
-either -- the correctness boolean is the story.
+and static has no number. bytecode_static vs java_eval is the lowering tax:
+Catalyst SQL beats a per-row interpreter UDF.
+A wrong-but-converted rewrite gets no perf number either.
 
   export SPARK_HOME=/path/to/spark-master
   python examples/bench_bytecode_vs_static.py [rows] [--rounds N] [--csv PATH]
@@ -39,8 +46,9 @@ from pyspark.sql import functions as F  # noqa: E402
 from pyspark.sql.types import BooleanType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
-from ai_udf_transpile import enable, shutdown  # noqa: E402
+from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.backends.bytecode import BytecodeBackend  # noqa: E402
+from ai_udf_transpile.backends.bytecode_eval import emit_java_eval  # noqa: E402
 from ai_udf_transpile.backends.fake import (  # noqa: E402
     both_positive,
     greet,
@@ -48,6 +56,7 @@ from ai_udf_transpile.backends.fake import (  # noqa: E402
     mod_bucket,
     plus_one,
 )
+from ai_udf_transpile.javac import compile_java, register_java_udf, verify_function_name  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 from ai_udf_transpile.worker import poll_once  # noqa: E402
 
@@ -162,6 +171,8 @@ def main() -> int:
     sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-bench-bc-"), "cache.sqlite")
     catalog = enable(spark, sqlite_path=sqlite, backend="bytecode", inline_worker=False)
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
+    # greet raises on NULL; the name column really is text.
+    conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
     bc_udfs: dict[str, UserDefinedFunction] = {}
     for name, fn, rtype, _df, _cols, _sample in functions:
         UserDefinedFunction(fn, rtype)  # construction queues the pending row
@@ -182,6 +193,22 @@ def main() -> int:
         if bytecode_correct[name]:
             assert "EvalPython" not in df.select(bc_udfs[name](*cols))._jdf.queryExecution().toString()
 
+    # -- java eval: same opcode subset, fixed Java interpreter, compiled once.
+    java_name: dict[str, str] = {}
+    java_correct: dict[str, bool] = {}
+    for name, fn, rtype, _df, cols, sample in functions:
+        emitted = emit_java_eval(fn)
+        compiled = compile_java(spark, emitted.java_source, emitted.class_name)
+        sql_name = verify_function_name("bce", compiled.jar_bytes)
+        register_java_udf(
+            spark, sql_name, compiled.class_name, compiled.jar_bytes, rtype, janino=compiled.janino
+        )
+        java_name[name] = sql_name
+        expr = f"{sql_name}({', '.join(cols)})"
+        got = [r[0] for r in sample.select(F.expr(expr)).collect()]
+        java_correct[name] = got == py_expect[name]
+        assert java_correct[name], f"java eval {name} disagreed: {got} != {py_expect[name]}"
+
     # -- throughput: only correct arms are benched. A wrong rewrite (e.g. static
     # bare-`%` on negatives) gets no perf number -- the boolean tells the story.
     arms: list[tuple[str, object, str | None]] = []
@@ -190,7 +217,10 @@ def main() -> int:
         if static_ok[name] and static_correct[name]:
             arms.append((f"static {name}", df.select(st_udfs[name](*cols)), f"python {name}"))
         if bytecode_correct[name]:
-            arms.append((f"bytecode {name}", df.select(bc_udfs[name](*cols)), f"python {name}"))
+            arms.append((f"bytecode_static {name}", df.select(bc_udfs[name](*cols)), f"python {name}"))
+        if java_correct[name]:
+            expr = f"{java_name[name]}({', '.join(cols)})"
+            arms.append((f"java_eval {name}", df.select(F.expr(expr)), f"python {name}"))
     for _name, arm_df, _ in arms:  # warmup
         noop_seconds(arm_df)
     secs: dict[str, float] = {}
@@ -207,29 +237,36 @@ def main() -> int:
         "function",
         "static_converted",
         "static_correct",
-        "bytecode_correct",
+        "bytecode_static_correct",
+        "java_eval_correct",
         "python_rows_per_second",
         "static_rows_per_second",
-        "bytecode_rows_per_second",
+        "bytecode_static_rows_per_second",
+        "java_eval_rows_per_second",
         "static_speedup_vs_python",
-        "bytecode_speedup_vs_python",
+        "bytecode_static_speedup_vs_python",
+        "java_eval_speedup_vs_python",
     ]
     wide: list[list] = []
     for name, _fn, _rtype, _df, _cols, _sample in functions:
         py_arm = f"python {name}"
         st_arm = f"static {name}" if (static_ok[name] and static_correct[name]) else None
-        bc_arm = f"bytecode {name}" if bytecode_correct[name] else None
+        bc_arm = f"bytecode_static {name}" if bytecode_correct[name] else None
+        jv_arm = f"java_eval {name}" if java_correct[name] else None
         wide.append(
             [
                 name,
                 static_ok[name],
                 static_correct[name],
                 bytecode_correct[name],
+                java_correct[name],
                 round(rows / secs[py_arm]),
                 round(rows / secs[st_arm]) if st_arm else "",
                 round(rows / secs[bc_arm]) if bc_arm else "",
+                round(rows / secs[jv_arm]) if jv_arm else "",
                 round(secs[py_arm] / secs[st_arm], 1) if st_arm else "",
                 round(secs[py_arm] / secs[bc_arm], 1) if bc_arm else "",
+                round(secs[py_arm] / secs[jv_arm], 1) if jv_arm else "",
             ]
         )
     print(",".join(header))
@@ -244,9 +281,14 @@ def main() -> int:
         f"static:  converted {len(st_conv)}/{len(functions)} ({', '.join(st_conv) or 'none'}); "
         f"correct {len(st_corr)}/{len(functions)} ({', '.join(st_corr) or 'none'})"
     )
+    jv_corr = [n for n, ok in java_correct.items() if ok]
     print(
-        f"bytecode: converted {len(functions)}/{len(functions)}; "
+        f"bytecode_static: converted {len(functions)}/{len(functions)}; "
         f"correct {len(bc_corr)}/{len(functions)} ({', '.join(bc_corr)}) -- deterministic, no AI round-trip"
+    )
+    print(
+        f"java_eval: correct {len(jv_corr)}/{len(functions)} ({', '.join(jv_corr)}) "
+        "-- same subset, Java interpreter UDF"
     )
 
     shutdown()

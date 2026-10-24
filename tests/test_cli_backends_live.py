@@ -95,6 +95,7 @@ def test_live_backend_greet(spark, sqlite_path, backend):
     if shutil.which(BACKENDS[backend]) is None:
         pytest.skip(f"{BACKENDS[backend]} not on PATH")
     conf.set_value(conf.CLI_TIMEOUT, "600")
+    conf.set_value(conf.PARTY_ON_STRINGS, "true")
     enable(spark, sqlite_path=sqlite_path, backend=backend, inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
 
@@ -114,6 +115,7 @@ def test_live_backend_upper_useragent(spark, sqlite_path, backend):
     if shutil.which(BACKENDS[backend]) is None:
         pytest.skip(f"{BACKENDS[backend]} not on PATH")
     conf.set_value(conf.CLI_TIMEOUT, "600")
+    conf.set_value(conf.PARTY_ON_STRINGS, "true")
     enable(spark, sqlite_path=sqlite_path, backend=backend, inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
 

@@ -138,12 +138,14 @@ def test_ai_sql_matches_python(spark, sqlite_path, name, itype, rtype, sql, need
         pytest.importorskip("numpy")
     from pyspark.sql.udf import UserDefinedFunction
 
-    from ai_udf_transpile import enable
+    from ai_udf_transpile import conf, enable
     from ai_udf_transpile.verify import hypothesis_check
     from ai_udf_transpile.worker import poll_once
 
     func = _func(name)
     catalog = enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
+    # The fixture SQL was written against string contents, not just NULL.
+    conf.set_value(conf.PARTY_ON_STRINGS, "true")
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     UserDefinedFunction(func, _spark_type(rtype))
     assert poll_once(catalog, FakeBackend(), spark)
@@ -156,6 +158,7 @@ def test_ai_sql_matches_python(spark, sqlite_path, name, itype, rtype, sql, need
         spark=spark,
         max_examples=50,
         func=func,
+        party_on_strings=True,
     )
     assert ok, f"AI SQL for {name} failed Hypothesis: {err}"
 
