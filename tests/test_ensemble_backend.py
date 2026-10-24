@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""EnsembleBackend: runs multiple sub-backends, collects candidates."""
+"""EnsembleBackend: a fallback chain, first sub-backend to answer wins."""
 
 from __future__ import annotations
 
@@ -47,6 +47,13 @@ class _FakeBackendB:
         return "model-b"
 
 
+class _NoModelBackend:
+    name = "nomodel"
+
+    def run(self, job, sandbox):
+        return TranspileResult(kind=KIND_CATALYST, sql="_udf_param_0 + 3")
+
+
 class _DeclineBackend:
     name = "decline"
 
@@ -57,19 +64,33 @@ class _DeclineBackend:
         return None
 
 
-def test_ensemble_collects_candidates_and_returns_first():
+def test_ensemble_first_candidate_wins_and_stops():
+    calls = []
+    b = _FakeBackendB()
+    inner = b.run
+
+    def counting_run(job, sandbox):
+        calls.append("b")
+        return inner(job, sandbox)
+
+    b.run = counting_run
     ensemble = EnsembleBackend(backends=["a", "b"])
-    # Monkey-patch _sub_backends to return our fakes.
-    ensemble._sub_backends = lambda: [("a", _FakeBackendA()), ("b", _FakeBackendB())]
+    ensemble._sub_backends = lambda: [("a", _FakeBackendA()), ("b", b)]
     job = _job_for(plus_one)
     with make_sandbox(job) as sandbox:
         result = ensemble.run(job, sandbox)
     assert result.sql == "_udf_param_0 + 1"
-    assert len(ensemble.candidates) == 2
-    names = [c[0] for c in ensemble.candidates]
-    models = [c[1] for c in ensemble.candidates]
-    assert names == ["a", "b"]
-    assert models == ["model-a", "model-b"]
+    assert result.model == "a/model-a"  # stamped with the sub-backend that served it
+    assert calls == []  # fallback chain: b never ran once a answered
+
+
+def test_ensemble_stamp_fills_in_missing_model():
+    ensemble = EnsembleBackend(backends=["nomodel"])
+    ensemble._sub_backends = lambda: [("nomodel", _NoModelBackend())]
+    job = _job_for(plus_one)
+    with make_sandbox(job) as sandbox:
+        result = ensemble.run(job, sandbox)
+    assert result.model == "nomodel/unknown"
 
 
 def test_ensemble_skips_decliners():
@@ -79,8 +100,18 @@ def test_ensemble_skips_decliners():
     with make_sandbox(job) as sandbox:
         result = ensemble.run(job, sandbox)
     assert result.sql == "_udf_param_0 + 1"
-    assert len(ensemble.candidates) == 1
-    assert ensemble.candidates[0][0] == "a"
+    assert result.model == "a/model-a"
+
+
+def test_ensemble_falls_back_when_first_backend_errors():
+    # CoCo down (auth, rate limit): the next sub-backend answers the row.
+    ensemble = EnsembleBackend(backends=["e1", "a"])
+    ensemble._sub_backends = lambda: [("e1", _ErrorBackend()), ("a", _FakeBackendA())]
+    job = _job_for(plus_one)
+    with make_sandbox(job) as sandbox:
+        result = ensemble.run(job, sandbox)
+    assert result.sql == "_udf_param_0 + 1"
+    assert result.model == "a/model-a"
 
 
 def test_ensemble_raises_when_all_decline():
@@ -90,7 +121,6 @@ def test_ensemble_raises_when_all_decline():
     with make_sandbox(job) as sandbox:
         with pytest.raises(BackendDecline):
             ensemble.run(job, sandbox)
-    assert ensemble.candidates == []
 
 
 class _ErrorBackend:
@@ -109,7 +139,6 @@ def test_ensemble_all_errored_is_a_retryable_error_not_a_decline():
     with make_sandbox(job) as sandbox:
         with pytest.raises(BackendError, match="rate limited"):
             ensemble.run(job, sandbox)
-    assert ensemble.candidates == []
 
 
 def test_ensemble_decline_and_error_still_raises_error():
@@ -120,6 +149,16 @@ def test_ensemble_decline_and_error_still_raises_error():
     job = _job_for(plus_one)
     with make_sandbox(job) as sandbox:
         with pytest.raises(BackendError):
+            ensemble.run(job, sandbox)
+
+
+def test_ensemble_unbuildable_leg_is_an_error_not_a_decline():
+    # A sub-backend that cannot even be constructed never got its turn to
+    # say no: that is a retryable error, not a 24h decline.
+    ensemble = EnsembleBackend(backends=["not-a-backend"])
+    job = _job_for(plus_one)
+    with make_sandbox(job) as sandbox:
+        with pytest.raises(BackendError, match="unavailable"):
             ensemble.run(job, sandbox)
 
 

@@ -1,21 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ensemble backend: run multiple AI backends, collect candidates, pick the best.
+"""Fallback-chain backend: sub-backends in order, first candidate wins.
 
-When ``backend="ensemble"`` the worker runs each configured sub-backend
-(claude, codex, cursor, ...) on the same UDF.  Every non-declining result is
-collected on ``self.candidates`` so the caller (demo, benchmark, worker) can
-inspect agreement/divergence across models.  The first successful result is
-returned so the normal worker pipeline (Hypothesis verify, mark_success)
-proceeds without change.
+When ``backend="ensemble"`` the worker tries each configured sub-backend
+(coco, cursor, ...) on the same UDF until one produces a rewrite.  A
+decline falls through to the next sub-backend; so does a transient error
+(auth, rate limit, crash) -- later sub-backends never run once one
+answers.  All declined => BackendDecline (the models saw it and said no);
+no candidate and any error => BackendError (retryable, so a dead CLI does
+not burn the row's 24h decline cooldown).
 
-The "choose best based on benchmark" step is a separate concern -- it needs
-Spark to run actual queries, which ``Backend.run(job, sandbox)`` does not
-have.  See ``ai_udf_transpile.benchmark.choose_best`` for that.
+The winner's ``model`` is stamped ``<sub-backend>/<its model>`` so the
+catalog records which sub-backend actually served the rewrite.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -38,26 +39,29 @@ class EnsembleBackend:
         else:
             raw = conf.get_value(conf.ENSEMBLE_BACKENDS, spark, conf.DEFAULTS[conf.ENSEMBLE_BACKENDS])
             self._backend_names = [b.strip().lower() for b in raw.split(",") if b.strip()]
-        # Lazy: don't construct sub-backends until run() so a missing binary
-        # doesn't crash at enable() time.
-        self.candidates: list[tuple[str, str, TranspileResult]] = []
 
     def _sub_backends(self) -> list[tuple[str, Any]]:
+        # Lazy construction, inside run(), so a missing binary does not crash
+        # enable(). A leg that cannot even be built counts as an error, not a
+        # decline -- it never got its turn to say no.
         out: list[tuple[str, Any]] = []
         for name in self._backend_names:
             try:
                 out.append((name, get_backend(name, self.spark)))
             except Exception:
                 logger.debug("ensemble: sub-backend %s unavailable", name, exc_info=True)
+                out.append((name, None))
         return out
 
     def reported_model(self) -> Optional[str]:
         return None
 
     def run(self, job: TranspileJob, sandbox: Path) -> TranspileResult:
-        self.candidates = []
         errors: list[str] = []
         for name, backend in self._sub_backends():
+            if backend is None:
+                errors.append(f"{name}: unavailable")
+                continue
             sub = sandbox / f"sub_{name}"
             write_sandbox(sub, job, inputs=conf.get_value(conf.AI_REPRESENTATION, self.spark))
             try:
@@ -69,16 +73,16 @@ class EnsembleBackend:
                 errors.append(f"{name}: {exc}")
                 logger.debug("ensemble: %s errored: %s", name, exc)
                 continue
-            model = result.model or f"{name}-unknown"
-            self.candidates.append((name, model, result))
-            logger.info("ensemble: %s (model=%s) produced a candidate", name, model)
-        if not self.candidates:
-            if errors:
-                # A sub-backend that errored (rate limit, auth, crash) is a
-                # transient failure: retry, do not burn a 24h decline
-                # cooldown on it the way an all-declined outcome deserves.
-                detail = "; ".join(errors)
-                raise BackendError(f"ensemble: no candidate from {self._backend_names}: {detail}")
-            raise BackendDecline(f"ensemble: no candidate from {self._backend_names}: all declined")
-        # First success wins for the catalog; all candidates stay on self.
-        return self.candidates[0][2]
+            # First candidate wins: this is a fallback chain, not a vote --
+            # later sub-backends never run once one answers. Copy-on-stamp:
+            # some backends (the fake) return shared objects.
+            stamped = replace(result, model=f"{name}/{result.model or 'unknown'}")
+            logger.info("ensemble: %s (model=%s) produced a candidate", name, stamped.model)
+            return stamped
+        if errors:
+            # A sub-backend that errored (rate limit, auth, crash) is a
+            # transient failure: retry, do not burn a 24h decline
+            # cooldown on it the way an all-declined outcome deserves.
+            detail = "; ".join(errors)
+            raise BackendError(f"ensemble: no candidate from {self._backend_names}: {detail}")
+        raise BackendDecline(f"ensemble: no candidate from {self._backend_names}: all declined")

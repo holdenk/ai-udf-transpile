@@ -5,8 +5,8 @@ Given several AI-generated rewrites for the same UDF, run each on a small
 DataFrame and measure rows/sec.  Returns the fastest (sql, model) so the
 caller can serve it instead of whichever happened to finish first.
 
-This is the "choose best" half of the ensemble story; the EnsembleBackend
-collects candidates, this module benchmarks them.
+This is the "choose best" half of the multi-model story: demo_multi_model
+collects one rewrite per backend, this module benchmarks them.
 """
 
 from __future__ import annotations

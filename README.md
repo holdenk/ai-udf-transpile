@@ -131,23 +131,25 @@ output instead of the source), or `source+bytecode` (both). The fake
 backend declines in `bytecode` mode because it recognizes fixtures by
 source — an honest stand-in for "the model only has the bytecode".
 
-## Multi-model ensemble
+## Backend fallback chain (ensemble)
 
-`backend=ensemble` runs every configured AI backend on the same UDF and
-collects all non-declining candidates, so you can compare agreement across
-models and pick the fastest rewrite instead of whichever happened to
-finish first. Configure which sub-backends to try with
-`spark.sql.experimental.aiUdfTranspile.ensembleBackends` (default:
-`claude,codex,cursor`):
+`backend=ensemble` is a fallback chain: each configured sub-backend gets the
+UDF until one produces a rewrite; a decline or a transient error (auth, rate
+limit, crash) falls through to the next, and later sub-backends never run
+once one answers. Default chain `coco,cursor` -- CoCo answers, cursor picks
+up the rows CoCo cannot. Configure it with
+`spark.sql.experimental.aiUdfTranspile.ensembleBackends`:
 
 ```python
 spark.conf.set("spark.sql.experimental.aiUdfTranspile.ensembleBackends", "claude,codex")
 enable(spark, backend="ensemble")
 ```
 
-The ensemble returns the first successful candidate so the normal worker
-pipeline (Hypothesis verify, mark success) proceeds unchanged; all
-candidates stay on `EnsembleBackend.candidates` for inspection.
+The winner's model is stamped `<sub-backend>/<model>`, so catalog rows and
+`docs/EXAMPLES_TRANSPILED.md` say which sub-backend actually served the
+rewrite. All sub-backends declined => a decline (24h cooldown, as before);
+no candidate and any sub-backend errored => a retryable error, so a dead
+CLI never burns the cooldown.
 
 **Choose best by benchmark.** `ai_udf_transpile.benchmark.choose_best`
 runs each candidate SQL on a sample DataFrame and returns the fastest
@@ -187,7 +189,7 @@ AI CLI on PATH.
 examples/run_demos.sh           # quickstart + full demo ($AI_UDF_TRANSPILE_BACKEND, else auto)
 examples/run_demos.sh --bench   # + local micro benchmarks
 examples/run_demos.sh --live    # + every CLI backend on PATH (cortex/pi/agent/claude/codex)
-examples/regen_examples_doc.sh  # every example twice on CoCo, one cache, then docs/EXAMPLES_TRANSPILED.md
+examples/regen_examples_doc.sh  # every example twice on the AI chain (CoCo, cursor fallback), one cache, then docs/EXAMPLES_TRANSPILED.md
 examples/run_demos.sh --bench --transpilation-timing-csv bench_transpilation_timing.csv
 examples/run_demos.sh --bench --rust-accel
 examples/run_demos.sh --bench-bytecode   # static (AST) vs bytecode->SQL vs Java bytecode eval vs python
@@ -276,7 +278,8 @@ excluded as declines), and `examples/dump_results.py` writes a markdown
 dump of what every transpiler did to every UDF the examples put in the
 cache — conversions and declines side by side, with the backend and model
 that made each AI row. `examples/regen_examples_doc.sh` fills that cache
-from CoCo (every example, twice: miss, then hit); the
+from the AI chain (every example, twice: miss, then hit; CoCo answers,
+cursor picks up what CoCo cannot); the
 dump it writes is [docs/EXAMPLES_TRANSPILED.md](docs/EXAMPLES_TRANSPILED.md). The
 examples and benchmarks refuse the fake backend; raw runs live
 under `questionable_benchmark_results/`.

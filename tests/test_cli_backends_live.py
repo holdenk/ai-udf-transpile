@@ -37,7 +37,15 @@ BACKENDS = {
     "cursor": conf.DEFAULTS[conf.BINARY_CURSOR],
     "claude": conf.DEFAULTS[conf.BINARY_CLAUDE],
     "codex": conf.DEFAULTS[conf.BINARY_CODEX],
+    "ensemble": "ensemble",
 }
+ENSEMBLE_BINARIES = (conf.DEFAULTS[conf.BINARY_COCO], conf.DEFAULTS[conf.BINARY_CURSOR])
+
+
+def _skip_unavailable(backend):
+    binaries = ENSEMBLE_BINARIES if backend == "ensemble" else (BACKENDS[backend],)
+    if not any(shutil.which(b) for b in binaries):
+        pytest.skip(f"no {backend} binary on PATH")
 
 
 def plus_one(x: int) -> int:
@@ -73,8 +81,7 @@ def _wait_success(catalog, retrigger, timeout=900):
 
 @pytest.mark.parametrize("backend", sorted(BACKENDS))
 def test_live_backend_plus_one(spark, sqlite_path, backend):
-    if shutil.which(BACKENDS[backend]) is None:
-        pytest.skip(f"{BACKENDS[backend]} not on PATH")
+    _skip_unavailable(backend)
     conf.set_value(conf.CLI_TIMEOUT, "600")
     enable(spark, sqlite_path=sqlite_path, backend=backend, inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
@@ -92,8 +99,7 @@ def test_live_backend_plus_one(spark, sqlite_path, backend):
 
 @pytest.mark.parametrize("backend", sorted(BACKENDS))
 def test_live_backend_greet(spark, sqlite_path, backend):
-    if shutil.which(BACKENDS[backend]) is None:
-        pytest.skip(f"{BACKENDS[backend]} not on PATH")
+    _skip_unavailable(backend)
     conf.set_value(conf.CLI_TIMEOUT, "600")
     conf.set_value(conf.PARTY_ON_STRINGS, "true")
     enable(spark, sqlite_path=sqlite_path, backend=backend, inline_worker=True)
@@ -112,8 +118,7 @@ def test_live_backend_greet(spark, sqlite_path, backend):
 @pytest.mark.parametrize("backend", sorted(BACKENDS))
 def test_live_backend_upper_useragent(spark, sqlite_path, backend):
     """SPARK-21935's UDF against a real backend: upper(col) must verify."""
-    if shutil.which(BACKENDS[backend]) is None:
-        pytest.skip(f"{BACKENDS[backend]} not on PATH")
+    _skip_unavailable(backend)
     conf.set_value(conf.CLI_TIMEOUT, "600")
     conf.set_value(conf.PARTY_ON_STRINGS, "true")
     enable(spark, sqlite_path=sqlite_path, backend=backend, inline_worker=True)
