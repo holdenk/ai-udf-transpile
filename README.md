@@ -268,6 +268,12 @@ python examples/bench_bytecode_vs_static.py --csv bench_bytecode_vs_static.csv
 python examples/bench_graph.py bench_bytecode_vs_static.csv docs/bench_bytecode.png
 ```
 
+`examples/bench_graph_aggregate.py` rolls every benchmark CSV in a
+directory into one per-path speedup chart (medians marked, fallback rows
+excluded as declines), and `examples/dump_results.py` writes a markdown
+dump of what every transpiler did to every fixture UDF — conversions and
+declines side by side. Raw runs live under `questionable_benchmark_results/`.
+
 `backend=auto` picks the first available backend from
 `spark.sql.experimental.aiUdfTranspile.autoBackendPriority`
 (default: `coco,pi,claude,codex,cursor`). Override binaries with

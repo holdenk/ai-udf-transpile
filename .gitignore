@@ -10,6 +10,9 @@ derby.log
 # they came from are not) and .#* are editor lockfiles.
 bench*.csv
 .#*
+# Raw benchmark runs and dumps. Intended to be committed eventually; kept
+# out for now so `git add -A` cannot sweep generated output into a commit.
+questionable_benchmark_results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-udf-transpile"
-version = "0.1.0"
-description = "AI-backed Python UDF transpilation for Apache Spark (Catalyst / Java UDF)."
+# a-suffix so pip needs --pre: this is ALPHA software, do not depend on it.
+version = "0.1.0a0"
+description = "ALPHA software (experimental, breaking, do not depend on this): AI-backed Python UDF transpilation for Apache Spark (Catalyst / Java UDF)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
@@ -16,6 +17,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    # The bytecode backends target 3.13 instruction shapes; older
+    # interpreters get fail-closed declines.
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     # The inline worker verifies rewrites with Hypothesis at runtime, so a
@@ -45,6 +49,8 @@ ai_udf_transpile = ["resources/prompt.md", "java/*.java"]
 [tool.ruff]
 line-length = 110
 target-version = "py311"
+# Generated benchmark output (CSVs, dumps, aggregate PNGs): not source.
+extend-exclude = ["questionable_benchmark_results"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

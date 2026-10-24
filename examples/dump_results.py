@@ -1,0 +1,177 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Dump what every transpiler does to every fixture UDF, as markdown.
+
+For each fake-backend fixture this writes one section with the source and
+what each path produced:
+
+  built-in static (AST)  Spark's own catalyst transpiler (pyTranspilers=catalyst)
+  bytecode -> SQL        the deterministic bytecode backend
+  AI (fake fixture)     the CI stand-in for AI output -- a live backend
+                        writes whatever the model produced (verified)
+
+Declines are shown as declines, with the reason -- that is half the story.
+
+  python examples/dump_results.py [--out questionable_benchmark_results/transpile_dump.md]
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import inspect
+import sys
+import textwrap
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from pyspark.sql import SparkSession  # noqa: E402
+from pyspark.sql.types import _parse_datatype_string  # noqa: E402
+from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
+
+from ai_udf_transpile.backends import fake  # noqa: E402
+from ai_udf_transpile.backends.base import BackendDecline  # noqa: E402
+from ai_udf_transpile.backends.bytecode import BytecodeBackend  # noqa: E402
+from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
+from ai_udf_transpile.sandbox import make_sandbox  # noqa: E402
+from ai_udf_transpile.targets import TranspileJob  # noqa: E402
+from ai_udf_transpile.types import _annotation_mapping, input_spark_types  # noqa: E402
+
+TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
+PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
+
+
+def _fixture_functions() -> list:
+    """Every function in the fake module that has a fixture rewrite."""
+    out = []
+    for name in dir(fake):
+        obj = getattr(fake, name)
+        if not callable(obj) or not hasattr(obj, "__code__"):
+            continue
+        try:
+            canon = canonical_source_from_func(obj)
+        except Exception:
+            continue
+        if canon in fake.FIXTURES:
+            out.append(obj)
+    return sorted(out, key=lambda f: f.__name__)
+
+
+def _ast_of(func) -> ast.FunctionDef:
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    return next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+
+
+def _types_of(func):
+    """(input spark types, return spark simple string) from annotations."""
+    node = _ast_of(func)
+    params = [arg.arg for arg in node.args.args]
+    in_types = input_spark_types(node, params)
+    mapped = _annotation_mapping(node.returns)
+    return in_types, (mapped[1] if mapped else None)
+
+
+def _safe(label: str, fn) -> list[str]:
+    """Run one transpiler path; a crash is a dump finding, not a dump death."""
+    try:
+        return [f"- **{label}**: `{fn()}`"]
+    except Exception as exc:
+        return [f"- **{label}**: error: {type(exc).__name__}: {exc}"]
+
+
+def _bytecode_result(func, in_types) -> str:
+    node = _ast_of(func)
+    params = [arg.arg for arg in node.args.args]
+    job = TranspileJob(
+        udf_key="dump",
+        source_text=canonical_source_from_func(func),
+        param_names=params,
+        input_types=in_types,
+        input_categories=["numeric"] * len(params),
+        return_type="string",
+        captures={},
+    )
+    try:
+        with make_sandbox(job) as sandbox:
+            return BytecodeBackend().run(job, sandbox).sql
+    except BackendDecline as exc:
+        return f"declined: {exc}"
+
+
+def _builtin_result(func, rtype_simple) -> str:
+    udf = UserDefinedFunction(func, _parse_datatype_string(rtype_simple))
+    if not udf.transpiled:
+        return "declined (the construction-time UserWarning carries the reason)"
+    return "  |  ".join(str(sql) for sql in udf.transpiled)
+
+
+def _ai_section(func) -> list[str]:
+    result = fake.FIXTURES[canonical_source_from_func(func)]
+    if result.sql:
+        return [f"- **AI (fake fixture)**: `{result.sql}`"]
+    return ["- **AI (fake fixture)**: java UDF:", "", "```java", result.java_source or "", "```"]
+
+
+def dump(spark, out_path: str) -> int:
+    spark.conf.set(TRANSPILE_CONF, "true")
+    spark.conf.set(PY_TRANSPLIERS_CONF, "catalyst")
+    funcs = _fixture_functions()
+    lines = [
+        "# What transpiles to what",
+        "",
+        f"{len(funcs)} fake-backend fixtures through all three paths. The AI",
+        "column is the deterministic CI stand-in; a live backend writes",
+        "whatever the model produced (still Hypothesis-verified before it is",
+        "served). Declines are results too.",
+        "",
+    ]
+    try:
+        for func in funcs:
+            in_types, rtype_simple = _types_of(func)
+            lines += [
+                f"## {func.__name__}",
+                "",
+                "```python",
+                canonical_source_from_func(func),
+                "```",
+                "",
+            ]
+            if in_types is None or rtype_simple is None:
+                lines += ["- **types**: unknown from annotations; skipped", ""]
+                continue
+            lines += _safe("built-in static (AST)", lambda f=func, r=rtype_simple: _builtin_result(f, r))
+            lines += _safe("bytecode \u2192 SQL", lambda f=func, t=in_types: _bytecode_result(f, t))
+            lines += _ai_section(func) + [""]
+    finally:
+        spark.conf.set(TRANSPILE_CONF, "false")
+        spark.conf.unset(PY_TRANSPLIERS_CONF)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text("\n".join(lines), encoding="utf-8")
+    print(f"wrote {out_path} ({len(funcs)} functions)")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--out",
+        default="questionable_benchmark_results/transpile_dump.md",
+        help="markdown output path",
+    )
+    args = parser.parse_args()
+    spark = (
+        SparkSession.builder.master("local[1]")
+        .appName("ai-udf-transpile-dump")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "1")
+        .config("spark.sql.ansi.enabled", "true")
+        .getOrCreate()
+    )
+    try:
+        return dump(spark, args.out)
+    finally:
+        spark.stop()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
