@@ -86,7 +86,16 @@ class _DecliningReportedBackend:
         raise BackendDecline("nope")
 
 
-def test_decline_records_reported_model(tmp_path):
+class _DecliningDetectedModelBackend:
+    name = "coco"
+
+    def run(self, job, sandbox):
+        exc = BackendDecline("nope")
+        exc.model = "glm-5.3"
+        raise exc
+
+
+def _run_decline(backend, tmp_path):
     cat = SqliteCatalog(tmp_path / "c.sqlite")
     src = canonical_source_from_func(always_decline)
     cat.insert_pending(
@@ -102,12 +111,23 @@ def test_decline_records_reported_model(tmp_path):
     )
     assert cat.claim("k", "coco")
     process_row(
-        cat, cat.get("k"), _DecliningReportedBackend(), spark=None, verify_fn=lambda **k: (True, None)
+        cat, cat.get("k"), backend, spark=None, verify_fn=lambda **k: (True, None)
     )
-    row = cat.get("k")
+    return cat.get("k")
+
+
+def test_decline_records_reported_model(tmp_path):
+    row = _run_decline(_DecliningReportedBackend(), tmp_path)
     assert row.status == "failed"
     assert "declined" in (row.error or "")
     assert row.model == "coco-unknown"
+
+
+def test_decline_records_detected_model(tmp_path):
+    row = _run_decline(_DecliningDetectedModelBackend(), tmp_path)
+    assert row.status == "failed"
+    assert "declined" in (row.error or "")
+    assert row.model == "glm-5.3"
 
 
 def test_poll_once_claims_one(tmp_path):

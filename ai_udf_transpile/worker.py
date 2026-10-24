@@ -174,8 +174,9 @@ def process_row(
         logger.info("transpile failed key=%s origin=%s: %s", key[:12], origin, err)
     except BackendDecline as exc:
         try:
+            detected = getattr(exc, "model", None)
             catalog.mark_failed(
-                key, f"declined: {exc}", origin=origin, model=model or _reported_model(backend)
+                key, f"declined: {exc}", origin=origin, model=detected or _reported_model(backend)
             )
         except Exception:
             logger.exception("failed to mark declined row %s", key)

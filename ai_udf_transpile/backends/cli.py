@@ -92,6 +92,41 @@ def _parse_claude_json(stdout: str) -> tuple[str, str]:
     return model, (result_text if isinstance(result_text, str) else "")
 
 
+def _parse_coco_json(stdout: str) -> tuple[str, str]:
+    """(model, result_text) from cortex's ``--format json`` NDJSON stdout.
+
+    Non-JSON (ANSI) preamble lines are skipped; ("", stdout) when none parse.
+    Under auto routing the CLI only ever reports "auto" -- pin an
+    agent-allowed -m model for a real name.
+    """
+    model = ""
+    result_text = ""
+    seen_json = False
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        seen_json = True
+        kind = data.get("type")
+        if kind == "assistant":
+            message = data.get("message")
+            if isinstance(message, dict) and message.get("model"):
+                model = str(message["model"])
+        elif kind == "system" and not model and data.get("model"):
+            model = str(data["model"])
+        elif kind == "result" and isinstance(data.get("result"), str):
+            result_text = data["result"]
+    if not seen_json:
+        return "", stdout
+    return model, result_text
+
+
 @dataclass(frozen=True)
 class CliSpec:
     name: str
@@ -100,6 +135,7 @@ class CliSpec:
     argv: ArgvBuilder
     model_conf_key: Optional[str] = None
     model_flag: Optional[str] = None
+    json_parser: Optional[Callable[[str], tuple[str, str]]] = None
 
 
 def coco_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
@@ -112,6 +148,8 @@ def coco_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
         "--workdir",
         str(sandbox),
         "--bypass",
+        "--format",
+        "json",
     ]
 
 
@@ -157,6 +195,7 @@ COCO_SPEC = CliSpec(
     argv=coco_argv,
     model_conf_key=conf.MODEL_COCO,
     model_flag="-m",
+    json_parser=_parse_coco_json,
 )
 PI_SPEC = CliSpec(
     name="pi",
@@ -181,6 +220,7 @@ CLAUDE_SPEC = CliSpec(
     argv=claude_argv,
     model_conf_key=conf.MODEL_CLAUDE,
     model_flag="--model",
+    json_parser=_parse_claude_json,
 )
 CODEX_SPEC = CliSpec(
     name="codex",
@@ -251,12 +291,14 @@ class CliBackend:
             # Still try to parse sandbox outputs; some CLIs exit non-zero after writing files.
             logger.debug("%s exit %s stderr=%s", self.name, completed.returncode, stderr[:500])
         model = self.model()
-        if self.spec.name == "claude":
-            detected, stdout = _parse_claude_json(stdout)
+        if self.spec.json_parser:
+            detected, stdout = self.spec.json_parser(stdout)
             model = model or detected
         try:
             result = parse_sandbox(sandbox, stdout)
-        except BackendDecline:
+        except BackendDecline as exc:
+            if model:
+                exc.model = model  # the worker records it on the declined row
             raise
         except Exception as exc:
             raise BackendError(f"{self.name} produced no rewrite: {exc}; stderr={stderr[:300]}") from exc

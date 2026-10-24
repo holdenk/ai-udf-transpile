@@ -9,7 +9,7 @@ import pytest
 from ai_udf_transpile import conf
 from ai_udf_transpile.backends.base import BackendDecline, BackendError
 from ai_udf_transpile.backends.claude import ClaudeBackend
-from ai_udf_transpile.backends.cli import _parse_claude_json, parse_sandbox
+from ai_udf_transpile.backends.cli import _parse_claude_json, _parse_coco_json, parse_sandbox
 from ai_udf_transpile.backends.coco import CocoBackend
 from ai_udf_transpile.backends.codex import CodexBackend
 from ai_udf_transpile.backends.cursor import CursorBackend
@@ -42,6 +42,7 @@ def test_coco_argv(tmp_path):
     assert "--file" in argv
     assert "--workdir" in argv
     assert "--bypass" in argv
+    assert argv[argv.index("--format") + 1] == "json"
     result = backend.run(None, tmp_path)  # job unused
     assert result.sql == "_udf_param_0 + 1"
     assert seen["cwd"] == str(tmp_path)
@@ -177,6 +178,121 @@ def test_coco_run_records_unknown_model(tmp_path):
     result = CocoBackend(runner=_sql_runner).run(None, tmp_path)
     assert result.sql == "_udf_param_0 + 1"
     assert result.model == "coco-unknown"
+
+
+def test_parse_coco_json_extracts_model_and_result():
+    stdout = "\n".join(
+        [
+            "\x1b[32m✓ Auto-apply [_CORTEX_CODE_ENGINEER]: 5 skill repos\x1b[0m",
+            json.dumps({"type": "system", "subtype": "init", "model": "auto"}),
+            json.dumps({"type": "assistant", "message": {"model": "auto", "role": "assistant"}}),
+            json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-5"}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "OUT.sql written"}),
+        ]
+    )
+    model, text = _parse_coco_json(stdout)
+    assert model == "claude-sonnet-5"  # last assistant record wins
+    assert text == "OUT.sql written"
+
+
+def test_parse_coco_json_passthrough_on_non_json():
+    model, text = _parse_coco_json("plain text output")
+    assert model == ""
+    assert text == "plain text output"
+
+
+def test_coco_run_records_detected_model(tmp_path):
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "system", "model": "auto"}),
+            json.dumps({"type": "assistant", "message": {"model": "glm-5.3"}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "done"}),
+        ]
+    )
+
+    def runner(argv, **kwargs):
+        (Path(kwargs["cwd"]) / "OUT.sql").write_text("_udf_param_0 + 1\n")
+        return _Completed(stdout=stdout)
+
+    result = CocoBackend(runner=runner).run(None, tmp_path)
+    assert result.sql == "_udf_param_0 + 1"  # OUT.sql beats the JSON result text
+    assert result.model == "glm-5.3"
+
+
+def test_coco_run_records_auto_when_routing(tmp_path):
+    # Under auto routing the CLI only ever says "auto" (modelUsage stays
+    # empty too); recording that beats an invented "coco-unknown".
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "system", "model": "auto"}),
+            json.dumps({"type": "assistant", "message": {"model": "auto"}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "done"}),
+        ]
+    )
+
+    def runner(argv, **kwargs):
+        (Path(kwargs["cwd"]) / "OUT.sql").write_text("_udf_param_0 + 1\n")
+        return _Completed(stdout=stdout)
+
+    result = CocoBackend(runner=runner).run(None, tmp_path)
+    assert result.model == "auto"
+
+
+def test_coco_decline_carries_detected_model(tmp_path):
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "assistant", "message": {"model": "glm-5.3"}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "DECLINE"}),
+        ]
+    )
+
+    def runner(argv, **kwargs):
+        (Path(kwargs["cwd"]) / "OUT.sql").write_text("DECLINE\n")
+        return _Completed(stdout=stdout)
+
+    with pytest.raises(BackendDecline) as excinfo:
+        CocoBackend(runner=runner).run(None, tmp_path)
+    assert excinfo.value.model == "glm-5.3"
+
+
+def test_claude_decline_carries_detected_model(tmp_path):
+    payload = json.dumps({"result": "DECLINE", "modelUsage": {"claude-x": {}}})
+
+    def runner(argv, **kwargs):
+        return _Completed(stdout=payload)
+
+    with pytest.raises(BackendDecline) as excinfo:
+        ClaudeBackend(runner=runner).run(None, tmp_path)
+    assert excinfo.value.model == "claude-x"
+
+
+def test_coco_configured_model_beats_detected(tmp_path):
+    conf.set_value(conf.MODEL_COCO, "snow-intelligence-x")
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "assistant", "message": {"model": "glm-5.3"}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "done"}),
+        ]
+    )
+
+    def runner(argv, **kwargs):
+        (Path(kwargs["cwd"]) / "OUT.sql").write_text("_udf_param_0 + 1\n")
+        return _Completed(stdout=stdout)
+
+    result = CocoBackend(runner=runner).run(None, tmp_path)
+    assert result.model == "snow-intelligence-x"
+
+
+def test_coco_no_result_record_is_an_error_not_a_decline(tmp_path):
+    # A stream with no result record is a crashed/killed CLI run, not a
+    # decision: BackendError retries, a decline would cool down for 24h.
+    stdout = json.dumps({"type": "assistant", "message": {"model": "glm-5.3"}})
+
+    def runner(argv, **kwargs):
+        return _Completed(stdout=stdout)
+
+    with pytest.raises(BackendError):
+        CocoBackend(runner=runner).run(None, tmp_path)
 
 
 def test_claude_run_records_unknown_model_without_json(tmp_path):
