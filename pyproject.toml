@@ -50,7 +50,9 @@ ai_udf_transpile = ["resources/prompt.md", "java/*.java"]
 line-length = 110
 target-version = "py311"
 # Generated benchmark output (CSVs, dumps, aggregate PNGs): not source.
-extend-exclude = ["questionable_benchmark_results"]
+# EXAMPLES_TRANSPILED.md is generated too -- its python fences are the
+# fixture sources verbatim, which ruff format would rewrite.
+extend-exclude = ["questionable_benchmark_results", "docs/EXAMPLES_TRANSPILED.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
