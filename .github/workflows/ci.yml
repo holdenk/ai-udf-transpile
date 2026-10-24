@@ -9,9 +9,16 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Bump a pin to move CI onto a new engine. The build caches key on the
+  # SHA, so a bump means exactly one rebuild, not a rebuild every time
+  # upstream moves. These are the SHAs the dev box runs against.
+  SPARK_REF: "10a34a06707851ce0ab0afebee3d6c19cb757f27"
+  COMET_REF: "330b29cf1013351cd9d7e93d3d37a6bc0b6d956b"
+
 jobs:
   unit:
-    name: lint and unit (no Spark)
+    name: lint and unit (no JVM)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -31,23 +38,20 @@ jobs:
           AI_UDF_TRANSPILE_MAX_EXAMPLES: "5"
         run: pytest -m "not spark" tests/
 
-  spark:
-    name: Spark master package + tests
+  spark-build:
+    name: Spark build (pinned, cached)
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
       MAVEN_OPTS: "-Xmx4g -XX:ReservedCodeCacheSize=1g"
-      SPARK_LOCAL_IP: "127.0.0.1"
-      AI_UDF_TRANSPILE_BACKEND: fake
-      AI_UDF_TRANSPILE_MAX_EXAMPLES: "5"
     steps:
-      - uses: actions/checkout@v4
-      - name: Checkout Apache Spark master
+      - name: Checkout Apache Spark (pinned)
         uses: actions/checkout@v4
         with:
           repository: apache/spark
           path: spark
-          ref: master
+          ref: ${{ env.SPARK_REF }}
+          fetch-depth: 1
       - name: Spark SHA
         id: spark
         run: echo "sha=$(git -C spark rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -55,9 +59,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
       - name: Cache Maven repo
         uses: actions/cache@v4
         with:
@@ -86,6 +87,52 @@ jobs:
         if: steps.spark-cache.outputs.cache-hit != 'true'
         working-directory: spark
         run: ./build/mvn -T1C -DskipTests -Phadoop-3 package -pl sql/core,assembly -am
+
+  spark-tests:
+    name: Spark tests
+    needs: spark-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SPARK_LOCAL_IP: "127.0.0.1"
+      AI_UDF_TRANSPILE_BACKEND: fake
+      AI_UDF_TRANSPILE_MAX_EXAMPLES: "5"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Apache Spark (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: apache/spark
+          path: spark
+          ref: ${{ env.SPARK_REF }}
+          fetch-depth: 1
+      - name: Spark SHA
+        id: spark
+        run: echo "sha=$(git -C spark rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Restore Spark build
+        uses: actions/cache@v4
+        with:
+          path: |
+            spark/assembly/target
+            spark/sql/core/target
+            spark/sql/catalyst/target
+            spark/core/target
+            spark/common/sketch/target
+            spark/common/kvstore/target
+            spark/common/network-common/target
+            spark/common/network-shuffle/target
+            spark/common/unsafe/target
+            spark/common/utils/target
+            spark/common/tags/target
+            spark/launcher/target
+          key: spark-${{ steps.spark.outputs.sha }}-${{ runner.os }}-java17-sql-core
       - name: Install Python deps
         run: pip install -e ".[dev]"
       - name: Pytest with Spark
@@ -95,7 +142,7 @@ jobs:
           export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
           pytest tests/ -v -rs
       # Reduced-settings E2E canary: proves the transpile pipeline works on a
-      # fresh Spark master build and produces the CSV for slides. always() so
+      # fresh Spark build and produces the CSV for slides. always() so
       # a pytest flake doesn't hide a real bench regression (or vice versa).
       - name: Micro benchmark (reduced)
         if: always()
@@ -112,3 +159,126 @@ jobs:
           name: bench-micro-csv
           path: bench_micro.csv
           if-no-files-found: ignore
+
+  comet-tests:
+    name: Comet tests
+    needs: spark-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SPARK_LOCAL_IP: "127.0.0.1"
+      AI_UDF_TRANSPILE_BACKEND: fake
+      AI_UDF_TRANSPILE_MAX_EXAMPLES: "5"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Apache Spark (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: apache/spark
+          path: spark
+          ref: ${{ env.SPARK_REF }}
+          fetch-depth: 1
+      - name: Spark SHA
+        id: spark
+        run: echo "sha=$(git -C spark rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Checkout DataFusion Comet (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: apache/datafusion-comet
+          path: comet
+          ref: ${{ env.COMET_REF }}
+          fetch-depth: 1
+      - name: Comet SHA
+        id: comet
+        run: echo "sha=$(git -C comet rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler maven
+      - name: Restore Spark build
+        uses: actions/cache@v4
+        with:
+          path: |
+            spark/assembly/target
+            spark/sql/core/target
+            spark/sql/catalyst/target
+            spark/core/target
+            spark/common/sketch/target
+            spark/common/kvstore/target
+            spark/common/network-common/target
+            spark/common/network-shuffle/target
+            spark/common/unsafe/target
+            spark/common/utils/target
+            spark/common/tags/target
+            spark/launcher/target
+          key: spark-${{ steps.spark.outputs.sha }}-${{ runner.os }}-java17-sql-core
+      - name: Cache Comet build
+        uses: actions/cache@v4
+        id: comet-cache
+        with:
+          path: |
+            ~/.cargo
+            comet/spark/target
+          key: comet-${{ steps.comet.outputs.sha }}-${{ env.SPARK_REF }}-${{ runner.os }}
+          restore-keys: comet-
+      - name: Restore Maven repo
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ steps.spark.outputs.sha }}-${{ runner.os }}
+          restore-keys: m2-
+      - name: Build Comet (skip when cached)
+        if: steps.comet-cache.outputs.cache-hit != 'true'
+        env:
+          SPARK_HOME: ${{ github.workspace }}/spark
+        run: |
+          export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
+          ./examples/setup_comet.sh --comet-home comet --spark-home "$SPARK_HOME" \
+            --ref ${{ env.COMET_REF }} --write-env-file comet.env
+          # comet.env is shell-export format; $GITHUB_ENV wants NAME=value.
+          sed 's/^export //; s/"//g' comet.env >> "$GITHUB_ENV"
+      - name: Resolve Comet jar (cached path)
+        if: steps.comet-cache.outputs.cache-hit == 'true'
+        env:
+          SPARK_HOME: ${{ github.workspace }}/spark
+        run: |
+          export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
+          ./examples/setup_comet.sh --comet-home comet --spark-home "$SPARK_HOME" \
+            --ref ${{ env.COMET_REF }} --skip-build --write-env-file comet.env
+          sed 's/^export //; s/"//g' comet.env >> "$GITHUB_ENV"
+      - name: Install Python deps
+        run: pip install -e ".[dev]"
+      - name: Pytest with Comet
+        env:
+          SPARK_HOME: ${{ github.workspace }}/spark
+          AI_UDF_TRANSPILE_TEST_COMET_JAR: ${{ env.COMET_JAR }}
+        run: |
+          export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
+          export PYSPARK_PYTHON="$(which python)" PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
+          pytest tests/ -v -rs
+      - name: Micro benchmark with Comet (reduced)
+        if: always()
+        env:
+          SPARK_HOME: ${{ github.workspace }}/spark
+          AI_UDF_TRANSPILE_COMET_JAR: ${{ env.COMET_JAR }}
+        run: |
+          export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
+          export PYSPARK_PYTHON="$(which python)" PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
+          python examples/bench_micro.py 100000 --rounds 1 --rust-accel --csv bench_micro_comet.csv
+      - name: Upload Comet benchmark CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-micro-comet-csv
+          path: bench_micro_comet.csv
+          if-no-files-found: ignore
+
+  # Eventually: a GPU child (needs: spark-build) running the same suite on a
+  # GPU runner with the Rapids jar, exactly like comet-tests but with
+  # AI_UDF_TRANSPILE_TEST_GPU_JAR and the spark.rapids confs.

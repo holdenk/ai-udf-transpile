@@ -90,7 +90,7 @@ def spark():
     os.environ["PYSPARK_PYTHON"] = sys.executable
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
     try:
-        session = (
+        builder = (
             SparkSession.builder.master("local[1]")
             .appName("ai-udf-transpile-tests")
             .config("spark.ui.enabled", "false")
@@ -100,10 +100,29 @@ def spark():
             .config("spark.driver.bindAddress", "127.0.0.1")
             .config("spark.pyspark.python", sys.executable)
             .config("spark.pyspark.driver.python", sys.executable)
-            .getOrCreate()
         )
+        for key, value in _comet_configs():
+            builder = builder.config(key, value)
+        session = builder.getOrCreate()
         session.range(1).count()
     except Exception as exc:
         outcome(f"Spark session unavailable: {exc}")
     yield session
     session.stop()
+
+
+def _comet_configs() -> list[tuple[str, str]]:
+    """CI's comet child points the test session at a Comet jar via env.
+
+    Unset (the default everywhere) or dangling jar: no comet, plain Spark.
+    """
+    jar = os.environ.get("AI_UDF_TRANSPILE_TEST_COMET_JAR", "")
+    if not jar or not Path(jar).exists():
+        return []
+    return [
+        ("spark.jars", jar),
+        ("spark.plugins", "org.apache.spark.CometPlugin"),
+        ("spark.comet.enabled", "true"),
+        ("spark.memory.offHeap.enabled", "true"),
+        ("spark.memory.offHeap.size", "1g"),
+    ]
