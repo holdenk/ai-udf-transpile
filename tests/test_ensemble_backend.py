@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai_udf_transpile.backends.base import BackendDecline
+from ai_udf_transpile.backends.base import BackendDecline, BackendError
 from ai_udf_transpile.backends.ensemble import EnsembleBackend
 from ai_udf_transpile.backends.fake import plus_one
 from ai_udf_transpile.keys import canonical_source_from_func
@@ -91,6 +91,36 @@ def test_ensemble_raises_when_all_decline():
         with pytest.raises(BackendDecline):
             ensemble.run(job, sandbox)
     assert ensemble.candidates == []
+
+
+class _ErrorBackend:
+    name = "error"
+
+    def run(self, job, sandbox):
+        raise BackendError("rate limited")
+
+
+def test_ensemble_all_errored_is_a_retryable_error_not_a_decline():
+    # A transient failure on every sub-backend must not burn a 24h decline
+    # cooldown on the row.
+    ensemble = EnsembleBackend(backends=["e1", "e2"])
+    ensemble._sub_backends = lambda: [("e1", _ErrorBackend()), ("e2", _ErrorBackend())]
+    job = _job_for(plus_one)
+    with make_sandbox(job) as sandbox:
+        with pytest.raises(BackendError, match="rate limited"):
+            ensemble.run(job, sandbox)
+    assert ensemble.candidates == []
+
+
+def test_ensemble_decline_and_error_still_raises_error():
+    # All declined + one errored: retry, because the errored sub-backend
+    # never got its turn to speak -- the decline alone is not the story.
+    ensemble = EnsembleBackend(backends=["d1", "e1"])
+    ensemble._sub_backends = lambda: [("d1", _DeclineBackend()), ("e1", _ErrorBackend())]
+    job = _job_for(plus_one)
+    with make_sandbox(job) as sandbox:
+        with pytest.raises(BackendError):
+            ensemble.run(job, sandbox)
 
 
 def test_ensemble_reported_model_is_none():

@@ -8,7 +8,9 @@ bench_tpcds_udfs), normalizes each arm to a speedup vs interpreted python, and
 draws one horizontal strip per path: every point is one (benchmark, function)
 pair, so the honest picture includes the stragglers. Fallback rows (a declined
 pattern running python perf under the transpiled label) are excluded -- they
-are declines, not rewrites. Writes bench_aggregate.png plus a _log sibling.
+are declines, not rewrites. A CSV with `comet` in its filename plots on its own
+comet arms (never mixed into the plain rows); arms without a comet variant are
+skipped with a warning. Writes bench_aggregate.png plus a _log sibling.
 
 No AI in the loop, ever: CSV in, PNG out.
 """
@@ -85,8 +87,17 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
                     continue  # declined/failed arm: no number, no point
                 if guard and row.get(guard[0]) == guard[1]:
                     continue  # python fallback perf, not a rewrite
-                key = f"{arm}_comet" if comet and f"{arm}_comet" in ARMS else arm
-                points[key].append((f"{bench}/{row['function']}", float(raw)))
+                if comet:
+                    variant = f"{arm}_comet"
+                    if variant not in ARMS:
+                        # Folding a rust-accelerated point into the plain
+                        # arm is exactly the mixing this chart exists to
+                        # avoid; skip loudly instead.
+                        print(f"skipping {path.name}: no {variant} arm", file=sys.stderr)
+                        continue
+                    points[variant].append((f"{bench}/{row['function']}", float(raw)))
+                else:
+                    points[arm].append((f"{bench}/{row['function']}", float(raw)))
     return points
 
 

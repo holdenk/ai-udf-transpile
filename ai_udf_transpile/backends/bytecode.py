@@ -57,6 +57,12 @@ _COMPARE_OPS: dict[str, str] = {
 
 # input_types -> truthiness class. "other" params are declined if a jump
 # or `not` consumes them (no faithful generic SQL).
+
+# Budget on branch-path walks: _branch re-walks the shared tail once per
+# path, so N sequential branch points can mean 2^N walks. Real UDFs use a
+# handful; past this the backend declines instead of hanging the worker.
+_RANGE_EVAL_BUDGET = 2_000
+
 _TRUTH_KINDS: dict[str, str] = {
     "boolean": "bool",
     "bool": "bool",
@@ -130,6 +136,7 @@ class _Evaluator:
 
     def evaluate(self, instrs: list[dis.Instruction]) -> Optional[_Entry]:
         self._idx = {ins.offset: n for n, ins in enumerate(instrs)}
+        self._budget = _RANGE_EVAL_BUDGET
         return self._eval_range(instrs, 0, len(instrs), [])
 
     def _eval_range(
@@ -139,6 +146,13 @@ class _Evaluator:
         end: int,
         stack: list[_Entry],
     ) -> Optional[_Entry]:
+        # Every branch walks its shared tail once per path, so N branch
+        # points can mean 2^N walks. Real UDFs use a handful; the budget
+        # turns a pathological if/elif chain into a decline instead of a
+        # driver hang.
+        self._budget -= 1
+        if self._budget < 0:
+            raise BackendDecline(f"more than {_RANGE_EVAL_BUDGET} branch paths -- too many jumps")
         i = start
         while i < end:
             ins = instrs[i]
@@ -175,7 +189,7 @@ class _Evaluator:
                 i += 1
                 continue
             if op == "SWAP":
-                n = ins.arg or 1
+                n = ins.arg or 2  # dead in 3.13 (SWAP arg >= 2); keep the honest default
                 stack[-1], stack[-n] = stack[-n], stack[-1]
                 i += 1
                 continue

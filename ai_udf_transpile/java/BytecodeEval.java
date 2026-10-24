@@ -183,8 +183,15 @@ public final class BytecodeEval {
                         next = arg;
                     }
                     break;
-                case OP_RETURN:
-                    return stack[sp - 1];
+                case OP_RETURN: {
+                    Object result = stack[sp - 1];
+                    // Do not retain the last row's objects on a long-lived
+                    // executor thread.
+                    for (int j = 0; j < sp; j++) {
+                        stack[j] = null;
+                    }
+                    return result;
+                }
                 case OP_POP:
                     sp--;
                     break;

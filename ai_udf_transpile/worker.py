@@ -117,6 +117,20 @@ def process_row(
             party_on_strings=party_on_strings,
         )
         if ok:
+            if (
+                not party_on_strings
+                and any(t.strip().lower() == "string" for t in row.input_types)
+                and not samples
+            ):
+                # partyOnStrings is off and nothing was sampled: this row's
+                # "verified" rests on NULL-only string evidence. That is the
+                # documented default, but a silent sampling gap should at
+                # least be visible in the logs.
+                logger.warning(
+                    "verified %s with no string evidence (partyOnStrings off, no samples); "
+                    "string columns may be unexercised",
+                    key[:12],
+                )
             # Provisional until the smoke test passes, so a concurrent query
             # does not pick up a rewrite that fails plan analysis.
             catalog.mark_success(
@@ -126,13 +140,15 @@ def process_row(
             # The standalone worker does not go through enable(), so pin both
             # or the smoke test no-ops and a bad rewrite is promoted. Only pin
             # when unset: a shutdown()+enable() cycle that raced this thread
-            # must not have the dead catalog stomp the fresh one.
+            # must not have the dead catalog stomp the fresh one. The lock
+            # makes the check-then-set atomic against another worker thread.
             from ai_udf_transpile.transpiler import get_catalog, set_catalog, set_session
 
-            if get_catalog() is None:
-                set_catalog(catalog)
-                if spark is not None:
-                    set_session(spark)
+            with _thread_lock:
+                if get_catalog() is None:
+                    set_catalog(catalog)
+                    if spark is not None:
+                        set_session(spark)
             smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
                 spark,
                 source_text=row.source_text,

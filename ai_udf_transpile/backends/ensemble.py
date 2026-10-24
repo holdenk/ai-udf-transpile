@@ -73,7 +73,12 @@ class EnsembleBackend:
             self.candidates.append((name, model, result))
             logger.info("ensemble: %s (model=%s) produced a candidate", name, model)
         if not self.candidates:
-            detail = "; ".join(errors) if errors else "all sub-backends declined"
-            raise BackendDecline(f"ensemble: no candidate from {self._backend_names}: {detail}")
+            if errors:
+                # A sub-backend that errored (rate limit, auth, crash) is a
+                # transient failure: retry, do not burn a 24h decline
+                # cooldown on it the way an all-declined outcome deserves.
+                detail = "; ".join(errors)
+                raise BackendError(f"ensemble: no candidate from {self._backend_names}: {detail}")
+            raise BackendDecline(f"ensemble: no candidate from {self._backend_names}: all declined")
         # First success wins for the catalog; all candidates stay on self.
         return self.candidates[0][2]

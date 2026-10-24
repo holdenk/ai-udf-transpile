@@ -167,6 +167,7 @@ so you can see which models to prioritize:
 ```python
 from ai_udf_transpile.model_stats import collect_stats, format_stats_table
 
+# SQLite catalog only -- this reaches into the cache table directly.
 stats = collect_stats(catalog)
 print(format_stats_table(stats))
 # backend      model                     succ  fail other total   rate

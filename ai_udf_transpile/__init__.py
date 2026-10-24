@@ -107,7 +107,10 @@ def enable(
     # conf values the caller set before enable().
     if backend is not None or os.environ.get("AI_UDF_TRANSPILE_BACKEND"):
         conf.set_value(conf.BACKEND, chosen_backend, spark)
-    if os.environ.get("AI_UDF_TRANSPILE_MAX_EXAMPLES") or os.environ.get("GITHUB_ACTIONS") == "true":
+    # Stamp only an explicit env choice: get_value's default path already
+    # returns 5 under GITHUB_ACTIONS, so a blanket stamp would shadow a
+    # spark.conf value a caller set in their own GA workflow.
+    if os.environ.get("AI_UDF_TRANSPILE_MAX_EXAMPLES"):
         conf.set_value(conf.MAX_EXAMPLES, conf.default_max_examples(), spark)
 
     try:

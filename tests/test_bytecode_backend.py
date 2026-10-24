@@ -376,6 +376,25 @@ def test_off_313_declines_fail_closed(monkeypatch):
         _run(plus_one)
 
 
+def test_branch_explosion_declines_instead_of_hanging():
+    # 30 sequential branches would be 2^30 tail walks without the budget.
+    body = "def f(x: int) -> int:\n"
+    for i in range(30):
+        body += f"    if x > {i}:\n        pass\n"
+    body += "    return x\n"
+    job = TranspileJob(
+        udf_key="k",
+        source_text=body,
+        param_names=["x"],
+        input_types=["bigint"],
+        input_categories=["numeric"],
+        return_type="bigint",
+        captures={},
+    )
+    with pytest.raises(BackendDecline, match="branch paths"):
+        BytecodeBackend().run(job, make_sandbox(job).__enter__())
+
+
 def test_out_sql_written():
     backend = BytecodeBackend()
     job = _job_for(plus_one)
