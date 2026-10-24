@@ -34,6 +34,26 @@ def test_aggregate_collects_and_excludes_fallbacks(tmp_path):
         )
         w.writerow(["ok", "static", 1_000_000, 5_000_000, "", "", 5.0, "", "", True, False, False])
         w.writerow(["fell", "static", 1_000_000, 1_000_000, "", "", 1.0, "", "", False, False, False])
+    # A comet run of the same schema: its points land on separate arms.
+    with open(tmp_path / "bench_micro_comet.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "function",
+                "kinds",
+                "regular_rows_per_second",
+                "transpiled_static_rows_per_second",
+                "transpiled_ai_catalyst_rows_per_second",
+                "transpiled_ai_java_rows_per_second",
+                "static_speedup_vs_regular",
+                "ai_catalyst_speedup_vs_regular",
+                "ai_java_speedup_vs_regular",
+                "transpile_succeeded_static",
+                "transpile_succeeded_ai_catalyst",
+                "transpile_succeeded_ai_java",
+            ]
+        )
+        w.writerow(["ok", "static", 1_000_000, 20_000_000, "", "", 20.0, "", "", True, False, False])
     # A bytecode-schema CSV.
     with open(tmp_path / "bench_bc.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -68,6 +88,9 @@ def test_aggregate_collects_and_excludes_fallbacks(tmp_path):
     assert "2 points, best 10.0x" in proc.stdout
     assert "bytecode → SQL (static)" in proc.stdout
     assert "1 points, best 12.0x" in proc.stdout
+    # The comet CSV lands on its own arm, not mixed into the plain one.
+    assert "static (built-in AST, Comet)" in proc.stdout
+    assert "best 20.0x" in proc.stdout
 
 
 def test_aggregate_rejects_unrecognized_csv(tmp_path):

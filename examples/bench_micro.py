@@ -72,6 +72,13 @@ PARTITIONS = os.cpu_count() or 16
 RUST_COMET_CONFS = {
     "spark.plugins": "org.apache.spark.CometPlugin",
     "spark.comet.enabled": "true",
+    # No CometShuffleManager (the earlier tweak dropped it): without this
+    # flag Comet disables its extension entirely on session start, and
+    # --rust-accel silently measures plain Spark. These benches are
+    # projections with no shuffle, so the default manager costs nothing.
+    "spark.comet.shuffle.enabled": "false",
+    # spark.range(...) is every bench frame's leaf scan.
+    "spark.comet.exec.range.enabled": "true",
     "spark.comet.explain.fallback.enabled": "true",
     "spark.memory.offHeap.enabled": "true",
     "spark.memory.offHeap.size": "2g",

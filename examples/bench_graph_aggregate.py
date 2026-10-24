@@ -34,6 +34,11 @@ ARMS = {
     "ai_java": ("AI: Java UDF", "tab:green"),
     "vanilla": ("vanilla SQL (tpcds patterns)", "tab:gray"),
     "transpiled": ("transpiled (tpcds patterns)", "tab:brown"),
+    # Comet-accelerated variants get their own rows: a rust-native point
+    # next to the plain one is the story, not noise in the same row.
+    "static_comet": ("static (built-in AST, Comet)", "tab:blue"),
+    "ai_catalyst_comet": ("AI: Catalyst SQL, Comet", "tab:purple"),
+    "ai_java_comet": ("AI: Java UDF, Comet", "tab:green"),
 }
 
 # csv signature column -> [(arm, speedup column, (fallback flag col, skip value))]
@@ -72,6 +77,7 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
             print(f"skipping {path.name}: unrecognized schema", file=sys.stderr)
             continue
         bench = path.stem.replace("bench_", "").replace("_", " ")
+        comet = "comet" in path.stem
         for row in rows:
             for arm, speedup_col, guard in specs:
                 raw = row.get(speedup_col, "")
@@ -79,7 +85,8 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
                     continue  # declined/failed arm: no number, no point
                 if guard and row.get(guard[0]) == guard[1]:
                     continue  # python fallback perf, not a rewrite
-                points[arm].append((f"{bench}/{row['function']}", float(raw)))
+                key = f"{arm}_comet" if comet and f"{arm}_comet" in ARMS else arm
+                points[key].append((f"{bench}/{row['function']}", float(raw)))
     return points
 
 
