@@ -302,8 +302,7 @@ running a backend. Write-back is append-only (reads dedupe by latest
 or unreachable catalog never breaks UDFs. `catalog=delta` (Delta Lake
 on the classpath) still exists but is no longer the shared story.
 Trust caveat: a served row is served as-is (no re-verification), so anyone
-who can append to that table can run SQL and Java in every reader's driver
-(see `docs/future-iceberg-udf-catalog.md`).
+who can append to that table can run SQL and Java in every reader's driver.
 
 Failed rewrites cool down for 24h (`failCooldownSeconds`) and stop retrying
 after `maxRetries` (default 3).
