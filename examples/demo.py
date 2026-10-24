@@ -27,6 +27,8 @@ from pyspark.sql.types import ArrayType, BooleanType, IntegerType, LongType, Str
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, register_impl, shutdown  # noqa: E402
+from ai_udf_transpile.backends import ai_backend  # noqa: E402
+from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
 
 
@@ -222,14 +224,25 @@ def always_decline(x: int) -> int:
 _TIMEOUTS: list[str] = []
 
 
-def wait_transpiled(desc, func, rtype, timeout=120):
+def gave_up(func) -> bool:
+    """The backend already failed func; failed rows cool down instead of re-queueing."""
+    catalog = get_catalog()
+    catalog = getattr(catalog, "_staging", catalog)  # write-back wraps the sqlite catalog
+    with catalog._lock:
+        row = catalog._conn.execute(
+            "SELECT status FROM cache WHERE source_text = ?", (canonical_source_from_func(func),)
+        ).fetchone()
+    return row is not None and row[0] == "failed"
+
+
+def wait_transpiled(desc, func, rtype, timeout=900):
     """Poll a fresh UDF until the cache hit transpiles it; return the last UDF.
 
     A timeout is recorded so main() can exit non-zero (run_demos.sh keys on it).
     """
     deadline = time.time() + timeout
     udf = UserDefinedFunction(func, rtype)
-    while time.time() < deadline and not udf.transpiled:
+    while time.time() < deadline and not udf.transpiled and not gave_up(func):
         time.sleep(1.0)
         udf = UserDefinedFunction(func, rtype)
     if not udf.transpiled:
@@ -237,7 +250,7 @@ def wait_transpiled(desc, func, rtype, timeout=120):
     return udf
 
 
-def wait_for_status(catalog, key, want, timeout=120):
+def wait_for_status(catalog, key, want, timeout=900):
     deadline = time.time() + timeout
     while time.time() < deadline:
         row = catalog.get(key)
@@ -259,14 +272,16 @@ def main() -> int:
         .config("spark.sql.ansi.enabled", "true")
         .getOrCreate()
     )
-    sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-demo-"), "cache.sqlite")
-    enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
+    sqlite = os.environ.get("AI_UDF_TRANSPILE_SQLITE") or os.path.join(
+        tempfile.mkdtemp(prefix="ai-udf-demo-"), "cache.sqlite"
+    )
+    enable(spark, sqlite_path=sqlite, backend=ai_backend(spark), inline_worker=True)
     catalog = get_catalog()
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     # greet/upper/zfill raise on NULL, and those parameters are text.
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
 
-    print("=== WORKING CASES (fake backend fixtures, Hypothesis-verified) ===")
+    print("=== WORKING CASES (Hypothesis-verified) ===")
     df = spark.createDataFrame([(1,), (41,), (None,)], ["x"])
 
     for func, rtype in [
@@ -511,10 +526,10 @@ def main() -> int:
     cur = catalog._conn.execute("SELECT udf_key FROM cache WHERE source_text LIKE '%always_decline%'")
     found = cur.fetchone()
     if found:
-        row = wait_for_status(catalog, found[0], "failed", timeout=60)
+        row = wait_for_status(catalog, found[0], "failed")
         print(
             f"always_decline: status={row.status} origin={row.origin} backend={row.backend} "
-            f"error={row.error!r} (no fixture -> failed, cooldown applies)"
+            f"error={row.error!r} (declined -> failed, cooldown applies)"
         )
     before = catalog.count()
     UserDefinedFunction(always_decline, LongType())
@@ -522,7 +537,7 @@ def main() -> int:
 
     # boto3 KMS encryption: untranspilable by nature (service call per row,
     # non-deterministic ciphertext). The type gate queues it (it is fully
-    # annotated), the fake backend declines, and even a hallucinated rewrite
+    # annotated), the backend declines, and even a hallucinated rewrite
     # fails closed: python raises on every example in an environment without
     # boto3/credentials, and verification requires at least one successful
     # python evaluation -- otherwise "python raise + sql value allowed"
@@ -531,10 +546,10 @@ def main() -> int:
     cur = catalog._conn.execute("SELECT udf_key FROM cache WHERE source_text LIKE '%kms_encrypt%'")
     found = cur.fetchone()
     if found:
-        row = wait_for_status(catalog, found[0], "failed", timeout=60)
+        row = wait_for_status(catalog, found[0], "failed")
         print(
             f"kms_encrypt (boto3 KMS per row): status={row.status} origin={row.origin} "
-            f"backend={row.backend} error={row.error!r} (no fixture -> failed, cooldown applies)"
+            f"backend={row.backend} error={row.error!r} (declined -> failed, cooldown applies)"
         )
     try:
         register_impl(
@@ -771,7 +786,7 @@ def main() -> int:
     enable(
         spark,
         sqlite_path=os.path.join(tempfile.mkdtemp(prefix="ai-udf-demo-wb-"), "cache.sqlite"),
-        backend="fake",
+        backend=ai_backend(spark),
         inline_worker=True,
     )
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
@@ -797,7 +812,7 @@ def main() -> int:
     enable(
         spark,
         sqlite_path=os.path.join(tempfile.mkdtemp(prefix="ai-udf-demo-wb-reader-"), "cache.sqlite"),
-        backend="fake",
+        backend=ai_backend(spark),
         inline_worker=True,
     )
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
@@ -812,7 +827,7 @@ def main() -> int:
     spark.stop()
     if _TIMEOUTS:
         for note in _TIMEOUTS:
-            print(f"TIMED OUT: {note}")
+            print(f"NOT TRANSPILED: {note}")
         return 1
     return 0
 

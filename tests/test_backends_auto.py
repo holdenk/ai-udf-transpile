@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from ai_udf_transpile import conf
-from ai_udf_transpile.backends import BackendError, pick_auto
+from ai_udf_transpile.backends import BackendError, ai_backend, pick_auto
 
 
 @pytest.fixture(autouse=True)
@@ -55,3 +55,18 @@ def test_pick_auto_reports_unknown_priority_names(monkeypatch):
     text = str(err.value)
     assert "unknown names" in text
     assert "wut" in text and "nope" in text
+
+
+@pytest.mark.parametrize("name", ["fake", "bytecode"])
+def test_ai_backend_refuses_non_ai(monkeypatch, name):
+    monkeypatch.setenv("AI_UDF_TRANSPILE_BACKEND", name)
+    with pytest.raises(BackendError, match="not an AI backend"):
+        ai_backend()
+
+
+def test_ai_backend_env_then_auto(monkeypatch):
+    monkeypatch.setenv("AI_UDF_TRANSPILE_BACKEND", "Claude")
+    assert ai_backend() == "claude"
+    monkeypatch.delenv("AI_UDF_TRANSPILE_BACKEND")
+    monkeypatch.setattr("ai_udf_transpile.backends.shutil.which", lambda binary: f"/tmp/{binary}")
+    assert ai_backend() == "coco"

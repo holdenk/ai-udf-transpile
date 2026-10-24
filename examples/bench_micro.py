@@ -7,11 +7,12 @@ Up to four arms per function on one local SparkSession:
   static        Spark's BUILT-IN catalyst transpiler (pyTranspilers=catalyst,
                 plugin not enabled) -- it converts simple operations only;
                 anything it declines gets no static number, just the boolean
-  ai catalyst   backend-generated Catalyst SQL (fake backend, inline worker)
+  ai catalyst   backend-generated Catalyst SQL (inline worker)
   ai java udf   backend-generated Java UDF (compiled on the driver); the
                 java target is a *_java twin -- same body, different def
                 name, so its canonical source maps to a different catalog
-                key and its own fixture. Slower per row than Catalyst SQL
+                key. Only the fake fixtures pin it to Java; a real backend
+                picks its own target. Slower per row than Catalyst SQL
                 for cheap ops, but it is a target for every convertible
                 benched UDF.
 
@@ -56,8 +57,8 @@ from pyspark.sql.types import LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
+from ai_udf_transpile.backends import ai_backend  # noqa: E402
 from ai_udf_transpile.backends.fake import (  # noqa: E402
-    FIXTURES,
     always_decline,
     backwards_java,
     edit_distance_java,
@@ -128,20 +129,6 @@ JAVA_TWINS = {
     "edit_distance": edit_distance_java,
 }
 
-for _f in (
-    plus_one,
-    backwards,
-    zfill3,
-    edit_distance,
-    plus_one_java,
-    backwards_java,
-    zfill3_java,
-    edit_distance_java,
-):
-    # The ai arms need a fake fixture for each benched function (both target
-    # kinds); fail at import rather than as a surprise decline mid-bench.
-    assert canonical_source_from_func(_f) in FIXTURES, f"no fake fixture for {_f.__name__}"
-
 
 def noop_seconds(df) -> float:
     start = time.perf_counter()
@@ -151,23 +138,22 @@ def noop_seconds(df) -> float:
 
 def wait_for_catalog_result(
     catalog, source_text: str, timeout: float = 10.0
-) -> tuple[str, str | None, str | None]:
+) -> tuple[str, str | None, str | None, str | None, str | None]:
+    """(status, backend, model, target_kind, error) once the row settles, or the last seen."""
     deadline = time.monotonic() + timeout
-    status = "missing"
-    backend = None
-    error = None
+    row = ("missing", None, None, None, None)
     while time.monotonic() < deadline:
         with catalog._lock:
-            row = catalog._conn.execute(
-                "SELECT status, backend, error FROM cache WHERE source_text = ?",
+            got = catalog._conn.execute(
+                "SELECT status, backend, model, target_kind, error FROM cache WHERE source_text = ?",
                 (source_text,),
             ).fetchone()
-        if row is not None:
-            status, backend, error = row
-            if status in {"failed", "success"}:
-                return status, backend, error
+        if got is not None:
+            row = tuple(got)
+            if row[0] in {"failed", "success"}:
+                break
         time.sleep(0.1)
-    return status, backend, error
+    return row
 
 
 def parse_conf_overrides(parser: argparse.ArgumentParser, values: list[str]) -> dict[str, str]:
@@ -356,18 +342,22 @@ def main() -> int:
     # -- ai phase: enable the plugin on a fresh catalog, drop the built-in
     # from pyTranspilers so the ai arms are isolated, and let the inline
     # worker fill each function from the backend (construction queues the
-    # row). Two targets per function: the canonical name gets the catalyst
-    # SQL fixture; a *_java twin (same body, different def name = a
-    # different catalog key) gets the Java UDF fixture, compiled on the
-    # driver during verification. always_decline declines whenever it is
-    # asked; it has no java twin (nothing would serve it either way).
-    sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-bench-"), "cache.sqlite")
-    catalog = enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
+    # row). Two targets per function: the canonical name and a *_java twin
+    # (same body, different def name = a different catalog key) meant for a
+    # Java UDF, compiled on the driver during verification. always_decline
+    # declines whenever it is asked; it has no java twin (nothing would
+    # serve it either way).
+    sqlite = os.environ.get("AI_UDF_TRANSPILE_SQLITE") or os.path.join(
+        tempfile.mkdtemp(prefix="ai-udf-bench-"), "cache.sqlite"
+    )
+    catalog = enable(spark, sqlite_path=sqlite, backend=ai_backend(spark), inline_worker=True)
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
     # zfill/backwards/edit_distance take text, and zfill raises on NULL.
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
     conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
     fills: dict[tuple[str, str], float] = {}
+    made_by: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+    target_kinds: dict[tuple[str, str], str | None] = {}
     decline_error: str | None = None
     for name, fn, rtype, _df, _cols, _sample in functions:
         for kind, target in (("catalyst", fn), ("java", JAVA_TWINS.get(name))):
@@ -375,18 +365,19 @@ def main() -> int:
                 continue
             start = time.perf_counter()
             UserDefinedFunction(target, rtype)  # construction queues the pending row
-            status, backend, error = wait_for_catalog_result(
-                catalog, canonical_source_from_func(target), timeout=120
+            status, backend, model, target_kind, error = wait_for_catalog_result(
+                catalog, canonical_source_from_func(target), timeout=900
             )
             fills[(name, kind)] = time.perf_counter() - start
+            made_by[(name, kind)] = (backend, model)
+            target_kinds[(name, kind)] = target_kind
             if name == "always_decline":
                 decline_error = error
-                assert status == "failed" and backend == "fake" and (error or "").startswith("declined:"), (
-                    "expected fake backend decline for always_decline, got "
-                    f"status={status!r} backend={backend!r} error={error!r}"
+                assert status == "failed", (
+                    f"expected a decline for always_decline, got {status=} {backend=} {error=}"
                 )
             else:
-                assert status == "success", f"fake backend did not fill {name} ({kind}): {error!r}"
+                assert status == "success", f"{backend} did not fill {name} ({kind}): {error!r}"
     ai_udfs = {}
     java_udfs = {}
     for name, fn, rtype, df, cols, sample in functions:
@@ -403,7 +394,11 @@ def main() -> int:
             assert "EvalPython" not in df.select(udf(*cols))._jdf.queryExecution().toString()
             (ai_udfs if label == "ai" else java_udfs)[name] = udf
     ai_ok = {name: bool(u.transpiled) for name, u in ai_udfs.items()}
-    java_ok = {name: bool(u.transpiled) for name, u in java_udfs.items()}
+    # A real backend picks its own target; only an actual Java UDF is a java arm.
+    java_ok = {
+        name: bool(u.transpiled) and target_kinds[(name, "java")] == "java_udf"
+        for name, u in java_udfs.items()
+    }
     fallback_df = ints.select(ai_udfs["always_decline"]("x"))
     assert "BatchEvalPython" in fallback_df._jdf.queryExecution().toString()
 
@@ -419,7 +414,8 @@ def main() -> int:
             arms.append(("python fallback always_decline", fallback_df, "python always_decline"))
         else:
             arms.append((f"ai {name}", df.select(ai_udfs[name](*cols)), f"python {name}"))
-            arms.append((f"java {name}", df.select(java_udfs[name](*cols)), f"python {name}"))
+            if java_ok[name]:
+                arms.append((f"java {name}", df.select(java_udfs[name](*cols)), f"python {name}"))
     for _name, arm_df, _ in arms:  # warmup round for everyone
         noop_seconds(arm_df)
     secs: dict[str, float] = {}
@@ -445,6 +441,8 @@ def main() -> int:
         "transpile_succeeded_static",
         "transpile_succeeded_ai_catalyst",
         "transpile_succeeded_ai_java",
+        "ai_backend",
+        "ai_model",
     ]
     wide: list[list] = []
     for name, _fn, _rtype, _df, _cols, _sample in functions:
@@ -476,6 +474,7 @@ def main() -> int:
                 static_ok[name],
                 ai_ok[name],
                 java_ok.get(name, False),
+                *made_by[(name, "catalyst")],
             ]
         )
     print(",".join(header))
@@ -520,7 +519,7 @@ def main() -> int:
         lookup_targets.append((name, "catalyst", fn, rtype, ai_ok[name]))
         twin = JAVA_TWINS.get(name)
         if twin is not None:
-            lookup_targets.append((name, "java", twin, rtype, java_ok.get(name, False)))
+            lookup_targets.append((name, "java", twin, rtype, name in java_udfs))
     for mode, transpile_on in (("plain", False), ("ai", True)):
         spark.conf.set(TRANSPILE_CONF, "true" if transpile_on else "false")
         if transpile_on:

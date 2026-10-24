@@ -7,9 +7,9 @@ Three sections:
 1. TRANSPILATION RESULTS -- for each UDF: the transpiled SQL/Java,
    attempt_count, origin, backend, and Hypothesis verdict, pulled from
    the catalog. Shows what the code actually became, not just a boolean.
-2. ATTEMPT COUNTS -- how many worker claims each transpile took (1 with
-   the fake backend; a real backend that fails Hypothesis cools down and
-   retries, bumping the count).
+2. ATTEMPT COUNTS -- how many worker claims each transpile took (a
+   backend that fails Hypothesis cools down and retries, bumping the
+   count).
 3. MULTI-AGENT COMPARISON -- for adversarial UDFs, several candidate
    rewrites (as if from different agents) are run through Hypothesis
    directly. Some pass, some fail -- the point: different agents produce
@@ -40,8 +40,8 @@ from pyspark.sql.types import BooleanType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
+from ai_udf_transpile.backends import ai_backend  # noqa: E402
 from ai_udf_transpile.backends.fake import (  # noqa: E402
-    FIXTURES,
     backwards_java,
     contains_ingredient,
     greet,
@@ -65,11 +65,21 @@ from ai_udf_transpile.types import input_spark_types, return_spark_type  # noqa:
 from ai_udf_transpile.verify import hypothesis_check  # noqa: E402
 
 
-def wait_transpiled(func, rtype, timeout=120):
+def gave_up(func) -> bool:
+    """The backend already failed func; failed rows cool down instead of re-queueing."""
+    catalog = get_catalog()
+    with catalog._lock:
+        row = catalog._conn.execute(
+            "SELECT status FROM cache WHERE source_text = ?", (canonical_source_from_func(func),)
+        ).fetchone()
+    return row is not None and row[0] == "failed"
+
+
+def wait_transpiled(func, rtype, timeout=900):
     """Re-create the UDF until the cache hit transpiles it."""
     deadline = time.time() + timeout
     udf = UserDefinedFunction(func, rtype)
-    while time.time() < deadline and not udf.transpiled:
+    while time.time() < deadline and not udf.transpiled and not gave_up(func):
         time.sleep(1.0)
         udf = UserDefinedFunction(func, rtype)
     return udf
@@ -103,9 +113,14 @@ def verify_candidate(spark, func, return_type, candidate_sql):
 
 
 def _faithful_sql(func):
-    """The fake backend's verified SQL for func, or None."""
-    r = FIXTURES.get(canonical_source_from_func(func))
-    return r.sql if r and r.sql else None
+    """This run's verified catalyst SQL for func, or None."""
+    catalog = get_catalog()
+    with catalog._lock:  # the inline worker writes through the same connection
+        row = catalog._conn.execute(
+            "SELECT catalyst_sql FROM cache WHERE source_text = ? AND status = 'success'",
+            (canonical_source_from_func(func),),
+        ).fetchone()
+    return row[0] if row else None
 
 
 def _truncate(text, width=80):
@@ -130,8 +145,10 @@ def main() -> int:
         .config("spark.sql.ansi.enabled", "true")
         .getOrCreate()
     )
-    sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-inspect-"), "cache.sqlite")
-    enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
+    sqlite = os.environ.get("AI_UDF_TRANSPILE_SQLITE") or os.path.join(
+        tempfile.mkdtemp(prefix="ai-udf-inspect-"), "cache.sqlite"
+    )
+    enable(spark, sqlite_path=sqlite, backend=ai_backend(spark), inline_worker=True)
     catalog = get_catalog()
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     # weekday_of takes a datetime (timestamp category); opt in.
@@ -176,10 +193,7 @@ def main() -> int:
     print("=== ATTEMPT COUNTS (worker claims per transpile) ===")
     for source_text, _kind, _sql, _cls, attempts, _o, _b, _h, status in rows:
         print(f"  {_func_name(source_text):22} attempts={attempts} status={status}")
-    print(
-        "(fake backend: every success is attempt 1; a real backend that fails\n"
-        " Hypothesis cools down 24h, then retries -- bumping attempt_count.)"
-    )
+    print("(a backend that fails Hypothesis cools down 24h, then retries --\n bumping attempt_count.)")
 
     print()
     print("=== MULTI-AGENT COMPARISON (different agents, different SQL) ===")
@@ -195,7 +209,7 @@ def main() -> int:
             [
                 ("Agent A (naive %)", "_udf_param_0 % _udf_param_1"),
                 ("Agent B (pmod)", "pmod(_udf_param_0, _udf_param_1)"),
-                ("Agent C (floored CASE)", _faithful_sql(mod_bucket)),
+                ("Agent C (this run)", _faithful_sql(mod_bucket)),
             ],
         ),
         (
@@ -205,7 +219,7 @@ def main() -> int:
             [
                 ("Agent A (round)", "round(_udf_param_0)"),
                 ("Agent B (int cast)", "cast(round(_udf_param_0) as int)"),
-                ("Agent C (bround+bigint)", _faithful_sql(round_half)),
+                ("Agent C (this run)", _faithful_sql(round_half)),
             ],
         ),
         (
@@ -215,7 +229,7 @@ def main() -> int:
             [
                 ("Agent A (dayofweek)", "dayofweek(_udf_param_0)"),
                 ("Agent B (offset -1)", "dayofweek(_udf_param_0) - 1"),
-                ("Agent C (pmod+5)", _faithful_sql(weekday_of)),
+                ("Agent C (this run)", _faithful_sql(weekday_of)),
             ],
         ),
         (
@@ -224,19 +238,22 @@ def main() -> int:
             BooleanType(),
             [
                 ("Agent A (naive instr)", "instr(lower(_udf_param_0), _udf_param_1) > 0"),
-                ("Agent B (coalesce)", _faithful_sql(contains_ingredient)),
+                ("Agent B (this run)", _faithful_sql(contains_ingredient)),
             ],
         ),
     ]
     for label, func, rtype, rewrites in candidates:
         print(f"  {label}")
         for agent, sql in rewrites:
+            if sql is None:  # this run's backend did not land one
+                print(f"    {agent + ':':22} (none)")
+                continue
             ok, err = verify_candidate(spark, func, rtype, sql)
             verdict = "ACCEPTED" if ok else f"REJECTED ({_truncate(err, 70)})"
             print(f"    {agent + ':':22} {_truncate(sql, 56):58} {verdict}")
         print()
 
-    print("=== BYTECODE vs AI BACKEND (deterministic vs fake) ===")
+    print("=== BYTECODE vs AI BACKEND (deterministic vs this run) ===")
     print("The bytecode backend walks CPython bytecode -- no AI, no network,")
     print("no attempts. It declines anything it cannot prove (CALL, IMPORT, ...).")
     print()

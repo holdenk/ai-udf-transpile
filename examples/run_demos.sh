@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Run the demos end to end against a packaged Spark master.
 #
-#   examples/run_demos.sh                        # fake-backend demos (quickstart, full)
-#   examples/run_demos.sh --live                 # + real CLI backends (cortex/pi/agent/claude/codex on PATH)
+#   examples/run_demos.sh                        # demos on $AI_UDF_TRANSPILE_BACKEND, else auto (CoCo first)
+#   examples/run_demos.sh --live                 # + every real CLI backend (cortex/pi/agent/claude/codex on PATH)
 #   examples/run_demos.sh --bench                 # + local micro benchmarks (~10M rows)
 #   examples/run_demos.sh --bench --csv out.csv   # + also write the wide per-function CSV
 #   examples/run_demos.sh --bench --transpilation-timing-csv out_transpilation_timing.csv
 #   examples/run_demos.sh --bench --rust-accel [--rust-accel-conf key=value]
 #   examples/run_demos.sh --bench-bytecode        # python vs static (AST) vs bytecode->SQL vs Java bytecode eval
 #   examples/run_demos.sh --bench-tpcds           # TPC-DS-inspired UDF patterns vs vanilla SQL
+#   examples/run_demos.sh --dump                  # + dump $AI_UDF_TRANSPILE_SQLITE to docs/EXAMPLES_TRANSPILED.md
 #   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
+#
+# Never the fake backend: that is a test fixture. examples/regen_examples_doc.sh
+# is the two-pass CoCo run that regenerates the doc.
 #
 # Env: SPARK_HOME (default ~/spark), PYTHON (default repo .venv).
 set -u -o pipefail
@@ -50,6 +54,7 @@ LIVE=0
 BENCH=0
 BENCH_BYTECODE=0
 BENCH_TPCDS=0
+DUMP=0
 CSV=""
 TRANSPILE_TIMING_CSV=""
 RUST_ACCEL=0
@@ -61,6 +66,7 @@ while [ $# -gt 0 ]; do
     --bench) BENCH=1 ;;
     --bench-bytecode) BENCH_BYTECODE=1 ;;
     --bench-tpcds) BENCH_TPCDS=1 ;;
+    --dump) DUMP=1 ;;
     # Passed through to bench_micro.py; implies --bench (only the bench reads it).
     --csv)
       [ $# -ge 2 ] || { echo "error: --csv needs a path" >&2; exit 2; }
@@ -151,6 +157,11 @@ if [ "$BENCH_TPCDS" -eq 1 ]; then
     TPCDS_ARGS+=(--csv "$TPCDS_CSV")
   fi
   run_demo "tpcds udf bench" "${TPCDS_ARGS[@]}"
+fi
+
+if [ "$DUMP" -eq 1 ]; then
+  [ -n "${AI_UDF_TRANSPILE_SQLITE:-}" ] || { echo "error: --dump needs AI_UDF_TRANSPILE_SQLITE" >&2; exit 2; }
+  run_demo "dump" examples/dump_results.py --sqlite "$AI_UDF_TRANSPILE_SQLITE" --out docs/EXAMPLES_TRANSPILED.md
 fi
 
 echo "===== SUMMARY ====="

@@ -6,7 +6,7 @@ comment).  We run three arms per pattern:
 
   python    the UDF as an interpreted Python UDF (transpilePyUDFs=false)
   vanilla   the native SQL expression the UDF is equivalent to
-  transpiled  the UDF after AI transpilation (fake backend, inline worker)
+  transpiled  the UDF after AI transpilation (inline worker)
 
 The point: a Python UDF doing TPC-DS-like work is 5-10x slower than native
 SQL, and transpilation closes that gap for the patterns whose faithful
@@ -38,6 +38,7 @@ from pyspark.sql.types import BooleanType, DoubleType, LongType, StringType  # n
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
+from ai_udf_transpile.backends import ai_backend  # noqa: E402
 from ai_udf_transpile.backends.fake import (  # noqa: E402
     common_c2f,
     common_discount_price,
@@ -296,18 +297,18 @@ def noop_seconds(df) -> float:
     return time.perf_counter() - start
 
 
-def wait_for_catalog(catalog, source_text, timeout=120):
+def wait_for_catalog(catalog, source_text, timeout=900):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with catalog._lock:
             row = catalog._conn.execute(
-                "SELECT status, error FROM cache WHERE source_text = ?",
+                "SELECT status, error, backend, model FROM cache WHERE source_text = ?",
                 (source_text,),
             ).fetchone()
         if row and row[0] in {"success", "failed"}:
             return row
         time.sleep(0.1)
-    return ("timeout", None)
+    return ("timeout", None, None, None)
 
 
 def main() -> int:
@@ -352,9 +353,11 @@ def main() -> int:
         col_names = [c[0] for c in cols]
         vanilla_exprs[name] = _substitute(sql, col_names)
 
-    # -- Transpiled arm: enable the plugin, let the fake backend fill each UDF.
-    sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-tpcds-"), "cache.sqlite")
-    catalog = enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
+    # -- Transpiled arm: enable the plugin, let the backend fill each UDF.
+    sqlite = os.environ.get("AI_UDF_TRANSPILE_SQLITE") or os.path.join(
+        tempfile.mkdtemp(prefix="ai-udf-tpcds-"), "cache.sqlite"
+    )
+    catalog = enable(spark, sqlite_path=sqlite, backend=ai_backend(spark), inline_worker=True)
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
     # strlen/upper raise on NULL. These patterns' strings are the values under test.
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
@@ -374,9 +377,11 @@ def main() -> int:
     conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
 
     declined: dict[str, bool] = {}
+    made_by: dict[str, tuple[str | None, str | None]] = {}
     for name, func, rtype, _cols, _sql in PATTERNS:
         UserDefinedFunction(func, rtype)  # construction queues the pending row
-        status, error = wait_for_catalog(catalog, canonical_source_from_func(func))
+        status, error, backend, model = wait_for_catalog(catalog, canonical_source_from_func(func))
+        made_by[name] = (backend, model)
         declined[name] = status != "success"
         if declined[name]:
             print(f"transpile declined/failed for {name}: {error!r}")
@@ -434,6 +439,7 @@ def main() -> int:
                 round(rows / tx_s),
                 round(tx_speedup, 1),
                 round(va_speedup, 1),
+                *made_by[name],
             ]
         )
 
@@ -450,6 +456,8 @@ def main() -> int:
                     "transpiled_rows_per_second",
                     "transpiled_speedup_vs_python",
                     "vanilla_speedup_vs_python",
+                    "ai_backend",
+                    "ai_model",
                 ]
             )
             w.writerows(csv_rows)

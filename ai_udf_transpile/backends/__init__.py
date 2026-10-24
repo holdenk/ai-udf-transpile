@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from typing import Any, Optional
 
 from ai_udf_transpile import conf
 from ai_udf_transpile.backends.base import Backend, BackendDecline, BackendError
 
-__all__ = ["Backend", "BackendDecline", "BackendError", "get_backend", "pick_auto"]
+__all__ = ["Backend", "BackendDecline", "BackendError", "ai_backend", "get_backend", "pick_auto"]
+
+# The ones that ask a model. fake is a test fixture, bytecode is deterministic.
+AI_BACKENDS = ("coco", "pi", "claude", "codex", "cursor", "ensemble")
 
 
 def _binary(spark: Any, key: str, default: str) -> str:
@@ -52,6 +56,16 @@ def pick_auto(spark: Any = None) -> str:
     if unknown:
         msg.append(f"unknown names in {conf.AUTO_BACKEND_PRIORITY}: {', '.join(unknown)}")
     raise BackendError("; ".join(msg))
+
+
+def ai_backend(spark: Any = None) -> str:
+    """$AI_UDF_TRANSPILE_BACKEND, else auto -- refusing anything that is not a real AI."""
+    name = (os.environ.get("AI_UDF_TRANSPILE_BACKEND") or "auto").strip().lower()
+    if name == "auto":
+        name = pick_auto(spark)
+    if name not in AI_BACKENDS:
+        raise BackendError(f"{name!r} is not an AI backend; use one of {', '.join(AI_BACKENDS)}")
+    return name
 
 
 def get_backend(name: Optional[str] = None, spark: Any = None) -> Backend:

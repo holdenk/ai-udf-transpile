@@ -2,21 +2,18 @@
 """Multi-model demo: run UDFs through every available AI backend, show
 agreement/divergence, success rates, and pick the fastest rewrite.
 
-Without --live this uses the fake backend (one fixture per UDF, so every
-"model" agrees -- the infrastructure demo).  With --live it hits real AI
-CLIs (claude, codex, cursor, ...) on PATH and shows which models produce the
-same SQL, which differ, and which decline.
+Shows which models produce the same SQL, which differ, and which decline.
 
   export SPARK_HOME=~/spark
-  python examples/demo_multi_model.py            # fake backend (CI-safe)
-  python examples/demo_multi_model.py --live     # real AI models on PATH
+  python examples/demo_multi_model.py         # $AI_UDF_TRANSPILE_BACKEND, else auto
+  python examples/demo_multi_model.py --all   # every AI CLI on PATH
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
-import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -26,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pyspark.sql import SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
 
-from ai_udf_transpile.backends import get_backend  # noqa: E402
+from ai_udf_transpile.backends import ai_backend, get_backend  # noqa: E402
 from ai_udf_transpile.backends.base import BackendDecline, BackendError  # noqa: E402
 from ai_udf_transpile.backends.fake import (  # noqa: E402
     both_positive,
@@ -40,6 +37,7 @@ from ai_udf_transpile.backends.fake import (  # noqa: E402
     title_case,
 )
 from ai_udf_transpile.benchmark import benchmark_all  # noqa: E402
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 from ai_udf_transpile.model_stats import collect_stats, format_stats_table  # noqa: E402
 from ai_udf_transpile.sandbox import write_sandbox  # noqa: E402
@@ -58,7 +56,7 @@ UDFS = [
     ("math_floor", math_floor, "bigint", ["double"], "dbls"),
 ]
 
-# Real AI backends to try in --live mode (name, binary).
+# Real AI backends to try (name, binary).
 LIVE_BACKENDS = [
     ("claude", "claude"),
     ("codex", "codex"),
@@ -100,38 +98,6 @@ def _try_backend(backend, job, sandbox):
         return None
 
 
-def _seed_stats_db() -> sqlite3.Connection:
-    """Create a temp SQLite catalog with example rows to demo the stats table."""
-    conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE cache (backend TEXT, model TEXT, status TEXT)")
-    rows = [
-        ("claude", "claude-sonnet", "success"),
-        ("claude", "claude-sonnet", "success"),
-        ("claude", "claude-sonnet", "success"),
-        ("claude", "claude-sonnet", "failed"),
-        ("codex", "codex-1", "success"),
-        ("codex", "codex-1", "success"),
-        ("codex", "codex-1", "failed"),
-        ("codex", "codex-1", "failed"),
-        ("cursor", "cursor-small", "success"),
-        ("cursor", "cursor-small", "failed"),
-        ("cursor", "cursor-small", "failed"),
-        ("cursor", "cursor-small", "failed"),
-        ("fake", "fake-fixture", "success"),
-        ("fake", "fake-fixture", "success"),
-        ("fake", "fake-fixture", "success"),
-    ]
-    conn.executemany("INSERT INTO cache VALUES (?,?,?)", rows)
-    return conn
-
-
-class _CatalogShim:
-    """Wrap a raw sqlite3.Connection so collect_stats can read it."""
-
-    def __init__(self, conn):
-        self._conn = conn
-
-
 def _short(text, width=72):
     if text is None:
         return "(none)"
@@ -141,9 +107,14 @@ def _short(text, width=72):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--live", action="store_true", help="use real AI CLIs on PATH")
     parser.add_argument("--rows", type=int, default=500_000, help="benchmark rows")
+    parser.add_argument("--all", action="store_true", help="every AI CLI on PATH, not just one")
     args = parser.parse_args()
+
+    backend_names = _available_backends() if args.all else [ai_backend()]
+    if not backend_names:
+        print("No AI CLIs on PATH")
+        return 1
 
     spark = (
         SparkSession.builder.master("local[*]")
@@ -152,14 +123,6 @@ def main() -> int:
         .config("spark.sql.ansi.enabled", "true")
         .getOrCreate()
     )
-
-    if args.live:
-        backend_names = _available_backends()
-        if not backend_names:
-            print("No AI CLIs on PATH; falling back to fake backend\n")
-            backend_names = ["fake"]
-    else:
-        backend_names = ["fake"]
 
     print(f"=== MULTI-MODEL TRANSPILATION ({', '.join(backend_names)}) ===\n")
 
@@ -212,12 +175,12 @@ def main() -> int:
             else:
                 print(f"  >> {len(candidates)} models, {unique} distinct SQL(s) -- DIVERGENCE\n")
 
-    # --- success rate table (example data -- real runs populate the catalog) ---
-    print("=== MODEL SUCCESS RATES (example data) ===")
-    conn = _seed_stats_db()
-    stats = collect_stats(_CatalogShim(conn))
-    print(format_stats_table(stats))
-    print()
+    # --- success rate table, from the catalog the other examples filled ---
+    shared = os.environ.get("AI_UDF_TRANSPILE_SQLITE")
+    if shared and os.path.exists(shared):
+        print(f"=== MODEL SUCCESS RATES ({shared}) ===")
+        print(format_stats_table(collect_stats(SqliteCatalog(shared))))
+        print()
 
     # --- benchmark candidates and pick best ---
     print(f"=== BENCHMARK: choose best rewrite ({n:,} rows, min of 3 rounds) ===")
@@ -234,7 +197,6 @@ def main() -> int:
             print(f"    {r.backend:<10} {r.model:<20} {r.rows_per_second:>12,.0f} rows/s{marker}")
         print()
 
-    conn.close()
     spark.stop()
     return 0
 

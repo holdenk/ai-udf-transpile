@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The 60-second demo: one Catalyst rewrite and one Java UDF, fake backend.
+"""The 60-second demo: one Catalyst rewrite and one Java UDF.
+
+Backend: $AI_UDF_TRANSPILE_BACKEND, else auto (first AI CLI on PATH, CoCo
+first). $AI_UDF_TRANSPILE_SQLITE shares one cache across runs and examples.
 
 export SPARK_HOME=/path/to/spark-master
 export PYTHONPATH="$SPARK_HOME/python:$(ls $SPARK_HOME/python/lib/py4j-*-src.zip | head -n1)"
@@ -23,6 +26,8 @@ from pyspark.sql.types import LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
+from ai_udf_transpile.backends import ai_backend  # noqa: E402
+from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
 
 
@@ -36,11 +41,21 @@ def backwards_java(name: str) -> str:
     return name[::-1]
 
 
-def wait_for_hit(func, rtype, timeout=120):
+def gave_up(func) -> bool:
+    """The backend already failed func; failed rows cool down instead of re-queueing."""
+    catalog = get_catalog()
+    with catalog._lock:
+        row = catalog._conn.execute(
+            "SELECT status FROM cache WHERE source_text = ?", (canonical_source_from_func(func),)
+        ).fetchone()
+    return row is not None and row[0] == "failed"
+
+
+def wait_for_hit(func, rtype, timeout=900):
     """Re-create the UDF until the catalog hit flips transpiled=True."""
     deadline = time.time() + timeout
     udf = UserDefinedFunction(func, rtype)
-    while time.time() < deadline and not udf.transpiled:
+    while time.time() < deadline and not udf.transpiled and not gave_up(func):
         time.sleep(1.0)
         udf = UserDefinedFunction(func, rtype)
     return udf
@@ -55,8 +70,10 @@ def main() -> int:
         .config("spark.sql.ansi.enabled", "true")
         .getOrCreate()
     )
-    sqlite = os.path.join(tempfile.mkdtemp(prefix="ai-udf-quickstart-"), "cache.sqlite")
-    enable(spark, sqlite_path=sqlite, backend="fake", inline_worker=True)
+    sqlite = os.environ.get("AI_UDF_TRANSPILE_SQLITE") or os.path.join(
+        tempfile.mkdtemp(prefix="ai-udf-quickstart-"), "cache.sqlite"
+    )
+    enable(spark, sqlite_path=sqlite, backend=ai_backend(spark), inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
 

@@ -2,8 +2,8 @@
 
 Partial, non-blocking Python UDF transpilation for Apache Spark. Spark's
 built-in Catalyst transpiler covers simple functions; this plugin asks an
-agent (CoCo / Pi / Claude / Codex / Cursor, or a deterministic fake backend
-in CI) to rewrite the rest into Catalyst SQL or a Java UDF, then
+agent (CoCo / Pi / Claude / Codex / Cursor; a deterministic fake backend
+stands in for tests only) to rewrite the rest into Catalyst SQL or a Java UDF, then
 Hypothesis-checks the rewrite against the original Python before it is served.
 
 Queries never wait on the agent. A miss inserts a `pending` catalog row and
@@ -33,7 +33,7 @@ A working experiment, not a dependency:
   backends write into a sandbox directory — that is a work dir, not a
   security boundary. Same trust hole in the shared write-back table:
   anyone who can append to it runs SQL and Java in every reader's driver.
-- **Benchmarks are honest but narrow.** Single node, fake backend, five
+- **Benchmarks are honest but narrow.** Single node, one AI backend, five
   functions, min of 3. The graph below is that run, not a promise about
   your cluster.
 - **Fail-open everywhere.** A misconfigured catalog or unreachable backend
@@ -59,7 +59,7 @@ from ai_udf_transpile import enable, register_impl
 
 spark = SparkSession.builder.getOrCreate()
 spark.conf.set("spark.sql.ansi.enabled", "true")
-enable(spark, backend="fake")  # or coco / pi / claude / codex / cursor / auto
+enable(spark, backend="coco")  # or pi / claude / codex / cursor / auto
 
 from pyspark.sql.functions import udf
 from pyspark.sql.types import LongType
@@ -96,7 +96,7 @@ register_impl(
 Standalone worker when `inlineWorker` is false:
 
 ```bash
-python -m ai_udf_transpile.worker --sqlite-path /tmp/ai_udf_transpile.sqlite --backend fake
+python -m ai_udf_transpile.worker --sqlite-path /tmp/ai_udf_transpile.sqlite --backend coco
 ```
 
 ## Backends: the six paths
@@ -178,15 +178,16 @@ print(format_stats_table(stats))
 
 `examples/demo_multi_model.py` runs a set of UDFs through every available
 backend, shows agreement/divergence, the success-rate table, and picks the
-fastest rewrite by benchmark. `--live` hits real AI CLIs on PATH; without
-it the fake backend is used (CI-safe).
+fastest rewrite by benchmark. One backend by default; `--all` for every
+AI CLI on PATH.
 
 ## Demos & benchmarks
 
 ```bash
-examples/run_demos.sh           # quickstart + full demo (fake backend)
+examples/run_demos.sh           # quickstart + full demo ($AI_UDF_TRANSPILE_BACKEND, else auto)
 examples/run_demos.sh --bench   # + local micro benchmarks
-examples/run_demos.sh --live    # + real CLI backends (cortex/pi/agent/claude/codex on PATH)
+examples/run_demos.sh --live    # + every CLI backend on PATH (cortex/pi/agent/claude/codex)
+examples/regen_examples_doc.sh  # every example twice on CoCo, one cache, then docs/EXAMPLES_TRANSPILED.md
 examples/run_demos.sh --bench --transpilation-timing-csv bench_transpilation_timing.csv
 examples/run_demos.sh --bench --rust-accel
 examples/run_demos.sh --bench-bytecode   # static (AST) vs bytecode->SQL vs Java bytecode eval vs python
@@ -204,7 +205,7 @@ candidate rewrites for the same UDF are run through Hypothesis to show
 which ship and which get rejected. `examples/demo_multi_model.py` runs
 UDFs through every available AI backend, shows agreement/divergence across
 models, the per-model success-rate table, and picks the fastest rewrite by
-benchmark (`--live` for real AI CLIs). `examples/bench_micro.py`
+benchmark. `examples/bench_micro.py`
 measures up to four arms per function —
 regular Python, transpiled static (Spark's built-in `catalyst` transpiler,
 which converts only simple operations like `plus_one`; everything else
@@ -272,9 +273,12 @@ python examples/bench_graph.py bench_bytecode_vs_static.csv docs/bench_bytecode.
 `examples/bench_graph_aggregate.py` rolls every benchmark CSV in a
 directory into one per-path speedup chart (medians marked, fallback rows
 excluded as declines), and `examples/dump_results.py` writes a markdown
-dump of what every transpiler did to every fixture UDF — conversions and
-declines side by side. That dump is committed as
-[docs/EXAMPLES_TRANSPILED.md](docs/EXAMPLES_TRANSPILED.md); raw runs live
+dump of what every transpiler did to every UDF the examples put in the
+cache — conversions and declines side by side, with the backend and model
+that made each AI row. `examples/regen_examples_doc.sh` fills that cache
+from CoCo (every example, twice: miss, then hit); the
+dump it writes is [docs/EXAMPLES_TRANSPILED.md](docs/EXAMPLES_TRANSPILED.md). The
+examples and benchmarks refuse the fake backend; raw runs live
 under `questionable_benchmark_results/`.
 
 `backend=auto` picks the first available backend from
@@ -319,9 +323,10 @@ The Spark tests need a package-only build of `apache/spark@master`
 `tests/conftest.py` puts `$SPARK_HOME/python` and py4j on `sys.path` and pins
 `PYSPARK_PYTHON` to the running interpreter so workers match the driver.
 
-CI uses `backend=fake` with a handful of annotated fixtures (`plus_one`,
-`is_none_branch`, `both_positive`, `greet`). Live CoCo/Cursor/Claude CLIs
-are not invoked in default GHA.
+CI's pytest uses `backend=fake` with a handful of annotated fixtures
+(`plus_one`, `is_none_branch`, `both_positive`, `greet`). Live
+CoCo/Cursor/Claude CLIs are not invoked in default GHA, so neither are the
+benchmarks.
 
 ## References
 
