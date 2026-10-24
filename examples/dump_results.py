@@ -14,12 +14,14 @@ Declines are shown as declines, with the reason -- that is half the story.
   python examples/dump_results.py [--sqlite target/examples_transpiled.sqlite]
                                    [--out docs/EXAMPLES_TRANSPILED.md]
                                    [--backend coco]
+                                   [--perf-csv bench_micro.csv] [--perf-csv bench_tpcds.csv]
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import importlib.util
 import os
 import platform
@@ -78,6 +80,68 @@ def _safe(label: str, fn) -> list[str]:
         return [f"- **{label}**: error: {type(exc).__name__}: {exc}"]
 
 
+def _fmt_rate(value: str) -> str:
+    n = float(value)
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}k"
+    return f"{n:.0f}"
+
+
+def _perf_lines(paths: list[str]) -> dict[str, str]:
+    """Section name -> perf bullet, from the bench CSVs.
+
+    Micro bench CSV is one row per function (kinds column); the tpcds CSV one
+    row per pattern (declined column). Only benched sections get a bullet;
+    always_decline's catalyst cell holds the fallback run, so it is labeled
+    that way instead of as an AI rewrite.
+    """
+    perf: dict[str, str] = {}
+    for path in paths:
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        except OSError as exc:
+            raise SystemExit(f"cannot read perf csv {path}: {exc}")
+        if not rows:
+            continue
+        if "kinds" in rows[0]:  # bench_micro wide CSV
+            for r in rows:
+                py = f"python {_fmt_rate(r['regular_rows_per_second'])} rows/s"
+                parts = [py]
+                static = r.get("transpiled_static_rows_per_second")
+                if static:
+                    parts.append(f"static {_fmt_rate(static)} ({r['static_speedup_vs_regular']}x)")
+                catalyst = r.get("transpiled_ai_catalyst_rows_per_second")
+                if catalyst:
+                    catalyst_x = r["ai_catalyst_speedup_vs_regular"]
+                    if r["transpile_succeeded_ai_catalyst"] == "True":
+                        parts.append(f"ai catalyst {_fmt_rate(catalyst)} ({catalyst_x}x)")
+                    else:
+                        parts.append(f"python fallback {_fmt_rate(catalyst)}")
+                perf[r["function"]] = "- **perf (micro bench)**: " + " · ".join(parts)
+                java = r.get("transpiled_ai_java_rows_per_second")
+                if java:
+                    java_x = r["ai_java_speedup_vs_regular"]
+                    perf[r["function"] + "_java"] = (
+                        f"- **perf (micro bench)**: {py} · ai java {_fmt_rate(java)} ({java_x}x)"
+                    )
+        elif "declined" in rows[0]:  # bench_tpcds CSV
+            for r in rows:
+                py = f"python {_fmt_rate(r['python_rows_per_second'])} rows/s"
+                tx_rate = _fmt_rate(r["transpiled_rows_per_second"])
+                if r["declined"] == "True":
+                    tx = f"transpiled = python fallback ({tx_rate} rows/s; declined)"
+                else:
+                    tx = f"transpiled {tx_rate} ({r['transpiled_speedup_vs_python']}x)"
+                perf[r["function"]] = (
+                    f"- **perf (tpcds bench)**: {py} · vanilla {_fmt_rate(r['vanilla_rows_per_second'])}"
+                    f" ({r['vanilla_speedup_vs_python']}x) · {tx}"
+                )
+    return perf
+
+
 def _builtin_result(row: CacheRow) -> str:
     name = _function_name(row.source_text)
     with tempfile.TemporaryDirectory() as tmp:
@@ -115,7 +179,7 @@ def _ai_section(row: CacheRow) -> list[str]:
     return [f"- **AI ({label})**: status={row.status}{tail}"]
 
 
-def dump(spark, rows: list[CacheRow], out_path: str, backend: str) -> int:
+def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[str, str]) -> int:
     spark.conf.set(TRANSPILE_CONF, "true")
     spark.conf.set(PY_TRANSPLIERS_CONF, "catalyst")
     by_status = dict(Counter(row.status for row in rows))
@@ -127,12 +191,16 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str) -> int:
         f"CPython {platform.python_version()}.",
         f"{len(rows)} rows, by status: {by_status}.",
         "Regenerate with `examples/regen_examples_doc.sh`.",
+        "Perf bullets are the local single-node benches (bench_micro.py,",
+        "bench_tpcds_udfs.py): rows/s vs the interpreted python baseline;",
+        "no perf bullet = not benched.",
         "",
     ]
     try:
         for row in rows:
+            name = _function_name(row.source_text) or row.udf_key[:12]
             lines += [
-                f"## {_function_name(row.source_text) or row.udf_key[:12]}",
+                f"## {name}",
                 "",
                 "```python",
                 row.source_text,
@@ -143,7 +211,10 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str) -> int:
             ]
             lines += _safe("built-in static (AST)", lambda r=row: _builtin_result(r))
             lines += _safe("bytecode → SQL", lambda r=row: _bytecode_result(r))
-            lines += _ai_section(row) + [""]
+            lines += _ai_section(row)
+            if perf.get(name):
+                lines.append(perf[name])
+            lines.append("")
     finally:
         spark.conf.set(TRANSPILE_CONF, "false")
         spark.conf.unset(PY_TRANSPLIERS_CONF)
@@ -161,6 +232,13 @@ def main() -> int:
         "--backend",
         help="backend every AI row came from (default: $AI_UDF_TRANSPILE_BACKEND, else auto)",
     )
+    parser.add_argument(
+        "--perf-csv",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="bench CSV to pull per-function perf bullets from (micro and/or tpcds); repeatable",
+    )
     args = parser.parse_args()
     if args.backend:
         os.environ["AI_UDF_TRANSPILE_BACKEND"] = args.backend
@@ -169,6 +247,7 @@ def main() -> int:
     except BackendError as exc:
         print(exc, file=sys.stderr)
         return 1
+    perf = _perf_lines(args.perf_csv) if args.perf_csv else {}
     sqlite_path = Path(args.sqlite)
     if not sqlite_path.exists():
         print(f"no sqlite catalog at {sqlite_path}", file=sys.stderr)
@@ -193,7 +272,7 @@ def main() -> int:
         .getOrCreate()
     )
     try:
-        return dump(spark, rows, args.out, args.backend)
+        return dump(spark, rows, args.out, args.backend, perf)
     finally:
         spark.stop()
 

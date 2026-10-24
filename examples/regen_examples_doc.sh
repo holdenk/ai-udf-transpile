@@ -13,10 +13,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export AI_UDF_TRANSPILE_BACKEND="${AI_UDF_TRANSPILE_BACKEND:-coco}"
 export AI_UDF_TRANSPILE_SQLITE="${AI_UDF_TRANSPILE_SQLITE:-$REPO_ROOT/target/examples_transpiled.sqlite}"
 
-mkdir -p "$(dirname "$AI_UDF_TRANSPILE_SQLITE")"
+mkdir -p "$(dirname "$AI_UDF_TRANSPILE_SQLITE")" "$REPO_ROOT/questionable_benchmark_results"
 rm -f "$AI_UDF_TRANSPILE_SQLITE"{,-wal,-shm}
 
-ARGS=(--bench --bench-tpcds "$@")
+ARGS=(--bench --bench-tpcds --csv "$REPO_ROOT/questionable_benchmark_results/examples_transpiled_bench.csv" "$@")
 echo "##### pass 1/2: filling $AI_UDF_TRANSPILE_SQLITE from $AI_UDF_TRANSPILE_BACKEND #####"
 "$REPO_ROOT/examples/run_demos.sh" "${ARGS[@]}" || echo "pass 1 had failures; pass 2 decides"
 echo "##### pass 2/2: cache hits, then the dump #####"
