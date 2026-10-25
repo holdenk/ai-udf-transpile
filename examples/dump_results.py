@@ -89,15 +89,16 @@ def _fmt_rate(value: str) -> str:
     return f"{n:.0f}"
 
 
-def _perf_lines(paths: list[str]) -> dict[str, str]:
-    """Section name -> perf bullet, from the bench CSVs.
+def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
+    """Section name -> per-arm perf strings, from the bench CSVs.
 
-    Micro bench CSV is one row per function (kinds column); the tpcds CSV one
-    row per pattern (declined column). Only benched sections get a bullet;
-    always_decline's catalyst cell holds the fallback run, so it is labeled
-    that way instead of as an AI rewrite.
+    "top" rides under the types line (the interpreted python baseline, plus
+    the native vanilla arm for tpcds patterns); "static" and "ai" are
+    suffixed onto the matching transpiled-path line. Only benched sections
+    get numbers; a declined pattern serves python, so its AI line gets no
+    suffix and the top line tells that story.
     """
-    perf: dict[str, str] = {}
+    perf: dict[str, dict[str, str]] = {}
     for path in paths:
         try:
             with open(path, newline="", encoding="utf-8") as f:
@@ -108,37 +109,41 @@ def _perf_lines(paths: list[str]) -> dict[str, str]:
             continue
         if "kinds" in rows[0]:  # bench_micro wide CSV
             for r in rows:
-                py = f"python {_fmt_rate(r['regular_rows_per_second'])} rows/s"
-                parts = [py]
+                py = _fmt_rate(r["regular_rows_per_second"])
+                top = f"- **perf (micro bench)**: interpreted python {py} rows/s"
+                arms: dict[str, str] = {"top": top, "static": "", "ai": ""}
                 static = r.get("transpiled_static_rows_per_second")
                 if static:
-                    parts.append(f"static {_fmt_rate(static)} ({r['static_speedup_vs_regular']}x)")
+                    arms["static"] = (
+                        f"{_fmt_rate(static)} rows/s ({r['static_speedup_vs_regular']}x vs python)"
+                    )
                 catalyst = r.get("transpiled_ai_catalyst_rows_per_second")
-                if catalyst:
-                    catalyst_x = r["ai_catalyst_speedup_vs_regular"]
-                    if r["transpile_succeeded_ai_catalyst"] == "True":
-                        parts.append(f"ai catalyst {_fmt_rate(catalyst)} ({catalyst_x}x)")
-                    else:
-                        parts.append(f"python fallback {_fmt_rate(catalyst)}")
-                perf[r["function"]] = "- **perf (micro bench)**: " + " · ".join(parts)
+                if catalyst and r["transpile_succeeded_ai_catalyst"] == "True":
+                    arms["ai"] = (
+                        f"{_fmt_rate(catalyst)} rows/s ({r['ai_catalyst_speedup_vs_regular']}x vs python)"
+                    )
+                perf[r["function"]] = arms
                 java = r.get("transpiled_ai_java_rows_per_second")
                 if java:
-                    java_x = r["ai_java_speedup_vs_regular"]
-                    perf[r["function"] + "_java"] = (
-                        f"- **perf (micro bench)**: {py} · ai java {_fmt_rate(java)} ({java_x}x)"
-                    )
+                    perf[r["function"] + "_java"] = {
+                        "top": top,
+                        "static": "",
+                        "ai": f"{_fmt_rate(java)} rows/s ({r['ai_java_speedup_vs_regular']}x vs python)",
+                    }
         elif "declined" in rows[0]:  # bench_tpcds CSV
             for r in rows:
-                py = f"python {_fmt_rate(r['python_rows_per_second'])} rows/s"
-                tx_rate = _fmt_rate(r["transpiled_rows_per_second"])
-                if r["declined"] == "True":
-                    tx = f"transpiled = python fallback ({tx_rate} rows/s; declined)"
-                else:
-                    tx = f"transpiled {tx_rate} ({r['transpiled_speedup_vs_python']}x)"
-                perf[r["function"]] = (
-                    f"- **perf (tpcds bench)**: {py} · vanilla {_fmt_rate(r['vanilla_rows_per_second'])}"
-                    f" ({r['vanilla_speedup_vs_python']}x) · {tx}"
+                top = (
+                    f"- **perf (tpcds bench)**: interpreted python"
+                    f" {_fmt_rate(r['python_rows_per_second'])} rows/s · native vanilla"
+                    f" {_fmt_rate(r['vanilla_rows_per_second'])} ({r['vanilla_speedup_vs_python']}x)"
                 )
+                ai = ""
+                if r["declined"] != "True":
+                    ai = (
+                        f"{_fmt_rate(r['transpiled_rows_per_second'])} rows/s"
+                        f" ({r['transpiled_speedup_vs_python']}x vs python)"
+                    )
+                perf[r["function"]] = {"top": top, "static": "", "ai": ai}
     return perf
 
 
@@ -185,7 +190,7 @@ def _ai_section(row: CacheRow) -> list[str]:
     return [f"- **AI ({label})**: status={row.status}{tail}"]
 
 
-def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[str, str]) -> int:
+def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[str, dict[str, str]]) -> int:
     spark.conf.set(TRANSPILE_CONF, "true")
     spark.conf.set(PY_TRANSPLIERS_CONF, "catalyst")
     by_status = dict(Counter(row.status for row in rows))
@@ -198,13 +203,18 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
         f"{len(rows)} rows, by status: {by_status}.",
         "Regenerate with `examples/regen_examples_doc.sh`.",
         "Perf bullets are the local single-node benches (bench_micro.py,",
-        "bench_tpcds_udfs.py): rows/s vs the interpreted python baseline;",
-        "no perf bullet = not benched.",
+        "bench_tpcds_udfs.py): interpreted python rows/s at the top of each",
+        "section, and each transpiled arm's rows/s at the end of its own",
+        "line; no perf = not benched.",
         "",
     ]
     try:
         for row in rows:
             name = _function_name(row.source_text) or row.udf_key[:12]
+            p = perf.get(name) or {}
+            head = [f"- **types**: {', '.join(row.input_types)} -> {row.return_type}"]
+            if p.get("top"):
+                head.append(p["top"])
             lines += [
                 f"## {name}",
                 "",
@@ -212,14 +222,20 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
                 row.source_text,
                 "```",
                 "",
-                f"- **types**: {', '.join(row.input_types)} -> {row.return_type}",
+                *head,
                 "",
             ]
-            lines += _safe("built-in static (AST)", lambda r=row: _builtin_result(r))
+            static_lines = _safe("built-in static (AST)", lambda r=row: _builtin_result(r))
+            # No perf suffix on an error or a failed row: a stale CSV must
+            # not put a happy rate next to a crash or a decline.
+            if p.get("static") and not static_lines[0].startswith("- **built-in static (AST)**: error"):
+                static_lines[0] += f" — {p['static']}"
+            lines += static_lines
             lines += _safe("bytecode → SQL", lambda r=row: _bytecode_result(r))
-            lines += _ai_section(row)
-            if perf.get(name):
-                lines.append(perf[name])
+            ai_lines = _ai_section(row)
+            if p.get("ai") and row.status == "success":
+                ai_lines[0] += f" — {p['ai']}"
+            lines += ai_lines
             lines.append("")
     finally:
         spark.conf.set(TRANSPILE_CONF, "false")

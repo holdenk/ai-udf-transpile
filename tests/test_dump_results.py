@@ -224,16 +224,26 @@ def test_perf_lines_unit(tmp_path):
     tpcds = tmp_path / "tpcds.csv"
     tpcds.write_text(TPCDS_CSV, encoding="utf-8")
     perf = _load_dump_module()._perf_lines([str(micro), str(tpcds)])
-    assert perf["plus_one"] == (
-        "- **perf (micro bench)**: python 2.0M rows/s · static 3.0M (1.5x) · ai catalyst 8.0M (4.0x)"
-    )
-    assert perf["plus_one_java"] == "- **perf (micro bench)**: python 2.0M rows/s · ai java 4.0M (2.0x)"
-    # fallback shows no speedup -- there is no rewrite to speed up
-    assert perf["always_decline"] == "- **perf (micro bench)**: python 1.0M rows/s · python fallback 1.0M"
-    assert perf["common_c2f"] == (
-        "- **perf (tpcds bench)**: python 1.0M rows/s · vanilla 5.0M (5.0x) · transpiled 4.0M (4.0x)"
-    )
-    assert "python fallback (900k rows/s; declined)" in perf["tpcds_safe_ratio"]
+    assert perf["plus_one"] == {
+        "top": "- **perf (micro bench)**: interpreted python 2.0M rows/s",
+        "static": "3.0M rows/s (1.5x vs python)",
+        "ai": "8.0M rows/s (4.0x vs python)",
+    }
+    assert perf["plus_one_java"] == {
+        "top": "- **perf (micro bench)**: interpreted python 2.0M rows/s",
+        "static": "",
+        "ai": "4.0M rows/s (2.0x vs python)",
+    }
+    # always_decline: the fallback perf is the top line's story; no rewrite was served
+    assert perf["always_decline"]["top"].endswith("interpreted python 1.0M rows/s")
+    assert perf["always_decline"]["static"] == ""
+    assert perf["always_decline"]["ai"] == ""
+    assert perf["common_c2f"] == {
+        "top": "- **perf (tpcds bench)**: interpreted python 1.0M rows/s · native vanilla 5.0M (5.0x)",
+        "static": "",
+        "ai": "4.0M rows/s (4.0x vs python)",
+    }
+    assert perf["tpcds_safe_ratio"]["ai"] == ""  # declined: python fallback serves, no suffix
 
 
 def test_perf_lines_missing_csv_is_fatal(tmp_path):
@@ -251,10 +261,21 @@ def test_dump_writes_perf_bullets(spark, tmp_path):
     assert proc.returncode == 0, proc.stderr[-2000:]
     text = out.read_text(encoding="utf-8")
     plus_one = text.split("## plus_one")[1].split("## ")[0]
-    assert "- **perf (micro bench)**: python 2.0M rows/s" in plus_one
-    assert "ai catalyst 8.0M (4.0x)" in plus_one
+    assert (
+        "- **perf (micro bench)**: interpreted python 2.0M rows/s" in plus_one
+    )  # top of section, before the paths
+    assert plus_one.index("perf (micro bench)") < plus_one.index("built-in static (AST)")
+    assert (
+        "- **built-in static (AST)**: `Column<'CAST(+(_udf_param_0, 1) AS BIGINT)'>`"
+        " — 3.0M rows/s (1.5x vs python)" in plus_one
+    )
+    assert (
+        "- **AI (coco / coco-model)**: `_udf_param_0 + 1`"
+        " (attempt_count=1, hypothesis_passed=True) — 8.0M rows/s (4.0x vs python)" in plus_one
+    )
     always = text.split("## always_decline")[1].split("## ")[0]
-    assert "python fallback 1.0M" in always
-    # not benched -> no perf bullet
+    assert "interpreted python 1.0M rows/s" in always
+    assert "vs python)" not in always  # declined: no transpiled arm to measure
+    # not benched -> no perf anywhere
     backwards = text.split("## backwards")[1].split("## ")[0]
     assert "perf" not in backwards
