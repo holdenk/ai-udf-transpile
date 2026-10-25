@@ -6,6 +6,11 @@
 # waits on the backend, pass two is the cache hit where things actually
 # party on. Then dump the cache.
 #
+# The benches run in both passes and write
+# questionable_benchmark_results/examples_transpiled_bench{,_tpcds}.csv;
+# the dump joins them into the doc: interpreted python rows/s at the top of
+# each section, each transpiled arm's rows/s at the end of its own line.
+#
 #   examples/regen_examples_doc.sh                                     # CoCo, cursor fallback
 #   AI_UDF_TRANSPILE_BACKEND=claude examples/regen_examples_doc.sh
 #   examples/regen_examples_doc.sh --rust-accel                     # extra run_demos.sh flags
