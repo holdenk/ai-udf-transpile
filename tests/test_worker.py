@@ -162,9 +162,7 @@ def _run_decline(backend, tmp_path):
         captures={},
     )
     assert cat.claim("k", "coco")
-    process_row(
-        cat, cat.get("k"), backend, spark=None, verify_fn=lambda **k: (True, None)
-    )
+    process_row(cat, cat.get("k"), backend, spark=None, verify_fn=lambda **k: (True, None))
     return cat.get("k")
 
 
