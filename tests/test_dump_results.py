@@ -209,6 +209,13 @@ TPCDS_CSV = (
     "common_c2f,False,1000,1000000,5000000,4000000,4.0,5.0,coco,auto\n"
     "tpcds_safe_ratio,True,1000,900000,4500000,900000,1.0,5.0,coco,auto\n"
 )
+CATALOG_CSV = (
+    "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+    "transpiled_speedup_vs_python,status,target_kind,backend,model\n"
+    "has_item,1000,2000000,6000000,3.0,success,catalyst,ensemble,coco/auto\n"
+    "plus_two,1000,1500000,,,failed,,human,\n"
+    "kms_encrypt,1000,,,,failed,,ensemble,coco/auto\n"
+)
 
 
 def _load_dump_module():
@@ -244,6 +251,38 @@ def test_perf_lines_unit(tmp_path):
         "ai": "4.0M rows/s (4.0x vs python)",
     }
     assert perf["tpcds_safe_ratio"]["ai"] == ""  # declined: python fallback serves, no suffix
+    # catalog CSV: coverage bench, one row per cached function
+    cat = tmp_path / "catalog.csv"
+    cat.write_text(CATALOG_CSV, encoding="utf-8")
+    perf = _load_dump_module()._perf_lines([str(cat)])
+    assert perf["has_item"] == {
+        "top": "- **perf (catalog bench)**: interpreted python 2.0M rows/s",
+        "static": "",
+        "ai": "6.0M rows/s (3.0x vs python)",
+    }
+    # python-only row (no transpiled arm served) keeps the top, no ai suffix
+    assert perf["plus_two"]["ai"] == ""
+    assert perf["plus_two"]["top"].endswith("interpreted python 1.5M rows/s")
+    # skipped function (python raises on the sample): no entry at all
+    assert "kms_encrypt" not in perf
+    # python-skipped but transpiled-measured: the rate survives, labeled
+    widg = tmp_path / "widg.csv"
+    widg.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,status,target_kind,backend,model\n"
+        "widget_name,1000,,884683,,success,catalyst,ensemble,coco/auto\n",
+        encoding="utf-8",
+    )
+    perf = _load_dump_module()._perf_lines([str(widg)])
+    assert perf["widget_name"] == {
+        "top": "",
+        "static": "",
+        "ai": "885k rows/s (no python baseline)",
+    }
+    # merge precedence: later files take over per function with their deeper arms
+    perf = _load_dump_module()._perf_lines([str(cat), str(micro)])
+    assert perf["has_item"]["top"].endswith("interpreted python 2.0M rows/s")  # catalog-only
+    assert perf["plus_one"]["static"] == "3.0M rows/s (1.5x vs python)"  # micro wins
 
 
 def test_perf_lines_missing_csv_is_fatal(tmp_path):

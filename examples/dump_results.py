@@ -96,7 +96,9 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
     the native vanilla arm for tpcds patterns); "static" and "ai" are
     suffixed onto the matching transpiled-path line. Only benched sections
     get numbers; a declined pattern serves python, so its AI line gets no
-    suffix and the top line tells that story.
+    suffix and the top line tells that story. Files overwrite per function,
+    last one wins: pass the wide bench_catalog CSV first, then the deeper
+    micro/tpcds CSVs whose extra arms (static, vanilla, java) take over.
     """
     perf: dict[str, dict[str, str]] = {}
     for path in paths:
@@ -107,7 +109,32 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
             raise SystemExit(f"cannot read perf csv {path}: {exc}")
         if not rows:
             continue
-        if "kinds" in rows[0]:  # bench_micro wide CSV
+        if "target_kind" in rows[0]:  # bench_catalog CSV: every cached function
+            for r in rows:
+                py_rate = r.get("python_rows_per_second")
+                tx_rate = r.get("transpiled_rows_per_second")
+                if not py_rate and not tx_rate:
+                    continue  # skipped function (python raises on the sample)
+                if not py_rate:
+                    # Interpreted arm could not run on the sample; the
+                    # transpiled rate is still a real measurement.
+                    perf[r["function"]] = {
+                        "top": "",
+                        "static": "",
+                        "ai": f"{_fmt_rate(tx_rate)} rows/s (no python baseline)",
+                    }
+                    continue
+                arms = {
+                    "top": f"- **perf (catalog bench)**: interpreted python {_fmt_rate(py_rate)} rows/s",
+                    "static": "",
+                    "ai": "",
+                }
+                if tx_rate and r["status"] == "success":
+                    arms["ai"] = (
+                        f"{_fmt_rate(tx_rate)} rows/s ({r['transpiled_speedup_vs_python']}x vs python)"
+                    )
+                perf[r["function"]] = arms
+        elif "kinds" in rows[0]:  # bench_micro wide CSV
             for r in rows:
                 py = _fmt_rate(r["regular_rows_per_second"])
                 top = f"- **perf (micro bench)**: interpreted python {py} rows/s"
@@ -202,10 +229,11 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
         f"CPython {platform.python_version()}.",
         f"{len(rows)} rows, by status: {by_status}.",
         "Regenerate with `examples/regen_examples_doc.sh`.",
-        "Perf bullets are the local single-node benches (bench_micro.py,",
-        "bench_tpcds_udfs.py): interpreted python rows/s at the top of each",
-        "section, and each transpiled arm's rows/s at the end of its own",
-        "line; no perf = not benched.",
+        "Perf bullets are the local single-node benches (bench_catalog.py for",
+        "every cached function, bench_micro.py / bench_tpcds_udfs.py for the",
+        "deeper arms): interpreted python rows/s at the top of each section,",
+        "and each transpiled arm's rows/s at the end of its own line; no perf",
+        "= not benched or the interpreted arm raises on the bench sample.",
         "",
     ]
     try:

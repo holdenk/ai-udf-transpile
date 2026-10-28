@@ -33,6 +33,14 @@ dev = [
     "ruff>=0.8",
     # Regenerates the README perf graph from the bench CSV (bench_graph.py).
     "matplotlib>=3.8",
+    # The kms_encrypt fixture is the canonical untranspilable UDF. With boto3
+    # absent, every call raises ImportError and verification fails closed;
+    # with boto3 present but credential-less (tests scrub every source), the
+    # NULL-guard row supplies the one successful python eval the vacuous-pass
+    # guard needs and the gate accepts the hallucinated rewrite -- the
+    # documented black-box limit for service-calling UDFs. Both realities are
+    # pinned in tests/test_kms_encrypt.py.
+    "boto3>=1.34",
 ]
 # Documentation-only extra: Delta Lake is not installed from PyPI here.
 delta = []

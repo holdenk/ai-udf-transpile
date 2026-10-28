@@ -200,10 +200,11 @@ def kms_encrypt(text: str, key_id: str) -> str:
     # There is no Catalyst equivalent -- the ciphertext comes from the
     # service and is non-deterministic (the same plaintext encrypts
     # differently every call), so any backend SQL "rewrite" is a
-    # hallucination. In an environment without boto3/credentials the python
-    # side raises on every example, which is the vacuous-pass trap: "python
-    # raise + sql value allowed" would accept ANY rewrite, so verification
-    # requires at least one successful python evaluation and fails closed.
+    # hallucination. Verification requires at least one successful python
+    # evaluation. With boto3 absent, every call raises ImportError and it
+    # fails closed; with boto3 present but credential-less, the None guard
+    # below supplies that one success and the rest is raise+value -- see
+    # the KMS section of main() for the full story.
     import base64
 
     import boto3
@@ -537,11 +538,16 @@ def main() -> int:
 
     # boto3 KMS encryption: untranspilable by nature (service call per row,
     # non-deterministic ciphertext). The type gate queues it (it is fully
-    # annotated), the backend declines, and even a hallucinated rewrite
-    # fails closed: python raises on every example in an environment without
-    # boto3/credentials, and verification requires at least one successful
-    # python evaluation -- otherwise "python raise + sql value allowed"
-    # would accept ANY sql vacuously.
+    # annotated) and the backend declines. The hallucination story depends
+    # on the environment: without boto3, python raises ImportError on every
+    # example and verification fails closed. With boto3 installed but no
+    # credentials, the NULL guard row (text is None -> None) supplies the
+    # one successful python evaluation the vacuous-pass guard requires, and
+    # base64(NULL)=NULL matches it -- every other row is a "python raise +
+    # sql value" allowance, so the differential gate ACCEPTS the rewrite.
+    # Black-box verification cannot refute a service-calling UDF when the
+    # service can never succeed in the verification env; both outcomes are
+    # shown, and only the first is the intended fail-closed story.
     UserDefinedFunction(kms_encrypt, StringType())
     cur = catalog._conn.execute("SELECT udf_key FROM cache WHERE source_text LIKE '%kms_encrypt%'")
     found = cur.fetchone()
@@ -559,9 +565,18 @@ def main() -> int:
             catalyst_sql="base64(_udf_param_0)",  # hallucinated "encryption"
             return_type=StringType(),
         )
-        print("BUG: hallucinated KMS rewrite was accepted")
     except ValueError as exc:
         print(f"register_impl rejected hallucinated KMS rewrite (fail-closed): {str(exc)[:110]}...")
+    else:
+        print(
+            "register_impl ACCEPTED the hallucinated KMS rewrite: boto3 is installed and "
+            "no credentials exist, so the NULL-guard row gives verification its one "
+            "successful python eval and every service-calling row is a python-raise + "
+            "sql-value allowance. The gate is differential -- it cannot refute a "
+            "service-calling UDF when the service cannot succeed here. Do not serve "
+            "rewrites of service-calling UDFs from a verification env that cannot "
+            "reach the service."
+        )
 
     print()
     print("=== WRONG REWRITE REJECTED BY HYPOTHESIS ===")

@@ -7,9 +7,11 @@
 # party on. Then dump the cache.
 #
 # The benches run in both passes and write
-# questionable_benchmark_results/examples_transpiled_bench{,_tpcds}.csv;
+# questionable_benchmark_results/examples_transpiled_bench{,_tpcds,_catalog}.csv;
 # the dump joins them into the doc: interpreted python rows/s at the top of
 # each section, each transpiled arm's rows/s at the end of its own line.
+# bench_catalog.py is the coverage bench -- every cached function gets
+# numbers or a loud skip; micro/tpcds add their deeper arms.
 #
 #   examples/regen_examples_doc.sh                                     # CoCo, cursor fallback
 #   AI_UDF_TRANSPILE_BACKEND=claude examples/regen_examples_doc.sh
@@ -23,7 +25,7 @@ export AI_UDF_TRANSPILE_SQLITE="${AI_UDF_TRANSPILE_SQLITE:-$REPO_ROOT/target/exa
 mkdir -p "$(dirname "$AI_UDF_TRANSPILE_SQLITE")" "$REPO_ROOT/questionable_benchmark_results"
 rm -f "$AI_UDF_TRANSPILE_SQLITE"{,-wal,-shm}
 
-ARGS=(--bench --bench-tpcds --csv "$REPO_ROOT/questionable_benchmark_results/examples_transpiled_bench.csv" "$@")
+ARGS=(--bench --bench-tpcds --bench-all --csv "$REPO_ROOT/questionable_benchmark_results/examples_transpiled_bench.csv" "$@")
 echo "##### pass 1/2: filling $AI_UDF_TRANSPILE_SQLITE from $AI_UDF_TRANSPILE_BACKEND #####"
 "$REPO_ROOT/examples/run_demos.sh" "${ARGS[@]}" || echo "pass 1 had failures; pass 2 decides"
 echo "##### pass 2/2: cache hits, then the dump #####"

@@ -54,9 +54,11 @@ LIVE=0
 BENCH=0
 BENCH_BYTECODE=0
 BENCH_TPCDS=0
+BENCH_ALL=0
 DUMP=0
 CSV=""
 TPCDS_CSV=""
+CATALOG_CSV=""
 TRANSPILE_TIMING_CSV=""
 RUST_ACCEL=0
 RUST_PRESET="comet"
@@ -67,12 +69,14 @@ while [ $# -gt 0 ]; do
     --bench) BENCH=1 ;;
     --bench-bytecode) BENCH_BYTECODE=1 ;;
     --bench-tpcds) BENCH_TPCDS=1 ;;
+    --bench-all) BENCH_ALL=1 ;;
     --dump) DUMP=1 ;;
     # Passed through to bench_micro.py; implies --bench (only the bench reads it).
     --csv)
       [ $# -ge 2 ] || { echo "error: --csv needs a path" >&2; exit 2; }
       CSV="$2"
       TPCDS_CSV="${CSV%.csv}_tpcds.csv"
+      CATALOG_CSV="${CSV%.csv}_catalog.csv"
       BENCH=1
       shift
       ;;
@@ -159,12 +163,23 @@ if [ "$BENCH_TPCDS" -eq 1 ]; then
   run_demo "tpcds udf bench" "${TPCDS_ARGS[@]}"
 fi
 
+if [ "$BENCH_ALL" -eq 1 ]; then
+  [ -n "${AI_UDF_TRANSPILE_SQLITE:-}" ] || { echo "error: --bench-all needs AI_UDF_TRANSPILE_SQLITE" >&2; exit 2; }
+  BCAT_ARGS=(examples/bench_catalog.py --sqlite "$AI_UDF_TRANSPILE_SQLITE")
+  if [ -n "$CSV" ]; then
+    BCAT_ARGS+=(--csv "$CATALOG_CSV")
+  fi
+  run_demo "catalog bench" "${BCAT_ARGS[@]}"
+fi
+
 if [ "$DUMP" -eq 1 ]; then
   [ -n "${AI_UDF_TRANSPILE_SQLITE:-}" ] || { echo "error: --dump needs AI_UDF_TRANSPILE_SQLITE" >&2; exit 2; }
   DUMP_ARGS=(examples/dump_results.py --sqlite "$AI_UDF_TRANSPILE_SQLITE" --out docs/EXAMPLES_TRANSPILED.md)
   if [ -n "$CSV" ]; then
+    # Catalog CSV first (widest coverage); micro/tpcds take over per function
+    # with their deeper arms. Later --perf-csv files win.
+    [ -f "$CATALOG_CSV" ] && DUMP_ARGS+=(--perf-csv "$CATALOG_CSV")
     DUMP_ARGS+=(--perf-csv "$CSV")
-    # Only when the tpcds bench actually ran; otherwise no tpcds bullets.
     [ -f "$TPCDS_CSV" ] && DUMP_ARGS+=(--perf-csv "$TPCDS_CSV")
   fi
   run_demo "dump" "${DUMP_ARGS[@]}"

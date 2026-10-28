@@ -14,6 +14,28 @@ from ai_udf_transpile import shutdown
 
 _REPO = Path(__file__).resolve().parents[1]
 
+# Ambient AWS variables break the test env two ways: a classic session
+# cannot start on hosts where they force a failing InetAddress.getLocalHost()
+# (the gateway dies before its port), and botocore would stall on IMDS
+# lookups. Scrub them before anything imports Spark or boto3.
+for _key in (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_DEFAULT_REGION",
+    "AWS_REGION",
+    "AWS_CA_BUNDLE",
+    "AWS_PROFILE",
+):
+    os.environ.pop(_key, None)
+os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+# Env scrubbing is not enough: botocore also resolves credentials from
+# ~/.aws/credentials, ~/.aws/config, and the SSO cli cache -- a developer
+# box with any of those would make the kms fixture call the real service
+# mid-verification. Point every file source at nothing.
+os.environ["AWS_SHARED_CREDENTIALS_FILE"] = "/dev/null"
+os.environ["AWS_CONFIG_FILE"] = "/dev/null"
+
 
 def _bootstrap_spark_home() -> None:
     home = os.environ.get("SPARK_HOME")
@@ -28,9 +50,19 @@ def _bootstrap_spark_home() -> None:
     if py not in sys.path:
         sys.path.insert(0, py)
     lib = Path(home) / "python" / "lib"
+    jars = []
     for z in glob.glob(str(lib / "py4j-*.zip")):
         if z not in sys.path:
             sys.path.insert(0, z)
+        jars.append(z)
+    if jars:
+        # Subprocess tests (dump_results, bench_catalog) re-exec python and
+        # need pyspark importable there too -- conftest's sys.path surgery
+        # does not survive exec. Mirror CI's PYTHONPATH so local runs match.
+        env_path = py + os.pathsep + os.pathsep.join(jars)
+        existing = os.environ.get("PYTHONPATH", "")
+        if env_path not in existing:
+            os.environ["PYTHONPATH"] = env_path + (os.pathsep + existing if existing else "")
 
 
 _bootstrap_spark_home()

@@ -27,7 +27,14 @@ A working experiment, not a dependency:
   not "faithful". String columns are not invented: a string may hold a
   date, JSON, or a number. Set
   `spark.sql.experimental.aiUdfTranspile.partyOnStrings` to generate
-  string values anyway.
+  string values anyway. And for service-calling UDFs the gate is only as
+  strong as the verification env: with the service unreachable, a
+  NULL-guarded function (return None on NULL, call the service otherwise)
+  supplies the one successful python eval the vacuous-pass guard needs,
+  and every service-calling row is a python-raise + sql-value allowance --
+  so a hallucinated rewrite of `kms_encrypt` verifies in an env without
+  AWS credentials. Verification cannot refute a service it cannot reach;
+  do not serve rewrites of service-calling UDFs from such an env.
 - **Generated code runs in your driver.** The rewrite is SQL you execute
   and, for java UDFs, javac output loaded into the session. The CLI
   backends write into a sandbox directory — that is a work dir, not a
