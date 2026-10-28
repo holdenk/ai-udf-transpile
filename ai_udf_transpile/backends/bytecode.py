@@ -105,15 +105,22 @@ class BytecodeBackend:
             key = canonical_source_text(job.source_text)
         except Exception:
             raise BackendDecline("could not parse source text")
-        code = compile(key, "<bytecode-backend>", "exec")
-        func_code = next((c for c in code.co_consts if isinstance(c, types.CodeType)), None)
-        if func_code is None:
-            raise BackendDecline("no function code object found")
-        if func_code.co_exceptiontable:
-            raise BackendDecline("try/except not supported")
-        param_kinds = [_truth_kind(t) for t in job.input_types]
-        evaluator = _Evaluator(job.param_names, func_code, param_kinds)
-        result = evaluator.evaluate(list(dis.get_instructions(func_code)))
+        try:
+            code = compile(key, "<bytecode-backend>", "exec")
+            func_code = next((c for c in code.co_consts if isinstance(c, types.CodeType)), None)
+            if func_code is None:
+                raise BackendDecline("no function code object found")
+            if func_code.co_exceptiontable:
+                raise BackendDecline("try/except not supported")
+            param_kinds = [_truth_kind(t) for t in job.input_types]
+            evaluator = _Evaluator(job.param_names, func_code, param_kinds)
+            result = evaluator.evaluate(list(dis.get_instructions(func_code)))
+        except BackendDecline:
+            raise
+        except Exception as exc:
+            # A deterministic backend's crash is deterministic: decline
+            # (and cool down) instead of burning retries on it.
+            raise BackendDecline(f"bytecode walk failed: {type(exc).__name__}: {exc}") from exc
         if result is None:
             raise BackendDecline("function has no return path")
         (sandbox / "OUT.sql").write_text(result[0] + "\n", encoding="utf-8")

@@ -330,6 +330,21 @@ def test_try_except_declined():
         BytecodeBackend().run(job, make_sandbox(job).__enter__())
 
 
+def test_walker_crash_is_a_decline_not_an_error(monkeypatch):
+    # An unexpected bytecode shape crashes the walk deterministically, so it
+    # must surface as a decline (cooldown) -- not a retryable BackendError
+    # burning the row's retries on the same crash.
+    import ai_udf_transpile.backends.bytecode as bytecode_mod
+
+    def boom(self, instructions):
+        raise ValueError("unexpected instruction shape")
+
+    monkeypatch.setattr(bytecode_mod._Evaluator, "evaluate", boom)
+    job = _job_for(plus_one)
+    with pytest.raises(BackendDecline, match="bytecode walk failed: ValueError"):
+        BytecodeBackend().run(job, make_sandbox(job).__enter__())
+
+
 def test_backslash_string_declined():
     def f(s: str) -> str:
         return s + "\\n"
