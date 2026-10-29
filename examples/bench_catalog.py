@@ -11,6 +11,12 @@ for all of it.
 Fail-open by function: one benign sample value per input type, and any
 function whose interpreted arm raises on it (kms_encrypt, ...) is skipped
 loudly rather than given numbers.
+
+When $AI_UDF_TRANSPILE_COMET_JAR (or $COMET_JAR) points at a Comet jar, a
+second session runs the served SQL under Comet's native acceleration too,
+writing comet_rows_per_second / comet_speedup_vs_python -- the doc's
+"comet" arm. A function whose plan falls back to Spark gets no comet
+number, said loudly.
 """
 
 from __future__ import annotations
@@ -151,6 +157,86 @@ def _time_arm(df, udf, rounds: int) -> float | None:
     return best if best < float("inf") else None
 
 
+def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], comet_jar: str) -> None:
+    """The same served SQL, executed natively by Comet, in a fresh JVM: the jar
+    must be on the driver classpath at launch, so the first session's gateway
+    (and its JVM) is retired first."""
+    from pyspark import SparkContext
+
+    gateway = SparkContext._gateway
+    if gateway is not None:
+        proc = getattr(gateway, "proc", None)
+        gateway.shutdown()
+        if proc is not None:
+            proc.terminate()
+    SparkContext._gateway = None
+    SparkContext._jvm = None
+    spark = (
+        SparkSession.builder.master("local[*]")
+        .appName("ai-udf-transpile-bench-catalog-comet")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "1")
+        .config("spark.sql.ansi.enabled", "true")
+        .config("spark.jars", comet_jar)
+        .config("spark.driver.extraClassPath", comet_jar)
+        .config("spark.executor.extraClassPath", comet_jar)
+        .config("spark.plugins", "org.apache.spark.CometPlugin")
+        .config("spark.comet.enabled", "true")
+        # Without this the extension disables itself on session start.
+        .config("spark.comet.shuffle.enabled", "false")
+        .config("spark.memory.offHeap.enabled", "true")
+        .config("spark.memory.offHeap.size", "1g")
+        .getOrCreate()
+    )
+    scratch = tempfile.mkdtemp(prefix="bench-catalog-comet-")
+    try:
+        enable(spark, sqlite_path=args.sqlite, inline_worker=False)
+        spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
+        spark.conf.set(TRANSPILE_CONF, "true")
+        cats = sorted({c for r in rows for c in r.input_categories})
+        conf.set_value(conf.INPUT_CATEGORIES, ",".join(cats), spark)
+        for row in rows:
+            entry = out.get(row.udf_key)
+            if entry is None or entry["status"] != "success" or not entry["transpiled_rows_per_second"]:
+                continue
+            name = entry["function"]
+            values = _values_for(row.input_types)
+            try:
+                func = _import_function(row.source_text, name)
+                # Comet has no native LocalTableScan, and an all-literal frame
+                # would constant-fold the UDF away; a parquet scan is a real leaf.
+                path = f"{scratch}/{row.udf_key}"
+                spark.createDataFrame(
+                    [tuple(values)] * args.rows,
+                    schema=", ".join(f"arg{i} {t}" for i, t in enumerate(row.input_types)),
+                ).write.parquet(path)
+                df = spark.read.parquet(path)
+            except Exception as exc:
+                print(f"{name}: no comet frame for sample ({type(exc).__name__})")
+                continue
+            udf = UserDefinedFunction(func, _parse_datatype_string(row.return_type))
+            if not udf.transpiled:
+                continue
+            arm = df.select(udf(*[f"arg{i}" for i in range(len(row.input_types))]))
+            if "CometProject" not in arm._jdf.queryExecution().executedPlan().toString():
+                print(f"{name}: comet fell back to Spark -- no native number")
+                continue
+            comet_secs = _time_arm(df, udf, args.rounds)
+            if comet_secs:
+                entry["comet_rows_per_second"] = round(args.rows / comet_secs)
+                if row.udf_key in py_secs:
+                    entry["comet_speedup_vs_python"] = round(py_secs[row.udf_key] / comet_secs, 1)
+                print(
+                    f"{name:24} comet={entry['comet_rows_per_second']:>10}"
+                    f" ({entry['comet_speedup_vs_python'] or '-'}x vs python)"
+                )
+    finally:
+        spark.conf.set(TRANSPILE_CONF, "false")
+        shutdown()
+        spark.stop()
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sqlite", default=os.environ.get("AI_UDF_TRANSPILE_SQLITE", ""))
@@ -193,7 +279,8 @@ def main() -> int:
     conf.set_value(conf.INPUT_CATEGORIES, ",".join(cats), spark)
     conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
 
-    out: list[list] = []
+    out: dict[str, dict] = {}  # by udf_key: two cache rows may share a function name
+    py_secs: dict[str, float] = {}
     for row in rows:
         name = _function_name(row.source_text) or row.udf_key[:12]
         values = _values_for(row.input_types)
@@ -203,21 +290,22 @@ def main() -> int:
                 func = _import_function(row.source_text, name)
             except Exception as exc:
                 print(f"{name}: import failed: {type(exc).__name__}: {exc}")
+        entry = {
+            "function": name,
+            "rows": args.rows,
+            "python_rows_per_second": "",
+            "transpiled_rows_per_second": "",
+            "transpiled_speedup_vs_python": "",
+            "comet_rows_per_second": "",
+            "comet_speedup_vs_python": "",
+            "status": row.status,
+            "target_kind": row.target_kind or "",
+            "backend": row.backend or "",
+            "model": row.model or "",
+        }
+        out[row.udf_key] = entry
         if values is None or func is None:
             print(f"{name}: skipped (no sample values or not importable)")
-            out.append(
-                [
-                    name,
-                    args.rows,
-                    "",
-                    "",
-                    "",
-                    row.status,
-                    row.target_kind or "",
-                    row.backend or "",
-                    row.model or "",
-                ]
-            )
             continue
         df = spark.createDataFrame(
             [tuple(values)] * args.rows,
@@ -226,7 +314,7 @@ def main() -> int:
         rtype = _parse_datatype_string(row.return_type)
 
         spark.conf.set(TRANSPILE_CONF, "false")
-        py_secs = _time_arm(df, UserDefinedFunction(func, rtype), args.rounds)
+        py_t = _time_arm(df, UserDefinedFunction(func, rtype), args.rounds)
         tx_secs = None
         spark.conf.set(TRANSPILE_CONF, "true")
         if row.status == "success":
@@ -235,50 +323,40 @@ def main() -> int:
                 tx_secs = _time_arm(df, udf, args.rounds)
             else:
                 print(f"{name}: transpiled arm not served (no hit) -- python only")
-        py_rate = round(args.rows / py_secs) if py_secs else ""
+        py_rate = round(args.rows / py_t) if py_t else ""
         tx_rate = round(args.rows / tx_secs) if tx_secs else ""
-        speedup = round(py_secs / tx_secs, 1) if (py_secs and tx_secs) else ""
-        note = "" if py_secs else "python raises on the sample; skipped"
+        entry["python_rows_per_second"] = py_rate
+        entry["transpiled_rows_per_second"] = tx_rate
+        entry["transpiled_speedup_vs_python"] = round(py_t / tx_secs, 1) if (py_t and tx_secs) else ""
+        if py_t:
+            py_secs[row.udf_key] = py_t
+        note = "" if py_t else "python raises on the sample; skipped"
         print(
             f"{name:24} python={py_rate or '-':>10} transpiled={tx_rate or '-':>10}"
-            f" speedup={speedup or '-':>6} {note}"
+            f" speedup={entry['transpiled_speedup_vs_python'] or '-':>6} {note}"
         )
-        out.append(
-            [
-                name,
-                args.rows,
-                py_rate,
-                tx_rate,
-                speedup,
-                row.status,
-                row.target_kind or "",
-                row.backend or "",
-                row.model or "",
-            ]
-        )
-
-    if args.csv:
-        with open(args.csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "function",
-                    "rows",
-                    "python_rows_per_second",
-                    "transpiled_rows_per_second",
-                    "transpiled_speedup_vs_python",
-                    "status",
-                    "target_kind",
-                    "backend",
-                    "model",
-                ]
-            )
-            writer.writerows(out)
-        print(f"csv: wrote {len(out)} rows to {args.csv}")
 
     spark.conf.set(TRANSPILE_CONF, "false")
     shutdown()
     spark.stop()
+
+    comet_jar = os.environ.get("AI_UDF_TRANSPILE_COMET_JAR") or os.environ.get("COMET_JAR") or ""
+    if comet_jar and not Path(comet_jar).exists():
+        print(f"comet jar {comet_jar} not found; skipping comet arm", file=sys.stderr)
+        comet_jar = ""
+    if comet_jar:
+        try:
+            _comet_phase(args, rows, out, py_secs, comet_jar)
+        except Exception as exc:  # fail open: the python/transpiled numbers still land
+            print(f"comet arm failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(next(iter(out.values()))))
+            writer.writeheader()
+            writer.writerows(out.values())
+        print(f"csv: wrote {len(out)} rows to {args.csv}")
+
     if _IMPORT_DIR is not None:
         shutil.rmtree(_IMPORT_DIR, ignore_errors=True)
     return 0

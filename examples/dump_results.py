@@ -133,6 +133,12 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     arms["ai"] = (
                         f"{_fmt_rate(tx_rate)} rows/s ({r['transpiled_speedup_vs_python']}x vs python)"
                     )
+                comet = r.get("comet_rows_per_second")
+                if comet and arms["ai"] and r.get("comet_speedup_vs_python"):
+                    # The same served SQL, executed natively by Comet.
+                    arms["ai"] += (
+                        f" · comet {_fmt_rate(comet)} rows/s ({r['comet_speedup_vs_python']}x vs python)"
+                    )
                 perf[r["function"]] = arms
         elif "kinds" in rows[0]:  # bench_micro wide CSV
             for r in rows:
@@ -232,7 +238,8 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
         "Perf bullets are the local single-node benches (bench_catalog.py for",
         "every cached function, bench_micro.py / bench_tpcds_udfs.py for the",
         "deeper arms): interpreted python rows/s at the top of each section,",
-        "and each transpiled arm's rows/s at the end of its own line; no perf",
+        "and each transpiled arm's rows/s at the end of its own line -- with a",
+        "comet arm when the catalog bench ran against a Comet build; no perf",
         "= not benched or the interpreted arm raises on the bench sample.",
         "",
     ]

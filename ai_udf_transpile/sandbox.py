@@ -75,7 +75,7 @@ def job_appendix(job: TranspileJob, inputs: Optional[str] = None) -> str:
         indent=2,
     )
     captures = json.dumps(job.captures, indent=2, default=str)
-    files_on_disk = [name for name, on in (("udf.py", show_source), ("disassembly.txt", show_bytecode))]
+    files_on_disk = [name for name, on in (("udf.py", show_source), ("disassembly.txt", show_bytecode)) if on]
     if files_on_disk:
         listing = "`" + "`, `".join(files_on_disk) + "`, "
     else:

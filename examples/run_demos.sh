@@ -9,6 +9,7 @@
 #   examples/run_demos.sh --bench --rust-accel [--rust-accel-conf key=value]
 #   examples/run_demos.sh --bench-bytecode        # python vs static (AST) vs bytecode->SQL vs Java bytecode eval
 #   examples/run_demos.sh --bench-tpcds           # TPC-DS-inspired UDF patterns vs vanilla SQL
+#   examples/run_demos.sh --all-benches --csv out.csv  # every bench: micro (+comet if COMET_JAR), bytecode, tpcds, catalog; then the graphs
 #   examples/run_demos.sh --dump                  # + dump $AI_UDF_TRANSPILE_SQLITE to docs/EXAMPLES_TRANSPILED.md
 #   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 #
@@ -55,10 +56,12 @@ BENCH=0
 BENCH_BYTECODE=0
 BENCH_TPCDS=0
 BENCH_ALL=0
+ALL_BENCHES=0
 DUMP=0
 CSV=""
 TPCDS_CSV=""
 CATALOG_CSV=""
+BYTECODE_CSV=""
 TRANSPILE_TIMING_CSV=""
 RUST_ACCEL=0
 RUST_PRESET="comet"
@@ -70,6 +73,14 @@ while [ $# -gt 0 ]; do
     --bench-bytecode) BENCH_BYTECODE=1 ;;
     --bench-tpcds) BENCH_TPCDS=1 ;;
     --bench-all) BENCH_ALL=1 ;;
+    # Every bench and every transpiled arm (static, bytecode, ai, comet).
+    --all-benches)
+      ALL_BENCHES=1
+      BENCH=1
+      BENCH_BYTECODE=1
+      BENCH_TPCDS=1
+      BENCH_ALL=1
+      ;;
     --dump) DUMP=1 ;;
     # Passed through to bench_micro.py; implies --bench (only the bench reads it).
     --csv)
@@ -77,6 +88,7 @@ while [ $# -gt 0 ]; do
       CSV="$2"
       TPCDS_CSV="${CSV%.csv}_tpcds.csv"
       CATALOG_CSV="${CSV%.csv}_catalog.csv"
+      BYTECODE_CSV="${CSV%.csv}_bytecode.csv"
       BENCH=1
       shift
       ;;
@@ -108,6 +120,12 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# The comet arm of the micro bench rides along whenever a jar is configured.
+if [ "$ALL_BENCHES" -eq 1 ] && [ "$RUST_ACCEL" -eq 0 ] \
+   && { [ -n "${AI_UDF_TRANSPILE_COMET_JAR:-}" ] || [ -n "${COMET_JAR:-}" ]; }; then
+  RUST_ACCEL=1
+fi
 
 NAMES=()
 STATUS=()
@@ -151,7 +169,7 @@ fi
 
 if [ "$BENCH_BYTECODE" -eq 1 ]; then
   BC_ARGS=(examples/bench_bytecode_vs_static.py)
-  [ -n "$CSV" ] && BC_ARGS+=(--csv "$CSV")
+  [ -n "$CSV" ] && BC_ARGS+=(--csv "$BYTECODE_CSV")
   run_demo "bytecode vs static bench" "${BC_ARGS[@]}"
 fi
 
@@ -170,6 +188,12 @@ if [ "$BENCH_ALL" -eq 1 ]; then
     BCAT_ARGS+=(--csv "$CATALOG_CSV")
   fi
   run_demo "catalog bench" "${BCAT_ARGS[@]}"
+fi
+
+if [ "$ALL_BENCHES" -eq 1 ] && [ -n "$CSV" ]; then
+  [ -f "$CSV" ] && run_demo "graph: micro" examples/bench_graph.py "$CSV" docs/bench_perf.png
+  [ -f "$BYTECODE_CSV" ] && run_demo "graph: bytecode" examples/bench_graph.py "$BYTECODE_CSV" docs/bench_bytecode.png
+  run_demo "graph: aggregate" examples/bench_graph_aggregate.py "$(dirname "$CSV")" --png "$(dirname "$CSV")/bench_aggregate.png"
 fi
 
 if [ "$DUMP" -eq 1 ]; then

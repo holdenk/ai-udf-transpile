@@ -30,6 +30,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-cov>=5.0",
     "ruff>=0.8",
     # Regenerates the README perf graph from the bench CSV (bench_graph.py).
     "matplotlib>=3.8",

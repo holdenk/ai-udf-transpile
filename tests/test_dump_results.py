@@ -211,10 +211,11 @@ TPCDS_CSV = (
 )
 CATALOG_CSV = (
     "function,rows,python_rows_per_second,transpiled_rows_per_second,"
-    "transpiled_speedup_vs_python,status,target_kind,backend,model\n"
-    "has_item,1000,2000000,6000000,3.0,success,catalyst,ensemble,coco/auto\n"
-    "plus_two,1000,1500000,,,failed,,human,\n"
-    "kms_encrypt,1000,,,,failed,,ensemble,coco/auto\n"
+    "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+    "status,target_kind,backend,model\n"
+    "has_item,1000,2000000,6000000,3.0,9000000,4.5,success,catalyst,ensemble,coco/auto\n"
+    "plus_two,1000,1500000,,,,,failed,,human,\n"
+    "kms_encrypt,1000,,,,,,failed,,ensemble,coco/auto\n"
 )
 
 
@@ -258,7 +259,7 @@ def test_perf_lines_unit(tmp_path):
     assert perf["has_item"] == {
         "top": "- **perf (catalog bench)**: interpreted python 2.0M rows/s",
         "static": "",
-        "ai": "6.0M rows/s (3.0x vs python)",
+        "ai": "6.0M rows/s (3.0x vs python) · comet 9.0M rows/s (4.5x vs python)",
     }
     # python-only row (no transpiled arm served) keeps the top, no ai suffix
     assert perf["plus_two"]["ai"] == ""

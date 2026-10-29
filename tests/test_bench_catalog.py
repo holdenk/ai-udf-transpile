@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import subprocess
 import sys
 import time
@@ -65,6 +66,7 @@ def test_bench_catalog_writes_rates_and_speedups(catalog, tmp_path):
         capture_output=True,
         text=True,
         timeout=600,
+        env={k: v for k, v in os.environ.items() if k not in ("AI_UDF_TRANSPILE_COMET_JAR", "COMET_JAR")},
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     rows = {r["function"]: r for r in csv.DictReader(out.open())}
@@ -86,3 +88,35 @@ def test_bench_catalog_missing_sqlite(tmp_path):
         timeout=60,
     )
     assert proc.returncode != 0
+
+
+def test_bench_catalog_comet_arm(catalog, tmp_path):
+    """CI's comet job (AI_UDF_TRANSPILE_TEST_COMET_JAR set) gets a native arm."""
+    jar = os.environ.get("AI_UDF_TRANSPILE_TEST_COMET_JAR", "")
+    if not jar or not Path(jar).exists():
+        pytest.skip("set AI_UDF_TRANSPILE_TEST_COMET_JAR to a Comet jar to run the comet arm")
+    out = tmp_path / "bench_catalog_comet.csv"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(BENCH),
+            "--sqlite",
+            catalog,
+            "--rows",
+            "1000",
+            "--rounds",
+            "1",
+            "--csv",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        env={**os.environ, "AI_UDF_TRANSPILE_COMET_JAR": jar},
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    rows = {r["function"]: r for r in csv.DictReader(out.open())}
+    assert rows["plus_one"]["comet_rows_per_second"]
+    assert float(rows["plus_one"]["comet_speedup_vs_python"]) > 0
+    # always_decline has no served rewrite: no comet number either
+    assert rows["always_decline"]["comet_rows_per_second"] == ""
