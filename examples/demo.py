@@ -551,7 +551,11 @@ def main() -> int:
     UserDefinedFunction(kms_encrypt, StringType())
     cur = catalog._conn.execute("SELECT udf_key FROM cache WHERE source_text LIKE '%kms_encrypt%'")
     found = cur.fetchone()
-    if found:
+    # A rerun on the same cache already holds the register_impl row below.
+    prior = catalog.get(found[0]) if found else None
+    if prior is not None and prior.origin == "human":
+        print(f"kms_encrypt: status={prior.status} origin=human (registered by an earlier run)")
+    elif found:
         row = wait_for_status(catalog, found[0], "failed")
         print(
             f"kms_encrypt (boto3 KMS per row): status={row.status} origin={row.origin} "

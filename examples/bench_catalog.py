@@ -8,9 +8,9 @@ for all of it.
   python examples/bench_catalog.py --sqlite target/examples_transpiled.sqlite
   python examples/bench_catalog.py --sqlite ... --csv out.csv --rows 100000
 
-Fail-open by function: one benign sample value per input type, and any
-function whose interpreted arm raises on it (kms_encrypt, ...) is skipped
-loudly rather than given numbers.
+Fail-open by function: one benign sample value per input type. A function
+whose interpreted arm raises on it (kms_encrypt, ...) gets no python number
+and no speedup, said loudly; a served rewrite still gets its own rows/s.
 
 When $AI_UDF_TRANSPILE_COMET_JAR (or $COMET_JAR) points at a Comet jar, a
 second session runs the served SQL under Comet's native acceleration too,
@@ -176,6 +176,19 @@ def _plans_python(df, udf) -> bool:
         return False  # planning errors surface in _time_arm, as before
 
 
+def _session(app: str, extra: dict[str, str] | None = None) -> SparkSession:
+    builder = (
+        SparkSession.builder.master("local[*]")
+        .appName(app)
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "1")
+        .config("spark.sql.ansi.enabled", "true")
+    )
+    for key, value in (extra or {}).items():
+        builder = builder.config(key, value)
+    return builder.getOrCreate()
+
+
 def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], comet_jar: str) -> None:
     """The same served SQL, executed natively by Comet, in a fresh JVM: the jar
     must be on the driver classpath at launch, so the first session's gateway
@@ -190,22 +203,19 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
             proc.terminate()
     SparkContext._gateway = None
     SparkContext._jvm = None
-    spark = (
-        SparkSession.builder.master("local[*]")
-        .appName("ai-udf-transpile-bench-catalog-comet")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "1")
-        .config("spark.sql.ansi.enabled", "true")
-        .config("spark.jars", comet_jar)
-        .config("spark.driver.extraClassPath", comet_jar)
-        .config("spark.executor.extraClassPath", comet_jar)
-        .config("spark.plugins", "org.apache.spark.CometPlugin")
-        .config("spark.comet.enabled", "true")
-        # Without this the extension disables itself on session start.
-        .config("spark.comet.shuffle.enabled", "false")
-        .config("spark.memory.offHeap.enabled", "true")
-        .config("spark.memory.offHeap.size", "1g")
-        .getOrCreate()
+    spark = _session(
+        "ai-udf-transpile-bench-catalog-comet",
+        {
+            "spark.jars": comet_jar,
+            "spark.driver.extraClassPath": comet_jar,
+            "spark.executor.extraClassPath": comet_jar,
+            "spark.plugins": "org.apache.spark.CometPlugin",
+            "spark.comet.enabled": "true",
+            # Without this the extension disables itself on session start.
+            "spark.comet.shuffle.enabled": "false",
+            "spark.memory.offHeap.enabled": "true",
+            "spark.memory.offHeap.size": "1g",
+        },
     )
     scratch = tempfile.mkdtemp(prefix="bench-catalog-comet-")
     try:
@@ -300,14 +310,7 @@ def main() -> int:
         print(f"{args.sqlite} has zero rows", file=sys.stderr)
         return 1
 
-    spark = (
-        SparkSession.builder.master("local[*]")
-        .appName("ai-udf-transpile-bench-catalog")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "1")
-        .config("spark.sql.ansi.enabled", "true")
-        .getOrCreate()
-    )
+    spark = _session("ai-udf-transpile-bench-catalog")
     # Cache hits only: no backend needed (and none consulted -- a CI env that
     # sets AI_UDF_TRANSPILE_BACKEND=fake must not break this, and a version
     # mismatch must not let a worker fire AI calls or write to the catalog
