@@ -638,12 +638,6 @@ def _smoke_test_reconstruction(
     if spark is None:
         return None
     try:
-        from pyspark.sql.types import StructField, StructType
-        from pyspark.sql.udf import UserDefinedFunction
-
-        from ai_udf_transpile.transpiler import register_transpiler
-
-        register_transpiler()
         try:
             spark.conf.set("spark.sql.experimental.optimizer.transpilePyUDFs", "true")
             current = spark.conf.get("spark.sql.experimental.optimizer.pyTranspilers", "") or ""
@@ -655,6 +649,12 @@ def _smoke_test_reconstruction(
         except Exception:
             logger.debug("could not enable transpile confs for smoke test", exc_info=True)
             return "smoke test could not arm the transpile confs"
+        from pyspark.sql.types import StructField, StructType
+        from pyspark.sql.udf import UserDefinedFunction
+
+        from ai_udf_transpile.transpiler import register_transpiler
+
+        register_transpiler()
         f = func
         if f is None:
             f = load_python_udf(source_text, captures)

@@ -580,6 +580,7 @@ def test_strategy_for_decimal_and_binary_and_rejects_unknown():
         _strategy_for("not_a_real_type")
 
 
+@pytest.mark.spark
 def test_spark_type_timestamp_ntz():
     from pyspark.sql.types import TimestampNTZType
 
