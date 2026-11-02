@@ -250,16 +250,18 @@ def main() -> int:
         if rust_preset == "comet":
             rust_confs.update(RUST_COMET_CONFS)
             comet_jar = _comet_jar_from_env()
+            if comet_jar and not Path(comet_jar).is_file():
+                parser.error(f"Comet jar does not exist: {comet_jar}")
+            classpath_override = {"spark.jars", "spark.driver.extraClassPath"} & rust_extra.keys()
+            if not comet_jar and not classpath_override:
+                parser.error(
+                    "--rust-accel-preset comet requires an existing jar via "
+                    "AI_UDF_TRANSPILE_COMET_JAR/COMET_JAR or spark.jars via --rust-accel-conf"
+                )
             if comet_jar:
                 rust_confs.setdefault("spark.jars", comet_jar)
                 rust_confs.setdefault("spark.driver.extraClassPath", comet_jar)
                 rust_confs.setdefault("spark.executor.extraClassPath", comet_jar)
-            else:
-                print(
-                    "warning: rust preset 'comet' expects Comet on classpath; set "
-                    "AI_UDF_TRANSPILE_COMET_JAR or COMET_JAR",
-                    file=sys.stderr,
-                )
         rust_confs.update(rust_extra)
         for key, value in sorted(rust_confs.items()):
             builder = builder.config(key, value)

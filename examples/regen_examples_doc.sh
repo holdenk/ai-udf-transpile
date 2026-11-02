@@ -7,7 +7,7 @@
 # party on. Then dump the cache.
 #
 # The benches run in both passes and write
-# questionable_benchmark_results/examples_transpiled_bench{,_bytecode,_tpcds,_catalog}.csv;
+# questionable_benchmark_results/examples_transpiled_bench{,_comet,_bytecode,_tpcds,_catalog}.csv;
 # the dump joins them into the doc: interpreted python rows/s at the top of
 # each section, each transpiled arm's rows/s at the end of its own line.
 # Pass 2 is --all-benches: every bench (micro, bytecode, tpcds, catalog) and the

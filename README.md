@@ -229,8 +229,11 @@ and plain-vs-AI UDF lookup/definition costs. `--rust-accel` runs the same
 bench with rust acceleration Spark configs enabled (default preset: Comet; add
 `--rust-accel-conf key=value` for local overrides). For the Comet preset, set
 `AI_UDF_TRANSPILE_COMET_JAR` (or `COMET_JAR`) so the plugin jar is on Spark's
-classpath; `examples/setup_comet.sh` can clone/build Comet from source and emit
-the exports for your current Spark checkout.
+classpath; a missing jar is an error, not silent plain-Spark output.
+`examples/setup_comet.sh` can clone/build Comet from source and emit the exports
+for your current Spark checkout. With `--all-benches`, plain and Comet micro
+runs write separate `bench.csv` / `bench_comet.csv` files and separate graphs,
+so Comet measurements are never mislabeled as plain Spark.
 
 `examples/bench_tpcds_udfs.py` benchmarks UDF patterns extracted from real
 TPC-DS queries (substring comparison from q19, safe ratio from q34, sales
