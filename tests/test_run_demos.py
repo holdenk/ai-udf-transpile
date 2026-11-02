@@ -34,8 +34,10 @@ def test_all_benches_flag_is_wired():
     assert demos.index("examples/bench_fhi_udfs.py") < demos.index("examples/bench_catalog.py")
     # ...which only happens with the live arm on: the pinned arms fill nothing.
     assert "examples/bench_fhi_udfs.py --ai" in demos
-    # One CSV per bench: micro and bytecode must not share a path.
+    # One CSV per bench: micro and bytecode must not share a path, and the
+    # bytecode arms must reach the generated examples document.
     assert "BYTECODE_CSV" in demos
+    assert 'DUMP_ARGS+=(--perf-csv "$BYTECODE_CSV")' in demos
     regen = (EXAMPLES / "regen_examples_doc.sh").read_text()
     assert "--all-benches" in regen
     # Pass 1 is the fill: a bench left out of it only gets cache misses in pass 2's doc.

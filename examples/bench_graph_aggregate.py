@@ -60,6 +60,11 @@ _SCHEMAS = {
         ("ai_java", "ai_java_speedup_vs_regular", ("transpile_succeeded_ai_java", "False")),
         ("ai_rust", "ai_rust_speedup_vs_regular", ("transpile_succeeded_ai_rust", "False")),
     ],
+    "target_kind": [
+        ("static", "static_speedup_vs_python", None),
+        ("bytecode_static", "bytecode_static_speedup_vs_python", None),
+        ("java_eval", "java_eval_speedup_vs_python", None),
+    ],
     "java_eval_rows_per_second": [
         ("static", "static_speedup_vs_python", None),
         ("bytecode_static", "bytecode_static_speedup_vs_python", None),
@@ -81,23 +86,33 @@ def _collect_by_kind(path: Path, rows: list[dict], points: dict[str, list[tuple[
     """One row per function, the served rewrite's kind in target_kind. These
     are AI rewrites, so they belong on the AI arms -- not on the tpcds
     `transpiled` strip the shared transpiled_rows_per_second column would
-    otherwise sniff them onto."""
+    otherwise sniff them onto. bench_catalog also carries the static,
+    bytecode and java_eval arms beside the AI one; those go to their arms."""
     bench = path.stem.replace("bench_", "").replace("_", " ")
+    comet = "comet" in path.stem
     for row in rows:
         # bench_fhi_udfs: only the live AI arm on the nullable column is an
         # AI rewrite as served; its pinned arms are exhibits, not output.
         if row.get("arm", "ai") != "ai" or row.get("column_nullable", "True") != "True":
             continue
+        label = f"{bench}/{row['function']}"
+        for arm, speedup_col in (
+            ("static", "static_speedup_vs_python"),
+            ("bytecode_static", "bytecode_static_speedup_vs_python"),
+            ("java_eval", "java_eval_speedup_vs_python"),
+        ):
+            raw = row.get(speedup_col, "")
+            if raw and float(raw) > 0:
+                points[arm].append((label, float(raw)))
         arm = _KIND_ARMS.get(row.get("target_kind", ""))
         if arm is None or row.get("status") != "success":
             continue  # declined, failed, or verified but not served: no rewrite ran
-        label = f"{bench}/{row['function']}"
         raw = row.get("transpiled_speedup_vs_python", "")
         if raw and float(raw) > 0:
             points[arm].append((label, float(raw)))
-        comet = row.get("comet_speedup_vs_python", "")
-        if comet and float(comet) > 0 and f"{arm}_comet" in ARMS:
-            points[f"{arm}_comet"].append((label, float(comet)))
+        raw_comet = row.get("comet_speedup_vs_python", "")
+        if raw_comet and float(raw_comet) > 0 and f"{arm}_comet" in ARMS:
+            points[f"{arm}_comet"].append((label, float(raw_comet)))
 
 
 def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
@@ -118,7 +133,11 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
         bench = path.stem.replace("bench_", "").replace("_", " ")
         comet = "comet" in path.stem
         for row in rows:
-            for arm, speedup_col, guard in specs:
+            ai_arm = "ai_java" if row.get("target_kind") == "java_udf" else "ai_catalyst"
+            row_specs = specs
+            if "target_kind" in row:
+                row_specs = [*specs, (ai_arm, "transpiled_speedup_vs_python", ("status", "failed"))]
+            for arm, speedup_col, guard in row_specs:
                 raw = row.get(speedup_col, "")
                 if not raw or float(raw) <= 0:
                     continue  # declined/failed arm: no number, no point
@@ -135,6 +154,10 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
                     points[variant].append((f"{bench}/{row['function']}", float(raw)))
                 else:
                     points[arm].append((f"{bench}/{row['function']}", float(raw)))
+            if "target_kind" in row and row.get("status") == "success":
+                raw = row.get("comet_speedup_vs_python", "")
+                if raw and float(raw) > 0:
+                    points[f"{ai_arm}_comet"].append((f"{bench}/{row['function']}", float(raw)))
     return points
 
 
