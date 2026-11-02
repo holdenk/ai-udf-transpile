@@ -127,7 +127,7 @@ def test_infra_failure_requeues_without_waiting_for_cooldown(tmp_path):
     assert row.status == "pending"
 
 
-def test_infra_failure_still_respects_max_retries(tmp_path):
+def test_infra_failure_waits_for_cooldown_after_initial_retries(tmp_path):
     cat = SqliteCatalog(tmp_path / "c.sqlite")
     _pending(cat)
     max_retries = int(conf.DEFAULTS[conf.MAX_RETRIES])
@@ -138,6 +138,23 @@ def test_infra_failure_still_respects_max_retries(tmp_path):
     assert kind == WAIT
     assert row is not None
     assert row.status == "failed"
+
+
+def test_infra_failure_requeues_after_cooldown_even_when_retries_exhausted(tmp_path):
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    _pending(cat)
+    max_retries = int(conf.DEFAULTS[conf.MAX_RETRIES])
+    assert cat.claim("k1", "coco")
+    cat.mark_failed("k1", "BackendError: rate limited")
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    cat._conn.execute(
+        "UPDATE cache SET failed_at = ?, attempt_count = ? WHERE udf_key = 'k1'",
+        (old, max_retries),
+    )
+    kind, row = cat.lookup("k1")
+    assert kind == WAIT
+    assert row is not None
+    assert row.status == "pending"
 
 
 def test_success_is_a_hit(tmp_path):

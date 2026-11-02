@@ -156,7 +156,7 @@ The winner's model is stamped `<sub-backend>/<model>`, so catalog rows and
 `docs/EXAMPLES_TRANSPILED.md` say which sub-backend actually served the
 rewrite. All sub-backends declined => a decline (24h cooldown, as before);
 no candidate and any sub-backend errored => a retryable error, so a dead
-CLI never burns the cooldown.
+CLI does not become a decline or a permanently cached failure.
 
 **Choose best by benchmark.** `ai_udf_transpile.benchmark.choose_best`
 runs each candidate SQL on a sample DataFrame and returns the fastest
@@ -319,7 +319,9 @@ Trust caveat: a served row is served as-is (no re-verification), so anyone
 who can append to that table can run SQL and Java in every reader's driver.
 
 Failed rewrites cool down for 24h (`failCooldownSeconds`) and stop retrying
-after `maxRetries` (default 3).
+after `maxRetries` (default 3). Transient `BackendError` failures (CLI crashes,
+timeouts, rate limits) instead retry immediately during that initial burst and
+become eligible again after each cooldown; they are never cached permanently.
 
 ## Tests
 

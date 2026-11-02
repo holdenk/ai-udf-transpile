@@ -261,12 +261,20 @@ def retries_exhausted(row: CacheRow, spark: Any = None) -> bool:
 
 
 def infra_failure(row: CacheRow) -> bool:
-    """A ``BackendError`` row (CLI crash/timeout/empty output) is transient.
-
-    Retry it as soon as a claim is free, bounded by MAX_RETRIES; declines and
-    bad rewrites keep the long cooldown because retrying them is spent money.
-    """
+    """A ``BackendError`` row (CLI crash/timeout/empty output) is transient."""
     return (row.error or "").startswith("BackendError:")
+
+
+def failure_retry_blocked(row: CacheRow, spark: Any = None) -> bool:
+    """Whether a failed row must wait before its next backend attempt.
+
+    Transient infrastructure errors retry immediately during the initial
+    MAX_RETRIES burst, then again after each cooldown. Declines and bad
+    rewrites stop retrying once that burst is exhausted.
+    """
+    if infra_failure(row):
+        return retries_exhausted(row, spark) and cooldown_active(row, spark)
+    return cooldown_active(row, spark) or retries_exhausted(row, spark)
 
 
 def open_catalog(spark: Any = None, *, sqlite_path: Optional[str] = None) -> Catalog:

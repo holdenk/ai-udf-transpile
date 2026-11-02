@@ -7,7 +7,7 @@ decline falls through to the next sub-backend; so does a transient error
 (auth, rate limit, crash) -- later sub-backends never run once one
 answers.  All declined => BackendDecline (the models saw it and said no);
 no candidate and any error => BackendError (retryable, so a dead CLI does
-not burn the row's 24h decline cooldown).
+not become a decline or a permanently cached failure).
 
 The winner's ``model`` is stamped ``<sub-backend>/<its model>`` so the
 catalog records which sub-backend actually served the rewrite.
