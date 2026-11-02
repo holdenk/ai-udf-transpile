@@ -822,6 +822,9 @@ def hypothesis_check(
         if py_exc is not None:
             # Spark's own hypothesis policy: python raise + sql value is allowed.
             return
+        if not _representable(sql_value, return_type):
+            mismatch.append(f"sql result {sql_value!r} does not fit {return_type} on {args!r}")
+            return
         if not _within_tolerance(py_value, sql_value, tolerance):
             mismatch.append(f"mismatch on {args!r}: python={py_value!r} sql={sql_value!r}")
 
@@ -859,12 +862,12 @@ def hypothesis_check(
             py_exc = exc
             py_value = _SENTINEL_RAISED
         else:
-            py_successes[0] += 1
             if not _representable(py_value, return_type):
                 # Out of contract: executing the python UDF with the declared
                 # return type would fail as well, so the sql side may do
                 # anything (ANSI overflow on cast(bround(1e37) as bigint)).
                 return
+            py_successes[0] += 1
         queued.append((args, py_value, py_exc))
 
     def _explicit_examples() -> list[tuple]:
