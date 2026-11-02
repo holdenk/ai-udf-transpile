@@ -24,6 +24,8 @@ def test_all_benches_flag_is_wired():
         "bench_graph_aggregate.py",
     ):
         assert bench in demos
-    # One CSV per bench: micro and bytecode must not share a path.
+    # One CSV per bench: micro and bytecode must not share a path, and the
+    # bytecode arms must reach the generated examples document.
     assert "BYTECODE_CSV" in demos
+    assert 'DUMP_ARGS+=(--perf-csv "$BYTECODE_CSV")' in demos
     assert "--all-benches" in (EXAMPLES / "regen_examples_doc.sh").read_text()

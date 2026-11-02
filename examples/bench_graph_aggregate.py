@@ -54,6 +54,11 @@ _SCHEMAS = {
         ),
         ("ai_java", "ai_java_speedup_vs_regular", ("transpile_succeeded_ai_java", "False")),
     ],
+    "target_kind": [
+        ("static", "static_speedup_vs_python", None),
+        ("bytecode_static", "bytecode_static_speedup_vs_python", None),
+        ("java_eval", "java_eval_speedup_vs_python", None),
+    ],
     "java_eval_rows_per_second": [
         ("static", "static_speedup_vs_python", None),
         ("bytecode_static", "bytecode_static_speedup_vs_python", None),
@@ -81,7 +86,11 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
         bench = path.stem.replace("bench_", "").replace("_", " ")
         comet = "comet" in path.stem
         for row in rows:
-            for arm, speedup_col, guard in specs:
+            ai_arm = "ai_java" if row.get("target_kind") == "java_udf" else "ai_catalyst"
+            row_specs = specs
+            if "target_kind" in row:
+                row_specs = [*specs, (ai_arm, "transpiled_speedup_vs_python", ("status", "failed"))]
+            for arm, speedup_col, guard in row_specs:
                 raw = row.get(speedup_col, "")
                 if not raw or float(raw) <= 0:
                     continue  # declined/failed arm: no number, no point
@@ -98,6 +107,10 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
                     points[variant].append((f"{bench}/{row['function']}", float(raw)))
                 else:
                     points[arm].append((f"{bench}/{row['function']}", float(raw)))
+            if "target_kind" in row and row.get("status") == "success":
+                raw = row.get("comet_speedup_vs_python", "")
+                if raw and float(raw) > 0:
+                    points[f"{ai_arm}_comet"].append((f"{bench}/{row['function']}", float(raw)))
     return points
 
 

@@ -11,8 +11,9 @@
 # the dump joins them into the doc: interpreted python rows/s at the top of
 # each section, each transpiled arm's rows/s at the end of its own line.
 # Pass 2 is --all-benches: every bench (micro, bytecode, tpcds, catalog) and the
-# graphs; pass 1 only needs numbers good enough to smoke-test the fill. bench_catalog.py is the coverage bench -- every cached function gets
-# numbers or a loud skip; micro/tpcds add their deeper arms.
+# graphs; pass 1 only needs numbers good enough to smoke-test the fill.
+# bench_catalog.py is the coverage bench -- every cached function attempts every
+# transpiled arm and gets numbers or a loud skip; micro/tpcds add deeper arms.
 #
 #   examples/regen_examples_doc.sh                                     # CoCo, cursor fallback
 #   AI_UDF_TRANSPILE_BACKEND=claude examples/regen_examples_doc.sh

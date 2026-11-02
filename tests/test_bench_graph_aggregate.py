@@ -101,3 +101,38 @@ def test_aggregate_rejects_unrecognized_csv(tmp_path):
         text=True,
     )
     assert proc.returncode != 0
+
+
+def test_aggregate_collects_every_catalog_arm(tmp_path):
+    path = tmp_path / "bench_catalog.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "function",
+                "status",
+                "target_kind",
+                "static_speedup_vs_python",
+                "bytecode_static_speedup_vs_python",
+                "java_eval_speedup_vs_python",
+                "transpiled_speedup_vs_python",
+                "comet_speedup_vs_python",
+            ]
+        )
+        writer.writerow(["cat", "success", "catalyst", 2.0, 3.0, 4.0, 5.0, 6.0])
+        writer.writerow(["java", "success", "java_udf", "", "", "", 7.0, 8.0])
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("bench_graph_aggregate", AGGREGATE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    points = module.collect([path])
+
+    assert points["static"] == [("catalog/cat", 2.0)]
+    assert points["bytecode_static"] == [("catalog/cat", 3.0)]
+    assert points["java_eval"] == [("catalog/cat", 4.0)]
+    assert points["ai_catalyst"] == [("catalog/cat", 5.0)]
+    assert points["ai_catalyst_comet"] == [("catalog/cat", 6.0)]
+    assert points["ai_java"] == [("catalog/java", 7.0)]
+    assert points["ai_java_comet"] == [("catalog/java", 8.0)]

@@ -73,7 +73,7 @@ while [ $# -gt 0 ]; do
     --bench-bytecode) BENCH_BYTECODE=1 ;;
     --bench-tpcds) BENCH_TPCDS=1 ;;
     --bench-all) BENCH_ALL=1 ;;
-    # Every bench and every transpiled arm (static, bytecode, ai, comet).
+    # Every bench and every transpiled arm (static, bytecode SQL/Java eval, AI, comet).
     --all-benches)
       ALL_BENCHES=1
       BENCH=1
@@ -200,9 +200,10 @@ if [ "$DUMP" -eq 1 ]; then
   [ -n "${AI_UDF_TRANSPILE_SQLITE:-}" ] || { echo "error: --dump needs AI_UDF_TRANSPILE_SQLITE" >&2; exit 2; }
   DUMP_ARGS=(examples/dump_results.py --sqlite "$AI_UDF_TRANSPILE_SQLITE" --out docs/EXAMPLES_TRANSPILED.md)
   if [ -n "$CSV" ]; then
-    # Catalog CSV first (widest coverage); micro/tpcds take over per function
-    # with their deeper arms. Later --perf-csv files win.
+    # Catalog CSV first (widest coverage), then bytecode and the deeper
+    # micro/tpcds benches. Each later file replaces only arms it measured.
     [ -f "$CATALOG_CSV" ] && DUMP_ARGS+=(--perf-csv "$CATALOG_CSV")
+    [ -f "$BYTECODE_CSV" ] && DUMP_ARGS+=(--perf-csv "$BYTECODE_CSV")
     DUMP_ARGS+=(--perf-csv "$CSV")
     [ -f "$TPCDS_CSV" ] && DUMP_ARGS+=(--perf-csv "$TPCDS_CSV")
   fi

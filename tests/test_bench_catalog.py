@@ -71,13 +71,39 @@ def test_bench_catalog_writes_rates_and_speedups(catalog, tmp_path):
     assert proc.returncode == 0, proc.stderr[-2000:]
     rows = {r["function"]: r for r in csv.DictReader(out.open())}
     assert rows["plus_one"]["python_rows_per_second"]
-    assert rows["plus_one"]["transpiled_rows_per_second"]
+    for arm in ("static", "bytecode_static", "java_eval", "transpiled"):
+        assert rows["plus_one"][f"{arm}_rows_per_second"], arm
+        assert float(rows["plus_one"][f"{arm}_speedup_vs_python"]) > 0
     assert float(rows["plus_one"]["transpiled_speedup_vs_python"]) >= 1.0
     assert rows["plus_one"]["status"] == "success"
-    # failed row: python arm only, nothing pretending to be transpiled
+    # A failed AI row has no AI or other fabricated rewrite numbers.
     assert rows["always_decline"]["python_rows_per_second"]
-    assert rows["always_decline"]["transpiled_rows_per_second"] == ""
+    for arm in ("static", "bytecode_static", "java_eval", "transpiled"):
+        assert rows["always_decline"][f"{arm}_rows_per_second"] == "", arm
     assert rows["always_decline"]["status"] == "failed"
+
+
+def test_bytecode_arm_preserves_placeholders_inside_literals(spark):
+    import importlib.util
+
+    from pyspark.sql.types import StringType
+
+    from ai_udf_transpile.catalog import CacheRow
+    from ai_udf_transpile.keys import canonical_source_text
+
+    spec = importlib.util.spec_from_file_location("bench_catalog", BENCH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    row = CacheRow(
+        udf_key="literal",
+        source_text=canonical_source_text("def literal(x: str) -> str:\n    return '_udf_param_0'\n"),
+        param_names=["x"],
+        input_types=["string"],
+        input_categories=["string"],
+        return_type="string",
+    )
+    df = spark.createDataFrame([("value",)], ["arg0"])
+    assert module._bytecode_df(df, row, StringType()).collect()[0][0] == "_udf_param_0"
 
 
 def test_bench_catalog_missing_sqlite(tmp_path):

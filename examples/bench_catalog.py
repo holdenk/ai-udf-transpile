@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark every function in the filled catalog: interpreted python vs the
-rewrite the pipeline actually serves. This is the coverage bench -- the
-micro/tpcds benches go deep on their own functions, this one goes wide over
+"""Benchmark every function in the filled catalog on every transpiled arm:
+interpreted python, built-in static SQL, bytecode SQL, bytecode Java eval,
+and the AI rewrite the pipeline actually serves. This is the coverage bench --
+the micro/tpcds benches go deep on their own functions, this one goes wide over
 everything the examples queued, so docs/EXAMPLES_TRANSPILED.md gets numbers
 for all of it.
 
   python examples/bench_catalog.py --sqlite target/examples_transpiled.sqlite
   python examples/bench_catalog.py --sqlite ... --csv out.csv --rows 100000
 
-Fail-open by function: one benign sample value per input type, and any
-function whose interpreted arm raises on it (kms_encrypt, ...) is skipped
-loudly rather than given numbers.
+Fail-open by function and by arm: one benign sample value per input type. An
+arm that declines or raises gets no number; other arms still run. If the
+interpreted arm raises, transpiled rates are reported without a speedup.
 
 When $AI_UDF_TRANSPILE_COMET_JAR (or $COMET_JAR) points at a Comet jar, a
 second session runs the served SQL under Comet's native acceleration too,
@@ -59,11 +60,17 @@ os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
 from pyspark.sql import SparkSession  # noqa: E402
+from pyspark.sql import functions as F  # noqa: E402
 from pyspark.sql.types import _parse_datatype_string  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
+from ai_udf_transpile.backends.base import BackendDecline  # noqa: E402
+from ai_udf_transpile.backends.bytecode import BytecodeBackend  # noqa: E402
+from ai_udf_transpile.backends.bytecode_eval import emit_java_eval  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
+from ai_udf_transpile.javac import compile_java, register_java_udf, verify_function_name  # noqa: E402
+from ai_udf_transpile.sandbox import make_sandbox  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
@@ -141,9 +148,8 @@ def noop_seconds(df) -> float:
     return time.perf_counter() - start
 
 
-def _time_arm(df, udf, rounds: int) -> float | None:
-    """Best (min) of N rounds; None when the function raises on the sample."""
-    arm = df.select(udf(*[f"arg{i}" for i in range(len(df.columns))]))
+def _time_df(arm, rounds: int) -> float | None:
+    """Best (min) of N rounds; None when the arm raises on the sample."""
     try:
         noop_seconds(arm)  # warmup doubles as the raise check
     except Exception:
@@ -155,6 +161,26 @@ def _time_arm(df, udf, rounds: int) -> float | None:
         except Exception:
             break  # a flaky late failure keeps the rounds that did land
     return best if best < float("inf") else None
+
+
+def _time_arm(df, udf, rounds: int) -> float | None:
+    return _time_df(df.select(udf(*[f"arg{i}" for i in range(len(df.columns))])), rounds)
+
+
+def _bytecode_df(df, row, rtype):
+    job = row.as_job()
+    with make_sandbox(job) as sandbox:
+        sql = BytecodeBackend().run(job, sandbox).sql
+    params = [F.col(f"arg{i}").alias(f"_udf_param_{i}") for i in range(len(row.input_types))]
+    return df.select(*params).select(F.expr(sql).cast(rtype))
+
+
+def _java_eval_expr(spark, func, rtype, arity: int):
+    emitted = emit_java_eval(func)
+    compiled = compile_java(spark, emitted.java_source, emitted.class_name)
+    sql_name = verify_function_name("bce_catalog", compiled.jar_bytes)
+    register_java_udf(spark, sql_name, compiled.class_name, compiled.jar_bytes, rtype, janino=compiled.janino)
+    return F.expr(f"{sql_name}({', '.join(f'arg{i}' for i in range(arity))})")
 
 
 def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], comet_jar: str) -> None:
@@ -294,6 +320,12 @@ def main() -> int:
             "function": name,
             "rows": args.rows,
             "python_rows_per_second": "",
+            "static_rows_per_second": "",
+            "static_speedup_vs_python": "",
+            "bytecode_static_rows_per_second": "",
+            "bytecode_static_speedup_vs_python": "",
+            "java_eval_rows_per_second": "",
+            "java_eval_speedup_vs_python": "",
             "transpiled_rows_per_second": "",
             "transpiled_speedup_vs_python": "",
             "comet_rows_per_second": "",
@@ -315,25 +347,62 @@ def main() -> int:
 
         spark.conf.set(TRANSPILE_CONF, "false")
         py_t = _time_arm(df, UserDefinedFunction(func, rtype), args.rounds)
-        tx_secs = None
         spark.conf.set(TRANSPILE_CONF, "true")
+
+        static_secs = None
+        spark.conf.set(PY_TRANSPLIERS_CONF, "catalyst")
+        try:
+            static_udf = UserDefinedFunction(func, rtype)
+            if static_udf.transpiled:
+                static_secs = _time_arm(df, static_udf, args.rounds)
+        except Exception as exc:
+            print(f"{name}: static arm failed: {type(exc).__name__}: {exc}")
+
+        spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
+        bytecode_secs = None
+        try:
+            bytecode_secs = _time_df(_bytecode_df(df, row, rtype), args.rounds)
+        except BackendDecline as exc:
+            print(f"{name}: bytecode declined: {exc}")
+        except Exception as exc:
+            print(f"{name}: bytecode arm failed: {type(exc).__name__}: {exc}")
+
+        java_eval_secs = None
+        try:
+            java_eval_secs = _time_df(
+                df.select(_java_eval_expr(spark, func, rtype, len(row.input_types))), args.rounds
+            )
+        except BackendDecline as exc:
+            print(f"{name}: java eval declined: {exc}")
+        except Exception as exc:
+            print(f"{name}: java eval arm failed: {type(exc).__name__}: {exc}")
+
+        tx_secs = None
         if row.status == "success":
             udf = UserDefinedFunction(func, rtype)
             if udf.transpiled:
                 tx_secs = _time_arm(df, udf, args.rounds)
             else:
-                print(f"{name}: transpiled arm not served (no hit) -- python only")
-        py_rate = round(args.rows / py_t) if py_t else ""
-        tx_rate = round(args.rows / tx_secs) if tx_secs else ""
-        entry["python_rows_per_second"] = py_rate
-        entry["transpiled_rows_per_second"] = tx_rate
-        entry["transpiled_speedup_vs_python"] = round(py_t / tx_secs, 1) if (py_t and tx_secs) else ""
+                print(f"{name}: AI arm not served (no hit)")
+
+        entry["python_rows_per_second"] = round(args.rows / py_t) if py_t else ""
+        for arm, secs in (
+            ("static", static_secs),
+            ("bytecode_static", bytecode_secs),
+            ("java_eval", java_eval_secs),
+            ("transpiled", tx_secs),
+        ):
+            entry[f"{arm}_rows_per_second"] = round(args.rows / secs) if secs else ""
+            entry[f"{arm}_speedup_vs_python"] = round(py_t / secs, 1) if (py_t and secs) else ""
         if py_t:
             py_secs[row.udf_key] = py_t
-        note = "" if py_t else "python raises on the sample; skipped"
+        note = "" if py_t else "python raises on the sample; no baseline"
         print(
-            f"{name:24} python={py_rate or '-':>10} transpiled={tx_rate or '-':>10}"
-            f" speedup={entry['transpiled_speedup_vs_python'] or '-':>6} {note}"
+            f"{name:24} python={entry['python_rows_per_second'] or '-':>10}"
+            f" static={entry['static_rows_per_second'] or '-':>10}"
+            f" bytecode={entry['bytecode_static_rows_per_second'] or '-':>10}"
+            f" java_eval={entry['java_eval_rows_per_second'] or '-':>10}"
+            f" ai={entry['transpiled_rows_per_second'] or '-':>10} {note}"
         )
 
     spark.conf.set(TRANSPILE_CONF, "false")
@@ -347,7 +416,7 @@ def main() -> int:
     if comet_jar:
         try:
             _comet_phase(args, rows, out, py_secs, comet_jar)
-        except Exception as exc:  # fail open: the python/transpiled numbers still land
+        except Exception as exc:  # fail open: all non-Comet arm numbers still land
             print(f"comet arm failed: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     if args.csv:

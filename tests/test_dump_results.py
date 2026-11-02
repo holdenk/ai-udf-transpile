@@ -133,7 +133,7 @@ def _run_dump(sqlite_path: Path, out: Path, *extra: str) -> subprocess.Completed
     )
 
 
-def test_dump_writes_all_three_paths(spark, tmp_path):
+def test_dump_writes_every_transpiled_path(spark, tmp_path):
     sqlite_path = tmp_path / "catalog.sqlite"
     _fill_catalog(sqlite_path)
     out = tmp_path / "dump.md"
@@ -143,6 +143,8 @@ def test_dump_writes_all_three_paths(spark, tmp_path):
     assert "## plus_one" in text
     assert "CAST(+(_udf_param_0, 1) AS BIGINT)" in text  # built-in static
     assert "(_udf_param_0 + 1)" in text  # bytecode -> SQL
+    assert "bytecode → Java eval" in text
+    assert "ai_udf.Bc" in text
     assert "declined: unsupported bytecode: CONTAINS_OP" in text  # has_item
     assert "java UDF" in text
     assert "public class Backwards" in text
@@ -209,13 +211,23 @@ TPCDS_CSV = (
     "common_c2f,False,1000,1000000,5000000,4000000,4.0,5.0,coco,auto\n"
     "tpcds_safe_ratio,True,1000,900000,4500000,900000,1.0,5.0,coco,auto\n"
 )
+BYTECODE_CSV = (
+    "function,static_converted,static_correct,bytecode_static_correct,java_eval_correct,"
+    "python_rows_per_second,static_rows_per_second,bytecode_static_rows_per_second,"
+    "java_eval_rows_per_second,static_speedup_vs_python,bytecode_static_speedup_vs_python,"
+    "java_eval_speedup_vs_python\n"
+    "plus_one,True,True,True,True,2000000,3500000,7000000,2500000,1.8,3.5,1.3\n"
+)
 CATALOG_CSV = (
-    "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+    "function,rows,python_rows_per_second,static_rows_per_second,static_speedup_vs_python,"
+    "bytecode_static_rows_per_second,bytecode_static_speedup_vs_python,"
+    "java_eval_rows_per_second,java_eval_speedup_vs_python,transpiled_rows_per_second,"
     "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
     "status,target_kind,backend,model\n"
-    "has_item,1000,2000000,6000000,3.0,9000000,4.5,success,catalyst,ensemble,coco/auto\n"
-    "plus_two,1000,1500000,,,,,failed,,human,\n"
-    "kms_encrypt,1000,,,,,,failed,,ensemble,coco/auto\n"
+    "has_item,1000,2000000,3000000,1.5,4000000,2.0,1000000,0.5,6000000,3.0,"
+    "9000000,4.5,success,catalyst,ensemble,coco/auto\n"
+    "plus_two,1000,1500000,2500000,1.7,,,,,,,,,failed,,human,\n"
+    "kms_encrypt,1000,,,,,,,,,,,,failed,,ensemble,coco/auto\n"
 )
 
 
@@ -235,11 +247,15 @@ def test_perf_lines_unit(tmp_path):
     assert perf["plus_one"] == {
         "top": "- **perf (micro bench)**: interpreted python 2.0M rows/s",
         "static": "3.0M rows/s (1.5x vs python)",
+        "bytecode": "",
+        "java_eval": "",
         "ai": "8.0M rows/s (4.0x vs python)",
     }
     assert perf["plus_one_java"] == {
         "top": "- **perf (micro bench)**: interpreted python 2.0M rows/s",
         "static": "",
+        "bytecode": "",
+        "java_eval": "",
         "ai": "4.0M rows/s (2.0x vs python)",
     }
     # always_decline: the fallback perf is the top line's story; no rewrite was served
@@ -249,22 +265,26 @@ def test_perf_lines_unit(tmp_path):
     assert perf["common_c2f"] == {
         "top": "- **perf (tpcds bench)**: interpreted python 1.0M rows/s · native vanilla 5.0M (5.0x)",
         "static": "",
+        "bytecode": "",
+        "java_eval": "",
         "ai": "4.0M rows/s (4.0x vs python)",
     }
     assert perf["tpcds_safe_ratio"]["ai"] == ""  # declined: python fallback serves, no suffix
-    # catalog CSV: coverage bench, one row per cached function
+    # catalog CSV: every transpiled arm survives, including static on a failed AI row
     cat = tmp_path / "catalog.csv"
     cat.write_text(CATALOG_CSV, encoding="utf-8")
     perf = _load_dump_module()._perf_lines([str(cat)])
     assert perf["has_item"] == {
         "top": "- **perf (catalog bench)**: interpreted python 2.0M rows/s",
-        "static": "",
+        "static": "3.0M rows/s (1.5x vs python)",
+        "bytecode": "4.0M rows/s (2.0x vs python)",
+        "java_eval": "1.0M rows/s (0.5x vs python)",
         "ai": "6.0M rows/s (3.0x vs python) · comet 9.0M rows/s (4.5x vs python)",
     }
-    # python-only row (no transpiled arm served) keeps the top, no ai suffix
     assert perf["plus_two"]["ai"] == ""
+    assert perf["plus_two"]["static"] == "2.5M rows/s (1.7x vs python)"
     assert perf["plus_two"]["top"].endswith("interpreted python 1.5M rows/s")
-    # skipped function (python raises on the sample): no entry at all
+    # skipped function (no arm produced a rate): no entry at all
     assert "kms_encrypt" not in perf
     # python-skipped but transpiled-measured: the rate survives, labeled
     widg = tmp_path / "widg.csv"
@@ -278,12 +298,19 @@ def test_perf_lines_unit(tmp_path):
     assert perf["widget_name"] == {
         "top": "",
         "static": "",
+        "bytecode": "",
+        "java_eval": "",
         "ai": "885k rows/s (no python baseline)",
     }
-    # merge precedence: later files take over per function with their deeper arms
-    perf = _load_dump_module()._perf_lines([str(cat), str(micro)])
-    assert perf["has_item"]["top"].endswith("interpreted python 2.0M rows/s")  # catalog-only
-    assert perf["plus_one"]["static"] == "3.0M rows/s (1.5x vs python)"  # micro wins
+    # Later files replace only arms they measured; bytecode/Java eval survive micro.
+    bc = tmp_path / "bytecode.csv"
+    bc.write_text(BYTECODE_CSV, encoding="utf-8")
+    perf = _load_dump_module()._perf_lines([str(cat), str(bc), str(micro)])
+    assert perf["has_item"]["top"].endswith("interpreted python 2.0M rows/s")
+    assert perf["plus_one"]["top"].endswith("interpreted python 2.0M rows/s")
+    assert perf["plus_one"]["static"] == "3.0M rows/s (1.5x vs python)"
+    assert perf["plus_one"]["bytecode"] == "7.0M rows/s (3.5x vs python)"
+    assert perf["plus_one"]["java_eval"] == "2.5M rows/s (1.3x vs python)"
 
 
 def test_perf_lines_missing_csv_is_fatal(tmp_path):
@@ -296,8 +323,17 @@ def test_dump_writes_perf_bullets(spark, tmp_path):
     _fill_catalog(sqlite_path)
     micro = tmp_path / "micro.csv"
     micro.write_text(MICRO_CSV_HEADER + "\n" + MICRO_CSV_ROWS, encoding="utf-8")
+    bytecode = tmp_path / "bytecode.csv"
+    bytecode.write_text(BYTECODE_CSV, encoding="utf-8")
     out = tmp_path / "dump.md"
-    proc = _run_dump(sqlite_path, out, "--perf-csv", str(micro))
+    proc = _run_dump(
+        sqlite_path,
+        out,
+        "--perf-csv",
+        str(bytecode),
+        "--perf-csv",
+        str(micro),
+    )
     assert proc.returncode == 0, proc.stderr[-2000:]
     text = out.read_text(encoding="utf-8")
     plus_one = text.split("## plus_one")[1].split("## ")[0]
@@ -309,6 +345,9 @@ def test_dump_writes_perf_bullets(spark, tmp_path):
         "- **built-in static (AST)**: `Column<'CAST(+(_udf_param_0, 1) AS BIGINT)'>`"
         " — 3.0M rows/s (1.5x vs python)" in plus_one
     )
+    assert "- **bytecode → SQL**: `(_udf_param_0 + 1)` — 7.0M rows/s (3.5x vs python)" in plus_one
+    assert "bytecode → Java eval" in plus_one
+    assert " — 2.5M rows/s (1.3x vs python)" in plus_one
     assert (
         "- **AI (coco / coco-model)**: `_udf_param_0 + 1`"
         " (attempt_count=1, hypothesis_passed=True) — 8.0M rows/s (4.0x vs python)" in plus_one

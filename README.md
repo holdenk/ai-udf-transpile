@@ -279,6 +279,11 @@ python examples/bench_bytecode_vs_static.py --csv bench_bytecode_vs_static.csv
 python examples/bench_graph.py bench_bytecode_vs_static.csv docs/bench_bytecode.png
 ```
 
+`examples/bench_catalog.py` benchmarks every cached UDF on every executable
+rewrite arm: built-in static, bytecode→SQL, bytecode Java eval, and the cached
+AI Catalyst/Java result (plus Comet when configured). Later benchmark CSVs are
+merged per arm, so deeper micro/TPC-DS runs do not discard the other paths.
+
 `examples/bench_graph_aggregate.py` rolls every benchmark CSV in a
 directory into one per-path speedup chart (medians marked, fallback rows
 excluded as declines), and `examples/dump_results.py` writes a markdown
@@ -286,9 +291,9 @@ dump of what every transpiler did to every UDF the examples put in the
 cache — conversions and declines side by side, with the backend and model
 that made each AI row. `examples/regen_examples_doc.sh` fills that cache
 from the AI chain (every example, twice: miss, then hit; CoCo answers,
-cursor picks up what CoCo cannot); the
-dump it writes is [docs/EXAMPLES_TRANSPILED.md](docs/EXAMPLES_TRANSPILED.md). The
-examples and benchmarks refuse the fake backend; raw runs live
+cursor picks up what CoCo cannot), runs all benchmarks, and attaches every
+transpiled arm's rate in [docs/EXAMPLES_TRANSPILED.md](docs/EXAMPLES_TRANSPILED.md).
+The examples and benchmarks refuse the fake backend; raw runs live
 under `questionable_benchmark_results/`.
 
 `backend=auto` picks the first available backend from
