@@ -9,7 +9,7 @@
 #   examples/run_demos.sh --bench --rust-accel [--rust-accel-conf key=value]
 #   examples/run_demos.sh --bench-bytecode        # python vs static (AST) vs bytecode->SQL vs Java bytecode eval
 #   examples/run_demos.sh --bench-tpcds           # TPC-DS-inspired UDF patterns vs vanilla SQL
-#   examples/run_demos.sh --all-benches --csv out.csv  # every bench: micro (+comet if COMET_JAR), bytecode, tpcds, catalog; then the graphs
+#   examples/run_demos.sh --all-benches --csv out.csv  # plain + Comet micro, bytecode, tpcds, catalog; then graphs
 #   examples/run_demos.sh --dump                  # + dump $AI_UDF_TRANSPILE_SQLITE to docs/EXAMPLES_TRANSPILED.md
 #   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 #
@@ -62,7 +62,9 @@ CSV=""
 TPCDS_CSV=""
 CATALOG_CSV=""
 BYTECODE_CSV=""
+MICRO_COMET_CSV=""
 TRANSPILE_TIMING_CSV=""
+COMET_TIMING_CSV=""
 RUST_ACCEL=0
 RUST_PRESET="comet"
 RUST_CONF=()
@@ -89,12 +91,14 @@ while [ $# -gt 0 ]; do
       TPCDS_CSV="${CSV%.csv}_tpcds.csv"
       CATALOG_CSV="${CSV%.csv}_catalog.csv"
       BYTECODE_CSV="${CSV%.csv}_bytecode.csv"
+      MICRO_COMET_CSV="${CSV%.csv}_comet.csv"
       BENCH=1
       shift
       ;;
     --transpilation-timing-csv|--timing-csv)
       [ $# -ge 2 ] || { echo "error: $1 needs a path" >&2; exit 2; }
       TRANSPILE_TIMING_CSV="$2"
+      COMET_TIMING_CSV="${TRANSPILE_TIMING_CSV%.csv}_comet.csv"
       BENCH=1
       shift
       ;;
@@ -121,7 +125,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# The comet arm of the micro bench rides along whenever a jar is configured.
+# All-bench runs keep plain and Comet micro results in separate CSVs.
 if [ "$ALL_BENCHES" -eq 1 ] && [ "$RUST_ACCEL" -eq 0 ] \
    && { [ -n "${AI_UDF_TRANSPILE_COMET_JAR:-}" ] || [ -n "${COMET_JAR:-}" ]; }; then
   RUST_ACCEL=1
@@ -150,21 +154,30 @@ run_demo "inspect" examples/demo_transpile_inspect.py
 run_demo "multi-model" examples/demo_multi_model.py
 [ "$LIVE" -eq 1 ] && run_demo "live backends" examples/demo_live_backends.py
 if [ "$BENCH" -eq 1 ]; then
+  if [ "$ALL_BENCHES" -eq 1 ] && [ "$RUST_ACCEL" -eq 1 ] && [ "$RUST_PRESET" = "comet" ]; then
+    PLAIN_ARGS=(examples/bench_micro.py)
+    [ -n "$CSV" ] && PLAIN_ARGS+=(--csv "$CSV")
+    [ -n "$TRANSPILE_TIMING_CSV" ] && PLAIN_ARGS+=(--transpilation-timing-csv "$TRANSPILE_TIMING_CSV")
+    run_demo "micro bench" "${PLAIN_ARGS[@]}"
+  fi
+  MICRO_CSV="$CSV"
+  TIMING_CSV="$TRANSPILE_TIMING_CSV"
+  MICRO_LABEL="micro bench"
   if [ "$RUST_ACCEL" -eq 1 ] && [ "$RUST_PRESET" = "comet" ]; then
-    if [ -z "${AI_UDF_TRANSPILE_COMET_JAR:-}" ] && [ -z "${COMET_JAR:-}" ]; then
-      echo "warning: rust preset 'comet' usually needs COMET_JAR/AI_UDF_TRANSPILE_COMET_JAR set" >&2
-    fi
+    MICRO_CSV="$MICRO_COMET_CSV"
+    TIMING_CSV="$COMET_TIMING_CSV"
+    MICRO_LABEL="micro bench (comet)"
   fi
   BENCH_ARGS=(examples/bench_micro.py)
-  [ -n "$CSV" ] && BENCH_ARGS+=(--csv "$CSV")
-  [ -n "$TRANSPILE_TIMING_CSV" ] && BENCH_ARGS+=(--transpilation-timing-csv "$TRANSPILE_TIMING_CSV")
+  [ -n "$MICRO_CSV" ] && BENCH_ARGS+=(--csv "$MICRO_CSV")
+  [ -n "$TIMING_CSV" ] && BENCH_ARGS+=(--transpilation-timing-csv "$TIMING_CSV")
   if [ "$RUST_ACCEL" -eq 1 ]; then
     BENCH_ARGS+=(--rust-accel --rust-accel-preset "$RUST_PRESET")
     for kv in "${RUST_CONF[@]}"; do
       BENCH_ARGS+=(--rust-accel-conf "$kv")
     done
   fi
-  run_demo "micro bench" "${BENCH_ARGS[@]}"
+  run_demo "$MICRO_LABEL" "${BENCH_ARGS[@]}"
 fi
 
 if [ "$BENCH_BYTECODE" -eq 1 ]; then
@@ -192,6 +205,9 @@ fi
 
 if [ "$ALL_BENCHES" -eq 1 ] && [ -n "$CSV" ]; then
   [ -f "$CSV" ] && run_demo "graph: micro" examples/bench_graph.py "$CSV" docs/bench_perf.png
+  if [ "$RUST_ACCEL" -eq 1 ] && [ "$RUST_PRESET" = "comet" ] && [ -f "$MICRO_COMET_CSV" ]; then
+    run_demo "graph: micro (comet)" examples/bench_graph.py "$MICRO_COMET_CSV" docs/bench_perf_comet.png
+  fi
   [ -f "$BYTECODE_CSV" ] && run_demo "graph: bytecode" examples/bench_graph.py "$BYTECODE_CSV" docs/bench_bytecode.png
   run_demo "graph: aggregate" examples/bench_graph_aggregate.py "$(dirname "$CSV")" --png "$(dirname "$CSV")/bench_aggregate.png"
 fi
@@ -203,7 +219,7 @@ if [ "$DUMP" -eq 1 ]; then
     # Catalog CSV first (widest coverage); micro/tpcds take over per function
     # with their deeper arms. Later --perf-csv files win.
     [ -f "$CATALOG_CSV" ] && DUMP_ARGS+=(--perf-csv "$CATALOG_CSV")
-    DUMP_ARGS+=(--perf-csv "$CSV")
+    [ -f "$CSV" ] && DUMP_ARGS+=(--perf-csv "$CSV")
     [ -f "$TPCDS_CSV" ] && DUMP_ARGS+=(--perf-csv "$TPCDS_CSV")
   fi
   run_demo "dump" "${DUMP_ARGS[@]}"
