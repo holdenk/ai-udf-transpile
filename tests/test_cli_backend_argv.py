@@ -62,12 +62,20 @@ def test_cursor_argv(tmp_path):
 def test_pi_argv(tmp_path):
     backend = PiBackend()
     argv = backend.build_argv(tmp_path, "PROMPT TEXT")
-    assert argv[0] == "pi"
-    assert "-p" in argv
-    assert "PROMPT TEXT" in argv
-    assert "--trust" in argv
-    assert "--force" in argv
-    assert "--output-format" in argv
+    assert argv == [
+        "pi",
+        "--mode",
+        "text",
+        "--no-session",
+        "--no-extensions",
+        "--no-skills",
+        "--no-context-files",
+        "--no-prompt-templates",
+        "--tools",
+        "read,write",
+        "-p",
+        "PROMPT TEXT",
+    ]
 
 
 def test_codex_argv(tmp_path):

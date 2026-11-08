@@ -1,0 +1,19 @@
+card: 1
+name: cli
+summary: "Build CLI backend invocations, including isolated noninteractive Pi calls with explicit read/write tools and no ambient context"
+language: python
+kind: module
+interface:
+  - "parse_sandbox(sandbox: Path, stdout: str='')"
+  - "class CliSpec"
+  - "coco_argv(binary: str, sandbox: Path, prompt_text: str)"
+  - "cursor_argv(binary: str, sandbox: Path, prompt_text: str)"
+  - "pi_argv(binary: str, sandbox: Path, prompt_text: str)"
+  - "claude_argv(binary: str, sandbox: Path, prompt_text: str)"
+  - "codex_argv(binary: str, sandbox: Path, prompt_text: str)"
+  - "class CliBackend"
+license: Apache-2.0
+provenance:
+  authored_by: agent
+  agent: agent
+  human_reviewed: false
