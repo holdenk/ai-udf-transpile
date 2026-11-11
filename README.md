@@ -251,26 +251,27 @@ seven scalar text UDFs from Fight Health Insurance's training-data pipeline
 (verdict parsing, entity cleanup, the findings regex extractors, the regex
 PII scrubber), ported self-contained into
 `ai_udf_transpile/backends/fhi_udfs.py`. Every one is regex or a line loop
-over free text. One local run (1M rows, 4 cores, PyPI Spark 4.3.0, one AI
-backend, partyOnStrings on): all seven got a rewrite that passed the gate on
-the first attempt, six as Catalyst SQL and the scrubber as a Java UDF --
-and only one of them is faster than the interpreted python (3.0x). The
-other five that Spark serves run at 0.3x-0.9x: a rewrite faithful to
-`str.strip()`, `splitlines()` and unicode `\s`/`\d`/`\b` spells those out
-as regex character classes and lookarounds, and `java.util.regex` over them
-loses to CPython's C string methods and `re`. Nothing in the serving path
-checks that a rewrite is faster before serving it. The seventh
-(`fhi_parse_verdict`) verified and is not served at all: its SQL has a
-`transform`/`filter` lambda, and Spark drops such a rewrite and plans the
-python UDF without saying so (`udf.transpiled` stays truthy; the bench
-checks the physical plan). That same rewrite is also wrong on an input the
-gate could not generate -- two different negative verdict words on one
-line -- because generated strings are 16 characters at most; a hand-built
-adversarial set agreed with python on the other 278 of 279 inputs.
+over free text, and it is where "verified" and "faster" came apart: all
+seven got a rewrite that passed the gate on the first attempt, and five of
+those were slower than the interpreted Python (0.3x-0.9x, at 100k rows and
+at 50M alike), while a sixth was never served because its SQL used a
+lambda. A rewrite faithful to `str.strip()`, `splitlines()` and Python's
+unicode `\s`/`\d`/`\b` spells them out as `java.util.regex` classes and
+lookarounds, and each regex evaluation costs about as much as the Python
+round trip the rewrite saves.
+
+The bench keeps both kinds of rewrite on purpose: per function, the AI's
+first verified rewrite (`naive`, the regression exhibit) and a hand-tuned
+faithful one (`tuned`), timed next to Python and, with `--ai`, whatever the
+backend serves today; each over a nullable and a provably non-null column,
+with `ai_udf_transpile.regress`'s static guess printed beside every ratio.
+After the prompt gained a section on speed, six of the seven AI rewrites
+beat Python. The numbers, what changed and why are in
+[CHANGELOG.md](CHANGELOG.md).
 
 ```bash
 examples/run_demos.sh --bench-fhi                       # or: python examples/bench_fhi_udfs.py
-python examples/bench_fhi_udfs.py --only fhi_deidentify_text --sampled-strings-only
+python examples/bench_fhi_udfs.py --ai --only fhi_deidentify_text --sampled-strings-only
 ```
 
 The perf graphs are generated from that CSV by a CLI tool

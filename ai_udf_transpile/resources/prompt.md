@@ -188,6 +188,14 @@ Implement `org.apache.spark.sql.api.java.UDFN` (N = arity):
   arbitrary precision, so a `long` can overflow where Python cannot;
   `Double.toString` spells non-finite values `Infinity`/`NaN` where Python
   spells `inf`/`nan` — match Python's spelling if the UDF stringifies.
+- Regex lookbehind (Java UDFs and Spark `regexp_*` alike, both are
+  `java.util.regex`): a lookbehind over a character class steps back ONE
+  UTF-16 unit, so `(?<![\p{L}\p{N}_])` reads a lone low surrogate after a
+  letter or digit outside the BMP (U+10000 and up) and calls it a non-word
+  character. Python reads the whole code point. Write the lookbehind as
+  `(?<![\p{L}\p{N}_]{1,2})` / `(?<=[\p{L}\p{N}_]{1,2})`, or test
+  `Character.codePointBefore` in code. A `\b` emulation that skips this
+  leaves an SSN ending in a mathematical digit unredacted.
 - Forbidden APIs (the rewrite is rejected before it is ever compiled or run):
   `Runtime.getRuntime`, `System.load`/`loadLibrary`/`exit`/`getenv`/`getProperty`,
   `ProcessBuilder`, reflection (`Class.forName`, `loadClass`, `ClassLoader`,

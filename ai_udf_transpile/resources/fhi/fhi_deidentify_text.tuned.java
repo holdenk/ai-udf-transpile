@@ -21,9 +21,13 @@ public class FhiDeidentifyTextTuned implements UDF1<Object, Object> {
                 : "\\t\\n\\x0B\\f\\r\\x1C-\\x1F \\x85\\xA0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000";
             final String S = "[" + SC + "]";
             final String WC = ascii ? "A-Za-z0-9_" : "\\p{L}\\p{N}_";
+            // Python's \\b. The non-ASCII lookbehinds take {1,2}: a lookbehind
+            // over a class steps back one UTF-16 unit, so a supplementary-plane
+            // letter or digit would read as its low surrogate -- not a word
+            // char -- and an SSN ending in U+1D7D7 would go unredacted.
             final String B = ascii
                 ? "\\b"
-                : "(?:(?<=[" + WC + "])(?![" + WC + "])|(?<![" + WC + "])(?=[" + WC + "]))";
+                : "(?:(?<=[" + WC + "]{1,2})(?![" + WC + "])|(?<![" + WC + "]{1,2})(?=[" + WC + "]))";
             final String L = ascii ? "[A-Za-z]" : "[A-Za-z\\u0130\\u0131\\u017F\\u212A]";
             final String MM = "(?:0[1-9]|1[0-2])";
             final String DD = "(?:0[1-9]|[12]" + D + "|3[01])";
@@ -33,7 +37,7 @@ public class FhiDeidentifyTextTuned implements UDF1<Object, Object> {
                 + "|\\[(?:NAME|PHONE|SSN|EMAIL|DOB|ADDRESS|MEMBER_ID|PLAN_ID|FAX|DATE|ID|REDACTED)[^\\]]*\\]");
             SSN = Pattern.compile(B + D + "{3}-" + D + "{2}-" + D + "{4}" + B);
             PHONE = Pattern.compile(
-                "(?<![" + D.replace("[", "").replace("]", "") + "-])(?:\\+?1[-." + SC + "]?)?\\(?" + D + "{3}\\)?[-." + SC + "]?"
+                "(?<![" + D.replace("[", "").replace("]", "") + "-]" + (ascii ? "" : "{1,2}") + ")(?:\\+?1[-." + SC + "]?)?\\(?" + D + "{3}\\)?[-." + SC + "]?"
                 + D + "{3}[-." + SC + "]?" + D + "{4}(?![" + D.replace("[", "").replace("]", "") + "-])");
             EMAIL = Pattern.compile(B + "[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}" + B);
             DOB = Pattern.compile(

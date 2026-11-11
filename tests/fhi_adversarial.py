@@ -148,3 +148,55 @@ ADVERSARIAL = {
         ("admitted to the hospital for ab", "A", "B"),
     ],
 }
+
+# Supplementary-plane characters (outside the BMP: two UTF-16 units in Java,
+# one code point in Python) next to a match. A java.util.regex lookbehind
+# over a character class steps back one UTF-16 unit and reads only the low
+# surrogate, so Python's \b, \d and \w emulated that way go wrong here: an SSN
+# ending in a mathematical bold digit (U+1D7D7, which Python's \d accepts) was
+# left unredacted. U+1D400 and U+20BB7 are letters, U+1D7CE-U+1D7FF digits,
+# U+1F600 is neither (the control). Characters assigned after Unicode 15.0
+# (e.g. U+2EBF0) are left out on purpose: whether they are word characters
+# depends on the JVM's Unicode tables, not on the rewrite.
+_ASTRAL = {
+    "fhi_verdict_has_legal_check": [
+        ("\U0001d400LEGAL: OK",),
+        ("VERDICT: VIABLE\n\U0001d400 LEGAL: OK",),
+        ("LEGAL: \U0001d400",),
+        ("LEGAL:\U0001d7cf",),
+    ],
+    "fhi_parse_verdict": [
+        ("VERDICT: \U0001d7cfNOT VIABLE",),
+        ("VERDICT: \U00020bb7NOT VIABLE",),
+        ("VERDICT: \U0001d400VIABLE",),
+        ("verdict: \U0001d400unviable",),
+        ("VERDICT: VIABLE \U0001d400NOT VIABLE",),
+        ("VERDICT: NOT VIABLE \U00020000VIABLE",),
+        ("VERDICT: VIABLE\U0001d400",),
+        ("VERDICT: \U0001f600NOT VIABLE",),
+        ("\U0001d7cf. VERDICT: VIABLE",),
+    ],
+    "fhi_clean_health_history": [("\U0001d400 none",), ("none\U0001f600",)],
+    "fhi_normalize_entity_text": [("\U0001d400Diagnosis: x",), ("**\U0001d400**",)],
+    "fhi_deidentify_text": [
+        ("\U0001d7cf\U0001d7d0\U0001d7d1-\U0001d7d2\U0001d7d3-\U0001d7d4\U0001d7d5\U0001d7d6\U0001d7d7",),
+        ("SSN 123-45-678\U0001d7d7",),
+        ("member id \U0001d7cf\U0001d7d0\U0001d7d1\U0001d7d2\U0001d7d3\U0001d7d4",),
+        ("Member ID: AB12345\U0001d7d4.",),
+        ("\U00020000+@x.co",),
+        ("\U00020000.jo@x.co",),
+        ("\U00020000123-45-6789",),
+        ("\U0001d7cf2345678901",),
+        ("123-45-6789\U00020000",),
+        ("12 Main St.\U00020000",),
+        ("call 415-555-1212\U0001f600",),
+    ],
+    "fhi_treatment_from_findings": [
+        ("The patient requested coverage for \U0001d7cf\U0001d400 pills.", "A", "B")
+    ],
+    "fhi_diagnosis_from_findings": [
+        ("admitted to the hospital for \U0001d400\U0001d401\U0001d402", "A", "B")
+    ],
+}
+for _name, _cases in _ASTRAL.items():
+    ADVERSARIAL[_name] = ADVERSARIAL[_name] + _cases

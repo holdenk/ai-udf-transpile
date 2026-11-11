@@ -10,8 +10,11 @@ public class FhiParseVerdictLoop implements UDF1<Object, Object> {
     // Python \b...\b around a word-char-delimited alternation, and \s, for str patterns.
     private static final String WS =
         "\\t\\n\\x0B\\f\\r\\x1C-\\x1F \\x85\\xA0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000";
+    // A lookbehind over a character class steps back one UTF-16 unit, so a
+    // supplementary-plane letter or digit before the word reads as its low
+    // surrogate (not a word char). {1,2} lets it see the whole code point.
     private static final Pattern WORD = Pattern.compile(
-        "(?<![\\p{L}\\p{N}_])((?:NOT|UN|NON)[" + WS + "_-]*VIABLE|VIABLE)(?![\\p{L}\\p{N}_])");
+        "(?<![\\p{L}\\p{N}_]{1,2})((?:NOT|UN|NON)[" + WS + "_-]*VIABLE|VIABLE)(?![\\p{L}\\p{N}_])");
 
     // str.isspace() (all 29 code points are in the BMP)
     private static boolean sp(char c) {
