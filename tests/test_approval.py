@@ -322,3 +322,41 @@ def test_resolve_ambiguous_prefix(tmp_path):
     rows = SqliteCatalog(path).awaiting_approval()
     with pytest.raises(KeyError, match="ambiguous"):
         approve.resolve(rows, "")
+
+
+def test_browse_is_read_only(tmp_path):
+    path, keys = _parked(tmp_path, n=3)
+    cat = SqliteCatalog(path)
+    answers = iter(["n", "p", "p", "huh", "3", "q"])
+    out = io.StringIO()
+    shown = approve.browse(cat, input_fn=lambda _: next(answers), out=out)
+    text = out.getvalue()
+    assert shown == 3
+    assert "read-only" in text
+    assert "already at the first row" in text
+    assert "please answer n, p" in text
+    assert "[3/3]" in text
+    assert [r.udf_key for r in cat.awaiting_approval()] == keys  # nothing changed
+    assert all(cat.get(k).reviewed_at is None for k in keys)
+
+
+def test_browse_ends_at_last_row_and_cli(tmp_path, monkeypatch):
+    path, _ = _parked(tmp_path, n=2)
+    cat = SqliteCatalog(path)
+    answers = iter(["", ""])
+    out = io.StringIO()
+    assert approve.browse(cat, input_fn=lambda _: next(answers), out=out) == 2
+    assert "end of list" in out.getvalue()
+    cat.close()
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("2\nq\n"))
+    out = io.StringIO()
+    assert approve.main(["--sqlite-path", path, "--browse"], out=out) == 0
+    assert "[1/2]" in out.getvalue() and "[2/2]" in out.getvalue()
+    assert len(SqliteCatalog(path).awaiting_approval()) == 2
+
+
+def test_browse_empty(tmp_path):
+    out = io.StringIO()
+    assert approve.browse(SqliteCatalog(tmp_path / "e.sqlite"), input_fn=lambda _: "q", out=out) == 0
+    assert "nothing awaiting approval" in out.getvalue()

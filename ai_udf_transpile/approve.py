@@ -2,6 +2,7 @@
 """Walk the rewrites parked in ``awaiting_approval`` and ask a person about each.
 
   python -m ai_udf_transpile.approve --sqlite-path /tmp/ai_udf_transpile.sqlite
+  python -m ai_udf_transpile.approve --sqlite-path ... --browse   # read-only, one at a time
   python -m ai_udf_transpile.approve --sqlite-path ... --list
   python -m ai_udf_transpile.approve --sqlite-path ... --approve 3fa2c1 --reviewer alice
   python -m ai_udf_transpile.approve --sqlite-path ... --reject 3fa2c1 --reason "drops the tz"
@@ -157,6 +158,57 @@ def review(
     return counts
 
 
+def browse(
+    catalog: Any,
+    *,
+    input_fn: Callable[[str], str] = input,
+    out: TextIO = sys.stdout,
+    triggers: Any = None,
+) -> int:
+    """Read-only interactive view of parked rewrites: page through, change nothing.
+
+    Enter/n next, p previous, a number jumps to that row, q quits.
+    Returns how many distinct rows were shown.
+    """
+    rows = catalog.awaiting_approval()
+    if not rows:
+        print("nothing awaiting approval", file=out)
+        return 0
+    print(f"{len(rows)} rewrite(s) awaiting approval (read-only; nothing is changed)", file=out)
+    seen: set[int] = set()
+    index = 0
+    show = True
+    while True:
+        if show:
+            seen.add(index)
+            print(f"\n=== [{index + 1}/{len(rows)}] ===", file=out)
+            print(describe(rows[index], catalog, triggers=triggers), file=out)
+        show = True
+        try:
+            answer = input_fn(f"[n]ext / [p]rev / 1-{len(rows)} / [q]uit? ").strip().lower()
+        except EOFError:
+            answer = "q"
+        if answer in {"", "n", "next"}:
+            if index + 1 >= len(rows):
+                print("end of list", file=out)
+                break
+            index += 1
+        elif answer in {"p", "prev", "previous"}:
+            if index == 0:
+                print("already at the first row", file=out)
+                show = False
+            else:
+                index -= 1
+        elif answer.isdigit() and 1 <= int(answer) <= len(rows):
+            index = int(answer) - 1
+        elif answer in {"q", "quit", "exit"}:
+            break
+        else:
+            print(f"please answer n, p, a number from 1 to {len(rows)}, or q", file=out)
+            show = False
+    return len(seen)
+
+
 def _summary(counts: dict[str, int], out: TextIO) -> None:
     print(
         f"\napproved {counts['approved']}, rejected {counts['rejected']}, skipped {counts['skipped']}",
@@ -172,6 +224,11 @@ def main(argv: Optional[list[str]] = None, *, out: TextIO = sys.stdout) -> int:
     parser.add_argument("--reviewer", default=None, help="name recorded on the row (default: $USER)")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--list", action="store_true", help="print parked rewrites and exit")
+    action.add_argument(
+        "--browse",
+        action="store_true",
+        help="page through parked rewrites interactively without approving or rejecting",
+    )
     action.add_argument("--approve", nargs="+", metavar="KEY", help="approve these keys (prefixes ok)")
     action.add_argument("--reject", nargs="+", metavar="KEY", help="reject these keys (prefixes ok)")
     parser.add_argument("--reason", default="", help="rejection reason (with --reject)")
@@ -192,6 +249,9 @@ def main(argv: Optional[list[str]] = None, *, out: TextIO = sys.stdout) -> int:
     reviewer = args.reviewer or default_reviewer()
     triggers = parse_triggers(args.flags)
     try:
+        if args.browse:
+            browse(catalog, out=out, triggers=triggers)
+            return 0
         if args.list:
             rows = catalog.awaiting_approval()
             if not rows:

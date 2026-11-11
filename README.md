@@ -378,6 +378,7 @@ written back. Review the queue with:
 
 ```bash
 python -m ai_udf_transpile.approve --sqlite-path /tmp/ai_udf_transpile.sqlite          # interactive
+python -m ai_udf_transpile.approve --sqlite-path ... --browse   # interactive, read-only
 python -m ai_udf_transpile.approve --sqlite-path ... --list
 python -m ai_udf_transpile.approve --sqlite-path ... --approve 3fa2c1 --reviewer alice  # key prefixes ok
 python -m ai_udf_transpile.approve --sqlite-path ... --reject 3fa2c1 --reason "drops the tz"
@@ -386,7 +387,9 @@ python -m ai_udf_transpile.approve --sqlite-path ... --reject 3fa2c1 --reason "d
 The interactive loop shows each UDF's Python source, the SQL or Java
 rewrite, the backend/model, which flags it tripped, and a few of the real
 input rows it was checked against, then asks approve / reject / skip /
-quit. The reviewer (`--reviewer`, else `$AI_UDF_TRANSPILE_REVIEWER`, else
+quit. `--browse` is the same view without the decisions: page through
+with Enter/`n`, `p`, a row number, or `q`, and nothing in the catalog
+changes. The reviewer (`--reviewer`, else `$AI_UDF_TRANSPILE_REVIEWER`, else
 `$USER`) and time are recorded on the row (`reviewed_by`, `reviewed_at`).
 Approve serves it; reject fails it with the reason (candidate kept), and it
 goes back to the backend after the normal cooldown, bounded by
