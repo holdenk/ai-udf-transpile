@@ -20,10 +20,14 @@ def test_all_benches_flag_is_wired():
         "bench_micro.py",
         "bench_bytecode_vs_static.py",
         "bench_tpcds_udfs.py",
+        "bench_fhi_udfs.py",
         "bench_catalog.py",
         "bench_graph_aggregate.py",
     ):
         assert bench in demos
     # One CSV per bench: micro and bytecode must not share a path.
     assert "BYTECODE_CSV" in demos
-    assert "--all-benches" in (EXAMPLES / "regen_examples_doc.sh").read_text()
+    regen = (EXAMPLES / "regen_examples_doc.sh").read_text()
+    assert "--all-benches" in regen
+    # Pass 1 is the fill: a bench left out of it only gets cache misses in pass 2's doc.
+    assert "--bench-fhi" in regen

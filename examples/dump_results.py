@@ -109,7 +109,7 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
             raise SystemExit(f"cannot read perf csv {path}: {exc}")
         if not rows:
             continue
-        if "target_kind" in rows[0]:  # bench_catalog CSV: every cached function
+        if "target_kind" in rows[0]:  # bench_catalog / bench_fhi_udfs CSV
             for r in rows:
                 py_rate = r.get("python_rows_per_second")
                 tx_rate = r.get("transpiled_rows_per_second")
@@ -124,8 +124,10 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                         "ai": f"{_fmt_rate(tx_rate)} rows/s (no python baseline)",
                     }
                     continue
+                # Same schema, different bench: bench_fhi_udfs.py names itself.
+                bench = r.get("bench") or "catalog"
                 arms = {
-                    "top": f"- **perf (catalog bench)**: interpreted python {_fmt_rate(py_rate)} rows/s",
+                    "top": f"- **perf ({bench} bench)**: interpreted python {_fmt_rate(py_rate)} rows/s",
                     "static": "",
                     "ai": "",
                 }

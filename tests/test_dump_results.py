@@ -261,6 +261,17 @@ def test_perf_lines_unit(tmp_path):
         "static": "",
         "ai": "6.0M rows/s (3.0x vs python) · comet 9.0M rows/s (4.5x vs python)",
     }
+    # bench_fhi_udfs.py writes the same schema and names itself in a bench column
+    fhi = tmp_path / "fhi.csv"
+    fhi.write_text(
+        CATALOG_CSV.replace("status,target_kind,backend,model\n", "status,target_kind,backend,model,bench\n")
+        .replace("coco/auto\n", "coco/auto,fhi\n")
+        .replace("human,\n", "human,,fhi\n"),
+        encoding="utf-8",
+    )
+    assert _load_dump_module()._perf_lines([str(fhi)])["has_item"]["top"] == (
+        "- **perf (fhi bench)**: interpreted python 2.0M rows/s"
+    )
     # python-only row (no transpiled arm served) keeps the top, no ai suffix
     assert perf["plus_two"]["ai"] == ""
     assert perf["plus_two"]["top"].endswith("interpreted python 1.5M rows/s")
