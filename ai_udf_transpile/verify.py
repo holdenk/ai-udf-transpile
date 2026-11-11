@@ -50,19 +50,29 @@ _SENTINEL_RAISED = object()
 # extend it when a rewrite legitimately needs one of these and re-review.
 # \s* around dots: valid Java allows whitespace/comments between tokens of
 # a qualified name (`Runtime . getRuntime()` compiles fine).
-_FORBIDDEN_SQL = re.compile(r"\b(?:reflect|java_method)\s*\(", re.IGNORECASE)
+# try_reflect is reflect with the exception swallowed: the same arbitrary
+# static call (`try_reflect('java.lang.System', 'getenv', 'X')` reads the
+# driver's environment into a column), and `\breflect` does not see it.
+# The Java list is still a denylist and still leaks at the edges; the
+# entries past io/net are the ones a rewrite reached without naming either
+# (files and sockets through java.nio, TLS through javax.net, the process
+# environment, and the getDeclared* spellings of reflection).
+_FORBIDDEN_SQL = re.compile(r"\b(?:try_)?(?:reflect|java_method)\s*\(", re.IGNORECASE)
 _FORBIDDEN_JAVA = re.compile(
     r"\b(?:"
     r"Runtime\s*\.\s*getRuntime"
-    r"|System\s*\.\s*(?:load|loadLibrary|exit)"
+    r"|System\s*\.\s*(?:load|loadLibrary|exit|getenv|getProperty|getProperties|setProperty)"
+    r"|getenv\s*\("
     r"|ProcessBuilder"
     r"|Class\s*\.\s*forName"
     r"|loadClass\s*\("
-    r"|getMethod\s*\("
+    r"|(?:get\w*)?ClassLoader"
+    r"|get(?:Declared)?(?:Method|Constructor|Field)s?\s*\("
     r"|MethodHandles"
     r"|exec\s*\("
     r"|java\s*\.\s*(?:io|net)\s*\."
-    r"|javax\s*\.\s*script"
+    r"|java\s*\.\s*nio\s*\.\s*(?:file|channels)"
+    r"|javax\s*\.\s*(?:script|net)"
     r")"
 )
 _PLACEHOLDER = re.compile(r"_udf_param_\d+")

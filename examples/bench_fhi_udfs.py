@@ -238,6 +238,9 @@ def main() -> int:
         .config("spark.sql.shuffle.partitions", str(PARTITIONS))
         .config("spark.sql.ansi.enabled", "true")
         .config(TRANSPILE_CONF, "false")
+        # The letter frame is ~700 chars a row; a million of them cached does
+        # not fit the 1g default heap reliably (it OOMed on one run in two).
+        .config("spark.driver.memory", os.environ.get("AI_UDF_TRANSPILE_BENCH_DRIVER_MEMORY", "4g"))
         .getOrCreate()
     )
     string_gate = "sampled" if args.sampled_strings_only else "party"

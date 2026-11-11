@@ -15,7 +15,7 @@ is rejected. DECLINE is cheap and final -- a wrong guess is wasted work.
 - `split` is a regex. `substr` is 1-based. `lpad` is not `zfill`.
 - `dayofweek` is Sunday=1. `lower` is not `casefold`.
 - Casts are not Python `int()` or `str()`. An `int` annotation is Spark `bigint`.
-- No `reflect` or `java_method`.
+- No `reflect`, `try_reflect` or `java_method`.
 - If you are not sure, DECLINE.
 
 ## Inputs (authoritative)
@@ -151,9 +151,11 @@ Implement `org.apache.spark.sql.api.java.UDFN` (N = arity):
   `Double.toString` spells non-finite values `Infinity`/`NaN` where Python
   spells `inf`/`nan` — match Python's spelling if the UDF stringifies.
 - Forbidden APIs (the rewrite is rejected before it is ever compiled or run):
-  `Runtime.getRuntime`, `System.load`/`loadLibrary`/`exit`, `ProcessBuilder`,
-  reflection (`Class.forName`, `loadClass`, `getMethod`, `MethodHandles`),
-  any `exec(`, and anything under `java.io.`, `java.net.`, or `javax.script`.
+  `Runtime.getRuntime`, `System.load`/`loadLibrary`/`exit`/`getenv`/`getProperty`,
+  `ProcessBuilder`, reflection (`Class.forName`, `loadClass`, `ClassLoader`,
+  `getMethod`/`getDeclaredMethod` and the Constructor/Field variants,
+  `MethodHandles`), any `exec(`, and anything under `java.io.`, `java.net.`,
+  `java.nio.file`, `java.nio.channels`, `javax.net`, or `javax.script`.
   A row function needs none of them.
 
 ### Example (Java)
@@ -184,7 +186,7 @@ public class Backwards implements UDF1<Object, Object> {
 - The UDF calls a network/service/SDK (boto3, requests), reads the clock or
   randomness, or does I/O: no faithful rewrite exists.
 - You cannot match Python semantics for the declared types with confidence.
-- Never emit `reflect` or `java_method`. They invoke arbitrary JVM methods
+- Never emit `reflect`, `try_reflect` or `java_method`. They invoke arbitrary JVM methods
   and are rejected before the rewrite is run.
 
 Match Python semantics for the given types, including NULL (`None`).
