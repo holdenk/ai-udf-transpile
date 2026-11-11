@@ -113,7 +113,11 @@ def review(
     out: TextIO = sys.stdout,
     triggers: Any = None,
 ) -> dict[str, int]:
-    """Interactive loop over every parked rewrite. Returns counts per decision."""
+    """Interactive loop over every parked rewrite. Returns counts per decision.
+
+    Each row prompts y (approve) / n (reject, optional reason) / skip (also
+    Enter); q stops early. a / r are accepted as aliases for y / n.
+    """
     counts = {"approved": 0, "rejected": 0, "skipped": 0}
     rows = catalog.awaiting_approval()
     if not rows:
@@ -125,7 +129,7 @@ def review(
         print(describe(row, catalog, triggers=triggers), file=out)
         while True:
             try:
-                answer = input_fn("[a]pprove / [r]eject / [s]kip / [q]uit? ").strip().lower()
+                answer = input_fn("approve this rewrite? [y/n/skip] (q quits) ").strip().lower()
             except EOFError:
                 answer = "q"
             if answer in {"a", "approve", "y", "yes"}:
@@ -153,7 +157,7 @@ def review(
                 counts["skipped"] += len(rows) - index + 1
                 _summary(counts, out)
                 return counts
-            print("please answer a, r, s, or q", file=out)
+            print("please answer y, n, skip, or q", file=out)
     _summary(counts, out)
     return counts
 

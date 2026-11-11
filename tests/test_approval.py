@@ -295,7 +295,7 @@ def test_cli_approve_and_reject_by_prefix(tmp_path):
 def test_interactive_review(tmp_path):
     path, keys = _parked(tmp_path, n=3)
     cat = SqliteCatalog(path)
-    answers = iter(["?", "a", "r", "looks wrong", "s"])
+    answers = iter(["?", "y", "n", "looks wrong", "skip"])
     out = io.StringIO()
     counts = approve.review(cat, reviewer="carol", input_fn=lambda _: next(answers), out=out)
     assert counts == {"approved": 1, "rejected": 1, "skipped": 1}

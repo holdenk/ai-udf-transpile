@@ -386,8 +386,9 @@ python -m ai_udf_transpile.approve --sqlite-path ... --reject 3fa2c1 --reason "d
 
 The interactive loop shows each UDF's Python source, the SQL or Java
 rewrite, the backend/model, which flags it tripped, and a few of the real
-input rows it was checked against, then asks approve / reject / skip /
-quit. `--browse` is the same view without the decisions: page through
+input rows it was checked against, then prompts `[y/n/skip]`: `y`
+approves, `n` rejects (with an optional reason), `skip` or Enter leaves it
+for later, `q` stops. `--browse` is the same view without the decisions: page through
 with Enter/`n`, `p`, a row number, or `q`, and nothing in the catalog
 changes. The reviewer (`--reviewer`, else `$AI_UDF_TRANSPILE_REVIEWER`, else
 `$USER`) and time are recorded on the row (`reviewed_by`, `reviewed_at`).
