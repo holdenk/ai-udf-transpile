@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import ast
 import builtins
+import copy
 import hashlib
 import inspect
 import json
 import sys
 import textwrap
 from types import FunctionType, ModuleType
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 ALLOWED_LITERAL_TYPES = (int, float, bool, str, bytes, type(None))
 BUILTIN_NAMES = set(dir(builtins))
@@ -30,6 +31,81 @@ def canonical_source_text(src: str) -> str:
 def canonical_source_from_func(func: Any) -> str:
     src = textwrap.dedent(inspect.getsource(func))
     return canonical_source_text(src)
+
+
+def dotted_parts(node: Optional[ast.AST]) -> Optional[list[str]]:
+    """``F.udf`` -> ``["F", "udf"]``; anything but a Name/Attribute chain -> None."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return parts[::-1]
+
+
+def decorator_callee(decorator: ast.AST) -> ast.AST:
+    """``@udf(LongType())`` and ``@udf`` both name ``udf``."""
+    return decorator.func if isinstance(decorator, ast.Call) else decorator
+
+
+def is_pyspark_udf_qualname(qualname: Optional[str]) -> bool:
+    """``pyspark.sql.functions.udf`` and friends; never ``pandas_udf``."""
+    return bool(qualname) and qualname.startswith("pyspark.") and qualname.rsplit(".", 1)[-1] == "udf"
+
+
+def strip_udf_decorators(
+    function_ast: ast.FunctionDef,
+    is_udf_decorator: Callable[[list[str]], bool],
+) -> ast.FunctionDef:
+    """Drop the PySpark ``@udf`` decorator(s) from a def, leaving the rest.
+
+    ``@udf(returnType=...)`` hands Spark the undecorated function, but
+    ``inspect.getsource`` still returns the decorator line, so without this
+    the decorator is part of the canonical source and ``udf`` becomes a
+    (non-stdlib, so uncacheable) capture: every decorated UDF declined. The
+    decorator only says how Spark wraps the function, not what it computes.
+    Returns the input node unchanged when there is nothing to drop, so keys
+    of undecorated UDFs are unaffected. Never mutates the caller's node.
+    """
+    keep = []
+    for decorator in function_ast.decorator_list:
+        parts = dotted_parts(decorator_callee(decorator))
+        if parts is not None and is_udf_decorator(parts):
+            continue
+        keep.append(decorator)
+    if len(keep) == len(function_ast.decorator_list):
+        return function_ast
+    clone = copy.copy(function_ast)
+    clone.decorator_list = keep
+    return clone
+
+
+def runtime_udf_decorator_check(func: Any) -> Callable[[list[str]], bool]:
+    """``is_udf_decorator`` for a live function: resolve the name in its globals."""
+
+    def check(parts: list[str]) -> bool:
+        try:
+            value = _resolve_name(func, parts[0])
+        except (KeyError, ValueError):
+            return False
+        for attr in parts[1:]:
+            value = getattr(value, attr, None)
+            if value is None:
+                return False
+        module = getattr(value, "__module__", None) or ""
+        name = getattr(value, "__name__", None) or ""
+        return is_pyspark_udf_qualname(f"{module}.{name}")
+
+    return check
+
+
+def udf_function_ast(func: Any, function_ast: ast.FunctionDef) -> ast.FunctionDef:
+    """The def node the cache keys: Spark's parse, minus a PySpark ``@udf`` decorator."""
+    if func is None:
+        return function_ast
+    return strip_udf_decorators(function_ast, runtime_udf_decorator_check(func))
 
 
 def _is_allowed_literal(value: Any) -> bool:

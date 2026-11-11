@@ -22,6 +22,7 @@ from ai_udf_transpile.keys import (
     canonical_source_from_func,
     closure_fingerprint,
     extract_captures,
+    udf_function_ast,
     udf_key,
 )
 from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileResult
@@ -200,7 +201,7 @@ def register_impl(
     if catalog is None:
         raise RuntimeError("call ai_udf_transpile.enable(spark) before register_impl")
 
-    function_ast = _function_ast(func)
+    function_ast = udf_function_ast(func, _function_ast(func))
     params = _public_params(func, function_ast)
     declared_return = return_type
     if declared_return is None:
