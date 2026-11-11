@@ -44,14 +44,17 @@ evaluation costs about as much as that whole trip, so:
 - **Avoid `->` lambdas whenever a lambda-free spelling exists.** Spark 4.3
   does not serve a scalar rewrite that contains one: it keeps the Python UDF
   and says nothing.
-- **When the Python is already mostly `re` calls, the work only changes
-  engines**, and spelling Python's unicode `\s` / `\d` / `\w` / `\b` out for
+- **When the Python makes five or more `re` calls per row, the work only
+  changes engines**, and spelling Python's unicode `\s` / `\d` / `\w` / `\b` out for
   `java.util.regex` makes it slower than CPython. Pay for that only on rows
   that need it: for pure-ASCII text Java's cheap classes mean what Python's
   mean (`\s` is `[\t-\r\x1c-\x20]`, `\d` is `[0-9]`, `\w` is
   `[A-Za-z0-9_]`, `\b` is `\b`, `(?iu)` is `(?i)`). In SQL:
   `CASE WHEN length(x) = octet_length(x) THEN <ascii spelling> ELSE <faithful spelling> END`.
   In a Java UDF: test once at the top of `call` and pick a pattern set.
+  With one or two simple patterns, skip this: a plain `regexp_extract` /
+  `regexp_replace` with `(?iu)` already beats the Python, and a guard only
+  adds work.
 
 ## Inputs (authoritative)
 
