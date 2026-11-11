@@ -141,6 +141,12 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     arms["ai"] += (
                         f" · comet {_fmt_rate(comet)} rows/s ({r['comet_speedup_vs_python']}x vs python)"
                     )
+                prev_ai = perf.get(r["function"], {}).get("ai", "")
+                if arms["ai"] and not comet and " · comet " in prev_ai:
+                    # A later bench on this schema (fhi) has no comet arm:
+                    # keep the catalog bench's, labeled, since its speedup is
+                    # against that bench's own python baseline.
+                    arms["ai"] += " · comet (catalog bench) " + prev_ai.split(" · comet ", 1)[1]
                 perf[r["function"]] = arms
         elif "kinds" in rows[0]:  # bench_micro wide CSV
             for r in rows:

@@ -16,13 +16,19 @@ Two arms per function, over synthetic rows shaped like the real columns
               or a Java UDF -- the backend picks; the CSV says which
 
 A function the backend declines, or whose rewrite Hypothesis rejects, keeps
-serving python: it gets a python number and no transpiled one.
+serving python: it gets a python number and no transpiled one. So does a
+rewrite that verified but that Spark will not serve: each arm's physical
+plan is checked before it is timed, and a "transpiled" arm that still has a
+python eval node is reported as not_served (Spark drops a rewrite with a
+higher-order-function lambda in it and runs the python instead, silently).
 
 Strings are the values under test, so partyOnStrings is on by default: the
 gate generates arbitrary text (unicode whitespace, odd line terminators) on
 top of the seeded domain rows. --sampled-strings-only turns that off and
-verifies on the seeded rows alone -- a weaker gate, and the CSV's
-string_gate column says which one a number was earned under.
+verifies on the seeded rows alone -- a weaker gate. The CSV's string_gate
+column says which gate this run verified a rewrite under, or `cached` when
+the rewrite was already in $AI_UDF_TRANSPILE_SQLITE and this run verified
+nothing (the catalog does not record the gate a row was earned under).
 
   export SPARK_HOME=~/spark
   python examples/bench_fhi_udfs.py [rows] [--rounds N] [--csv PATH]
@@ -180,18 +186,28 @@ def noop_seconds(df) -> float:
     return time.perf_counter() - start
 
 
-def wait_for_catalog(catalog, source_text, timeout=900):
+_ROW_SQL = (
+    "SELECT status, error, backend, model, target_kind, attempt_count FROM cache "
+    "WHERE source_text = ? AND spark_version = ? ORDER BY updated_at DESC"
+)
+
+
+def catalog_row(catalog, source_text, spark_version):
+    """This session's row for a function. The key includes the Spark version,
+    so a shared catalog can hold the same source under another key; that row
+    must not answer for the one this session queued."""
+    with catalog._lock:
+        return catalog._conn.execute(_ROW_SQL, (source_text, spark_version)).fetchone()
+
+
+def wait_for_catalog(catalog, source_text, spark_version, timeout=900):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        with catalog._lock:
-            row = catalog._conn.execute(
-                "SELECT status, error, backend, model, target_kind FROM cache WHERE source_text = ?",
-                (source_text,),
-            ).fetchone()
+        row = catalog_row(catalog, source_text, spark_version)
         if row and row[0] in {"success", "failed"}:
             return row
         time.sleep(0.1)
-    return ("timeout", None, None, None, None)
+    return ("timeout", None, None, None, None, None)
 
 
 def main() -> int:
@@ -250,6 +266,11 @@ def main() -> int:
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
     spark.conf.set(TRANSPILE_CONF, "true")
     conf.set_value(conf.PARTY_ON_STRINGS, "false" if args.sampled_strings_only else "true", spark)
+    version = str(spark.version)
+    sources = {n: canonical_source_from_func(funcs[n]) for n in names}
+    # A row already terminal in a reused catalog is served as it is: this run
+    # verifies nothing for it, under either gate.
+    attempts_before = {n: (catalog_row(catalog, sources[n], version) or (None,) * 6)[5] for n in names}
 
     # -- Seed samples: run each UDF once on domain-shaped rows so Hypothesis
     # checks real verdict blocks and letters, not just generated text. The
@@ -264,7 +285,7 @@ def main() -> int:
     filled: dict[str, tuple] = {}
     for n in names:
         UserDefinedFunction(funcs[n], rtypes[n])  # construction queues the pending row
-        filled[n] = wait_for_catalog(catalog, canonical_source_from_func(funcs[n]), args.timeout)
+        filled[n] = wait_for_catalog(catalog, sources[n], version, args.timeout)
         status, error = filled[n][0], filled[n][1]
         if status != "success":
             print(f"no rewrite for {n} ({status}): {error!r}")
@@ -286,13 +307,17 @@ def main() -> int:
         return "EvalPython" in df._jdf.queryExecution().executedPlan().toString()
 
     arms: list[tuple[str, str, object]] = []
+    not_served: set[str] = set()
     for n in names:
         py_df = frames[n].select(py_udfs[n](*cols[n]))
         assert runs_python(py_df), f"{n}: python arm has no python eval node"
         arms.append(("python", n, py_df))
         if n in ai_udfs:
             tx_df = frames[n].select(ai_udfs[n](*cols[n]))
-            assert not runs_python(tx_df), f"{n}: transpiled arm still evaluates python"
+            if runs_python(tx_df):
+                not_served.add(n)
+                print(f"{n}: rewrite verified, but Spark still plans the python UDF -- python only")
+                continue
             arms.append(("transpiled", n, tx_df))
     for _arm, _n, arm_df in arms:  # warmup
         noop_seconds(arm_df)
@@ -306,7 +331,10 @@ def main() -> int:
     print("-" * len(header))
     out = []
     for n in names:
-        status, _error, backend, model, kind = filled[n]
+        status, _error, backend, model, kind, attempts = filled[n]
+        if n in not_served:
+            status = "not_served"
+        verified_now = attempts is not None and attempts != attempts_before[n]
         py_s = secs[("python", n)]
         tx_s = secs.get(("transpiled", n))
         speedup = round(py_s / tx_s, 1) if tx_s else ""
@@ -329,7 +357,7 @@ def main() -> int:
                 "backend": backend or "",
                 "model": model or "",
                 "bench": "fhi",
-                "string_gate": string_gate,
+                "string_gate": string_gate if verified_now else "cached",
             }
         )
 

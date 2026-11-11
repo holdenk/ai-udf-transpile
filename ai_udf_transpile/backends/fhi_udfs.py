@@ -178,9 +178,14 @@ def fhi_normalize_entity_text(text: str) -> str:
 
 
 def fhi_deidentify_text(text: str) -> str:
-    # deid.deidentify_text: the regex PII pass. Existing {{PLACEHOLDER}} /
-    # [PLACEHOLDER] tokens are parked behind NUL-delimited indexes, six PII
-    # patterns run in order (SSN before phone), then the tokens come back.
+    # deid.deidentify_text as its bare registrations return it
+    # (deid.make_deidentify_text_udf, spark_utils.make_deid_text_udf): the
+    # regex PII pass. Existing {{PLACEHOLDER}} / [PLACEHOLDER] tokens are
+    # parked behind NUL-delimited indexes, six PII patterns run in order (SSN
+    # before phone), then the tokens come back. The letter-cleaning
+    # registration (spark_utils.make_clean_letter_text_udf) runs
+    # filter_end_markers first; that composition is a different UDF and is
+    # not ported.
     # A PII scrubber fails in one direction: a rewrite that redacts less
     # than this does is a leak, not a mismatch.
     import re

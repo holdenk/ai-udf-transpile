@@ -25,6 +25,11 @@ def test_all_benches_flag_is_wired():
         "bench_graph_aggregate.py",
     ):
         assert bench in demos
+    # --all-benches itself turns the fhi bench on, and its fills land in the
+    # cache before the coverage bench reads it.
+    start = demos.index("--all-benches)")
+    assert "BENCH_FHI=1" in demos[start : demos.index(";;", start)]
+    assert demos.index("examples/bench_fhi_udfs.py") < demos.index("examples/bench_catalog.py")
     # One CSV per bench: micro and bytecode must not share a path.
     assert "BYTECODE_CSV" in demos
     regen = (EXAMPLES / "regen_examples_doc.sh").read_text()
