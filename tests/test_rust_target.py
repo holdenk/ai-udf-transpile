@@ -285,6 +285,14 @@ def test_fixtures_pass_the_scan(source):
         "let _q = '\"'; unsafe { } let _r = '\"';",
         # Nested block comment: the tail after the first */ is still code to us.
         "/* /* */ */ unsafe { }",
+        # ...and a quote inside the nested comment must not open a string
+        # that hides the code after it (reported against the regex scan).
+        '/* /* */ " */ std::process::exit(0); // "',
+        '/* /* /* */ */ " */ let _ = std::fs::read("/x"); // "',
+        # A lifetime is not a char literal: the quote does not open anything.
+        "fn f<'a>(s: &'a str) -> &'a str { s } let _ = std::fs::read(\"/x\"); let _c = 'x';",
+        # A raw string ends at its own closing hashes, not at the first quote.
+        'let _a = r##"a "# b"##; std::process::exit(0); let _b = "";',
     ],
 )
 def test_scan_rejects(body):
@@ -304,6 +312,9 @@ def test_scan_rejects(body):
         "use std::collections::HashMap; let _m: HashMap<i64, i64> = HashMap::new();",
         'let _s = format!("{}", 1); let _v: Vec<char> = "ab".chars().rev().collect();',
         "fn helper<'a>(s: &'a str) -> &'a str { s } let _ = helper(\"x\");",
+        "/* outer /* inner std::fs */ still a comment: unsafe { std::process::exit(0) } */",
+        'let _a = r##"unsafe "# std::fs::read"##;',
+        "let _q = '\\''; let _u = '\\u{1F600}'; let _b = b'\\x7f';",
     ],
 )
 def test_scan_allows(body):
@@ -844,3 +855,30 @@ def test_unsafe_is_a_compile_error_even_past_the_scan(rust_build_dir):
 def test_empty_source_is_rejected(rust_build_dir):
     with pytest.raises(rustc.RustCompileError, match="empty Rust source"):
         rustc.compile_rust(None, "  \n", ["bigint"], "bigint")
+
+
+@pytest.mark.skipif(rustc.fcntl is None, reason="flock is POSIX-only")
+def test_build_lock_excludes_other_processes(tmp_path):
+    # Two drivers sharing a build directory must not build one crate at once.
+    import subprocess
+    import sys
+
+    probe = (
+        "import fcntl, sys\n"
+        "with open(sys.argv[1], 'a+b') as h:\n"
+        "    try:\n"
+        "        fcntl.flock(h.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "    except BlockingIOError:\n"
+        "        print('held')\n"
+        "    else:\n"
+        "        print('free')\n"
+    )
+    lock = tmp_path / "locks" / "ai_udf_rs_x.lock"
+
+    def other_process_sees() -> str:
+        done = subprocess.run([sys.executable, "-c", probe, str(lock)], capture_output=True, text=True)
+        return done.stdout.strip()
+
+    with rustc._locked("ai_udf_rs_x", tmp_path):
+        assert other_process_sees() == "held"
+    assert other_process_sees() == "free"

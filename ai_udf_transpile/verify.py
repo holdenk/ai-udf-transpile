@@ -295,21 +295,75 @@ def _java_for_forbidden_scan(java: str) -> str:
     return _JAVA_SKIP.sub(_blank_skippable, _translate_java_unicode_escapes(java))
 
 
-# Comments and literals, blanked before the Rust scan. Raw strings come
-# first: `r"\"` is a complete literal (no escapes), and reading it as an
-# ordinary string would run the "literal" on to the next quote and hide the
-# code in between. Char literals matter for the same reason (`'"'` is not an
-# open string). Block comments nest in Rust; blanking only up to the first
-# `*/` leaves the tail of a nested comment visible, which can only reject
-# more, never less.
-_RUST_SKIP = re.compile(
-    r"//[^\n\r]*"  # line comment
-    r"|/\*.*?\*/"  # block comment (outermost prefix)
-    r'|(?<![A-Za-z0-9_])b?r(#*)".*?"\1'  # raw (byte) string
-    r'|b?"(?:[^"\\]|\\.)*"'  # (byte) string
-    r"|b?'(?:[^'\\\n]|\\(?:u\{[^}\n]*\}|x[0-9a-fA-F]{2}|.))'",  # char / byte literal
-    re.DOTALL,
-)
+# Comments and literals, blanked before the Rust scan. A lexer, not a regex:
+# Rust block comments NEST, and a regex that stops at the first `*/` treats
+# the rest of an outer comment as code -- `/* /* */ " */ exit(0); // "`
+# then reads as a string covering the call. Raw strings (`r#"..."#`) have no
+# escapes, and `'a` is a lifetime unless a closing quote follows one char.
+_RUST_CHAR = re.compile(r"b?'(?:[^'\\\n]|\\(?:u\{[^}\n]*\}|x[0-9a-fA-F]{2}|.))'")
+_RUST_RAW_START = re.compile(r'b?r(#*)"')
+
+
+def _rust_blank_literals(rust: str) -> str:
+    """Blank comments and literals (keeping newlines) the way rustc lexes them.
+
+    An unterminated comment or literal blanks to the end: rustc rejects that
+    source anyway, so treating the tail as inert can only reject less of
+    something that will never compile.
+    """
+    out = list(rust)
+    n = len(rust)
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    i = 0
+    while i < n:
+        ch = rust[i]
+        if rust.startswith("//", i):
+            j = rust.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+            continue
+        if rust.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if rust.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif rust.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+            continue
+        ident_before = i > 0 and (rust[i - 1].isalnum() or rust[i - 1] == "_")
+        raw = None if ident_before else _RUST_RAW_START.match(rust, i)
+        if raw:
+            close = '"' + raw.group(1)
+            j = rust.find(close, raw.end())
+            j = n if j < 0 else j + len(close)
+            blank(i, j)
+            i = j
+            continue
+        if ch == '"' or (ch == "b" and not ident_before and rust.startswith('b"', i)):
+            j = i + (2 if ch == "b" else 1)
+            while j < n and rust[j] != '"':
+                j += 2 if rust[j] == "\\" else 1
+            blank(i, j + 1)
+            i = j + 1
+            continue
+        if ch == "'" or (ch == "b" and not ident_before and rust.startswith("b'", i)):
+            lit = _RUST_CHAR.match(rust, i)
+            if lit:
+                blank(i, lit.end())
+                i = lit.end()
+                continue
+        i += 1
+    return "".join(out)
 
 
 # `r#fs` is the identifier `fs`: drop the raw prefix so `std::r#fs` reads as
@@ -318,7 +372,7 @@ _RUST_RAW_IDENT = re.compile(r"\br#(?=[A-Za-z_])")
 
 
 def _rust_for_forbidden_scan(rust: str) -> str:
-    return _RUST_RAW_IDENT.sub("", _RUST_SKIP.sub(_blank_skippable, rust))
+    return _RUST_RAW_IDENT.sub("", _rust_blank_literals(rust))
 
 
 def rejected_rewrite(result: Any) -> Optional[str]:

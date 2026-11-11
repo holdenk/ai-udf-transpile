@@ -40,12 +40,18 @@ import sys
 import threading
 import time
 import tomllib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from ai_udf_transpile import conf
 from ai_udf_transpile.targets import KIND_RUST
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -498,7 +504,8 @@ def _sdk_state(spark: Any, spec: SdkSpec) -> _SdkState:
     """
     root = build_dir(spark)
     key = (str(root), spec.ident)
-    with _SDK_LOCK:
+    sdk_name = "sdk-" + hashlib.sha256(spec.ident.encode()).hexdigest()[:16]
+    with _SDK_LOCK, _locked(sdk_name, root):
         cached = _SDK_STATES.get(key)
         if cached is not None:
             return cached
@@ -586,6 +593,29 @@ def _build_lock(name: str) -> threading.Lock:
         return _BUILD_LOCKS.setdefault(name, threading.Lock())
 
 
+@contextmanager
+def _locked(name: str, root: Path):
+    """Serialize work on one UDF crate across threads AND processes.
+
+    Two drivers sharing a build directory (the per-user default, or
+    rust.sharedBuildDir) would otherwise build the same crate in the same
+    directory and delete each other's sources mid-build. The thread lock
+    comes first: flock is per open file, so threads of one process need
+    their own exclusion anyway. No fcntl (Windows): threads only.
+    """
+    with _build_lock(name):
+        locks = root / "locks"
+        locks.mkdir(parents=True, exist_ok=True)
+        with open(locks / f"{name}.lock", "a+b") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _planned(spark: Any, rust_source: str, input_types: list[str], return_type: str) -> CompiledRust:
     spec = resolve_sdk(spark)
     name = udf_name(rust_source, input_types, return_type, spec.ident)
@@ -612,11 +642,11 @@ def compile_rust(spark: Any, rust_source: str, input_types: list[str], return_ty
     if not (rust_source or "").strip():
         raise RustCompileError("empty Rust source")
     planned = _planned(spark, rust_source, input_types, return_type)
-    with _build_lock(planned.name):
+    root = build_dir(spark)
+    with _locked(planned.name, root):
         if planned.library.is_file():
-            return planned
+            return planned  # built by another thread or process while we waited
         state = _sdk_state(spark, resolve_sdk(spark))
-        root = build_dir(spark)
         crate = root / "crates" / planned.name
         # Fresh directory: nothing stale (a build.rs, an extra module) rides along.
         shutil.rmtree(crate, ignore_errors=True)
