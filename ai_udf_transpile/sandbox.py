@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from ai_udf_transpile import conf
-from ai_udf_transpile.targets import TranspileJob
+from ai_udf_transpile.targets import KIND_RUST, TranspileJob
 
 SOURCE = "source"
 BYTECODE = "bytecode"
@@ -24,6 +24,33 @@ _MODES = (SOURCE, BYTECODE, SOURCE_PLUS_BYTECODE)
 
 def default_prompt() -> str:
     return files("ai_udf_transpile.resources").joinpath("prompt.md").read_text(encoding="utf-8")
+
+
+def rust_signature_for(job: TranspileJob) -> Optional[str]:
+    """The row-function signature to ask for, when this job accepts Rust."""
+    from ai_udf_transpile.rustc import rust_signature, supports_types
+
+    if KIND_RUST not in job.targets or not supports_types(job.input_types, job.return_type):
+        return None
+    return rust_signature(job.input_types, job.return_type)
+
+
+def rust_prompt(signature: str) -> str:
+    text = files("ai_udf_transpile.resources").joinpath("prompt_rust.md").read_text(encoding="utf-8")
+    return text.replace("@@SIGNATURE@@", signature)
+
+
+def _types_payload(job: TranspileJob) -> dict:
+    payload = {
+        "param_names": job.param_names,
+        "input_types": job.input_types,
+        "input_categories": job.input_categories,
+        "return_type": job.return_type,
+    }
+    signature = rust_signature_for(job)
+    if signature:
+        payload["rust_signature"] = signature
+    return payload
 
 
 def representation(inputs: Optional[str] = None) -> str:
@@ -65,15 +92,7 @@ def job_appendix(job: TranspileJob, inputs: Optional[str] = None) -> str:
     if show_bytecode and not dis_text:
         # No disassembly (closure, syntax drift): bytecode mode has no function.
         show_bytecode = False
-    types = json.dumps(
-        {
-            "param_names": job.param_names,
-            "input_types": job.input_types,
-            "input_categories": job.input_categories,
-            "return_type": job.return_type,
-        },
-        indent=2,
-    )
+    types = json.dumps(_types_payload(job), indent=2)
     captures = json.dumps(job.captures, indent=2, default=str)
     files_on_disk = [name for name, on in (("udf.py", show_source), ("disassembly.txt", show_bytecode)) if on]
     if files_on_disk:
@@ -107,6 +126,9 @@ def write_sandbox(
 ) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     body = prompt if prompt is not None else default_prompt()
+    signature = rust_signature_for(job)
+    if signature:
+        body = body.rstrip() + "\n\n" + rust_prompt(signature)
     (root / "PROMPT.md").write_text(body.rstrip() + "\n" + job_appendix(job, inputs), encoding="utf-8")
     mode = representation(inputs)
     if mode in (SOURCE, SOURCE_PLUS_BYTECODE):
@@ -118,19 +140,7 @@ def write_sandbox(
     (root / "captures.json").write_text(
         json.dumps(job.captures, indent=2, default=str) + "\n", encoding="utf-8"
     )
-    (root / "types.json").write_text(
-        json.dumps(
-            {
-                "param_names": job.param_names,
-                "input_types": job.input_types,
-                "input_categories": job.input_categories,
-                "return_type": job.return_type,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    (root / "types.json").write_text(json.dumps(_types_payload(job), indent=2) + "\n", encoding="utf-8")
     return root
 
 

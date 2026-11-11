@@ -10,6 +10,7 @@ import linecache
 import logging
 import re
 import textwrap
+from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,28 @@ _FORBIDDEN_JAVA = re.compile(
     r"|java\s*\.\s*nio\s*\.\s*(?:file|channels)"
     r"|javax\s*\.\s*(?:script|net)"
     r")"
+)
+# A Rust row function is pure computation over its arguments. `unsafe` is
+# also a compile error (the generated glue forbids it for the module); the
+# rest is what safe Rust can still reach: the filesystem, processes, sockets
+# and the environment through std, files read at COMPILE time through
+# include!/env!/#[path], and FFI through extern. arrow and the SDK are the
+# glue's business -- a row function never needs them. A module is named
+# either as a path segment (`fs::read`, `std::fs`) or in a `use std::{..}`
+# group. Denylist, not a sandbox: the same caveat as the Java scan.
+_RUST_MODULES = r"(?:fs|process|net|env|os|ffi|ptr|thread|io|path|arch|intrinsics)"
+_FORBIDDEN_RUST = re.compile(
+    r"\b(?:unsafe|extern)\b"
+    r"|\b" + _RUST_MODULES + r"\s*::"
+    r"|\b(?:std|core|alloc)\s*::\s*" + _RUST_MODULES + r"\b"
+    r"|\buse\s+(?:::\s*)?(?:std|core|alloc)\s*::\s*\{[^;]*\b" + _RUST_MODULES + r"\b"
+    r"|\b(?:arrow\w*|comet_udf_sdk|libc)\s*::"
+    r"|\b(?:SystemTime|Instant)\b"  # the clock: Comet plans the call as immutable
+    # A macro can paste a module name into a path (`std::$m::read`), which
+    # no token scan sees; a row function has no use for defining one.
+    r"|\bmacro_rules\b"
+    r"|\b(?:include|include_str|include_bytes|env|option_env|asm|global_asm|concat_idents)\s*!"
+    r"|#\s*!?\s*\[\s*(?:path|link\w*|no_mangle|export_name|used|global_allocator|cfg_attr|proc_macro\w*)\b"
 )
 _PLACEHOLDER = re.compile(r"_udf_param_\d+")
 
@@ -272,6 +295,32 @@ def _java_for_forbidden_scan(java: str) -> str:
     return _JAVA_SKIP.sub(_blank_skippable, _translate_java_unicode_escapes(java))
 
 
+# Comments and literals, blanked before the Rust scan. Raw strings come
+# first: `r"\"` is a complete literal (no escapes), and reading it as an
+# ordinary string would run the "literal" on to the next quote and hide the
+# code in between. Char literals matter for the same reason (`'"'` is not an
+# open string). Block comments nest in Rust; blanking only up to the first
+# `*/` leaves the tail of a nested comment visible, which can only reject
+# more, never less.
+_RUST_SKIP = re.compile(
+    r"//[^\n\r]*"  # line comment
+    r"|/\*.*?\*/"  # block comment (outermost prefix)
+    r'|(?<![A-Za-z0-9_])b?r(#*)".*?"\1'  # raw (byte) string
+    r'|b?"(?:[^"\\]|\\.)*"'  # (byte) string
+    r"|b?'(?:[^'\\\n]|\\(?:u\{[^}\n]*\}|x[0-9a-fA-F]{2}|.))'",  # char / byte literal
+    re.DOTALL,
+)
+
+
+# `r#fs` is the identifier `fs`: drop the raw prefix so `std::r#fs` reads as
+# what it names. (Raw strings also start `r#`, but those are already blank.)
+_RUST_RAW_IDENT = re.compile(r"\br#(?=[A-Za-z_])")
+
+
+def _rust_for_forbidden_scan(rust: str) -> str:
+    return _RUST_RAW_IDENT.sub("", _RUST_SKIP.sub(_blank_skippable, rust))
+
+
 def rejected_rewrite(result: Any) -> Optional[str]:
     """Return an error if the rewrite must not be compiled or executed.
 
@@ -281,10 +330,16 @@ def rejected_rewrite(result: Any) -> Optional[str]:
     """
     sql = getattr(result, "sql", None) or ""
     java = getattr(result, "java_source", None) or ""
+    rust = getattr(result, "rust_source", None) or ""
     if _FORBIDDEN_SQL.search(_sql_for_forbidden_scan(sql)):
         return "rewrite invokes reflect or java_method"
     if _FORBIDDEN_JAVA.search(_java_for_forbidden_scan(java)):
         return "java rewrite uses a forbidden API (Runtime/ProcessBuilder/reflection/exec/io/net/script)"
+    if _FORBIDDEN_RUST.search(_rust_for_forbidden_scan(rust)):
+        return (
+            "rust rewrite uses a forbidden construct "
+            "(unsafe/extern/fs/process/net/env/io/clock/include!/env!/macro_rules!/#[path]/arrow)"
+        )
     return None
 
 
@@ -564,12 +619,42 @@ def _row_values(args: tuple) -> dict[str, Any]:
     return {f"_udf_param_{i}": args[i] for i in range(len(args))}
 
 
-def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_type: str):
+_COMET_RDD_CONVERT = "spark.comet.convert.rdd.enabled"
+
+
+@contextmanager
+def _comet_native_rows(spark: Any, native: bool):
+    """Let Comet take the operator above an in-memory DataFrame.
+
+    A Rust UDF runs only inside Comet's native execution, and the verifier's
+    rows come from ``createDataFrame`` (an RDD scan Comet leaves to Spark
+    unless asked to convert it). Session-wide for the duration, like the
+    untyped-UDF switch in javac: harmless to a concurrent query, which at
+    worst gets its own RDD scans converted to Arrow.
+    """
+    if not native:
+        yield
+        return
+    prior = spark.conf.get(_COMET_RDD_CONVERT, None)
+    spark.conf.set(_COMET_RDD_CONVERT, "true")
+    try:
+        yield
+    finally:
+        if prior is None:
+            spark.conf.unset(_COMET_RDD_CONVERT)
+        else:
+            spark.conf.set(_COMET_RDD_CONVERT, prior)
+
+
+def _eval_sql(
+    spark: Any, sql: str, args: tuple, input_types: list[str], return_type: str, native: bool = False
+):
     from pyspark.sql import Row
     from pyspark.sql.types import StructType
 
     df = spark.createDataFrame([Row(**_row_values(args))], StructType(_param_fields(input_types)))
-    value = df.selectExpr(f"({sql}) AS result").collect()[0][0]
+    with _comet_native_rows(spark, native):
+        value = df.selectExpr(f"({sql}) AS result").collect()[0][0]
     if not _representable(value, return_type):
         # Production always casts the result; verify did not. A value that
         # fits the tolerance but not the return type passed verification and
@@ -578,8 +663,15 @@ def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_
     return value
 
 
-def _eval_sql_batch(spark: Any, sql: str, rows: list[tuple], input_types: list[str]) -> list:
-    """Evaluate ``sql`` on many argument tuples in one job. Order matches ``rows``."""
+def _eval_sql_batch(
+    spark: Any, sql: str, rows: list[tuple], input_types: list[str], native: bool = False
+) -> list:
+    """Evaluate ``sql`` on many argument tuples in one job. Order matches ``rows``.
+
+    ``native`` keeps the projection directly above the scan: a global sort
+    puts a Spark exchange under it, and a Rust UDF above a Spark operator is
+    a query error. Rows are matched back by id either way.
+    """
     from pyspark.sql import Row
     from pyspark.sql.types import IntegerType, StructField, StructType
 
@@ -590,7 +682,10 @@ def _eval_sql_batch(spark: Any, sql: str, rows: list[tuple], input_types: list[s
         values.update(_row_values(args))
         data.append(Row(**values))
     df = spark.createDataFrame(data, StructType(fields))
-    collected = df.orderBy("_batch_id").selectExpr("_batch_id", f"({sql}) AS result").collect()
+    if not native:
+        df = df.orderBy("_batch_id")
+    with _comet_native_rows(spark, native):
+        collected = df.selectExpr("_batch_id", f"({sql}) AS result").collect()
     by_id = {int(record[0]): record[1] for record in collected}
     return [by_id[i] for i in range(len(rows))]
 
@@ -710,6 +805,28 @@ def _java_udf_expr(
     return f"{fname}({args})"
 
 
+def _rust_udf_expr(
+    spark: Any,
+    result: Any,
+    input_types: list[str],
+    return_type: str,
+) -> str:
+    """Build (if needed) and register the Rust UDF; the SQL that calls it.
+
+    Blocks on cargo: this is the worker, not UDF definition. The build lands
+    in the same content-addressed cache a later lookup serves from.
+    """
+    from ai_udf_transpile import rustc
+
+    reason = rustc.comet_unavailable(spark)
+    if reason:
+        raise VerifyFailed(f"a rust rewrite can only be verified under Comet: {reason}")
+    compiled = rustc.compile_rust(spark, result.rust_source or "", input_types, return_type)
+    rustc.register_rust_udf(spark, compiled, input_types, return_type)
+    result.entry = compiled.name
+    return rustc.call_expr(compiled.name, input_types)
+
+
 _INT_RETURN_RANGES = {
     "int": (-(2**31), 2**31 - 1),
     "bigint": (-(2**63), 2**63 - 1),
@@ -793,11 +910,20 @@ def hypothesis_check(
             return False, f"java_udf verify setup failed: {exc}"
         if eval_expr is None:
             return False, "java_udf result has no class/binary to verify"
+    elif kind == "rust":
+        if spark is None:
+            return False, "rust verify requires Spark"
+        try:
+            eval_expr = _rust_udf_expr(spark, result, input_types, return_type)
+        except Exception as exc:
+            return False, f"rust verify setup failed: {exc}"
     else:
         return False, f"verify of target_kind={kind} is not implemented"
 
     if spark is None:
         return False, "hypothesis_check requires a SparkSession"
+    # A Rust UDF is evaluated by Comet or not at all.
+    native = kind == "rust"
 
     import time
 
@@ -842,12 +968,12 @@ def hypothesis_check(
         sql_batches += 1
         args_list = [item[0] for item in batch]
         try:
-            sql_values = _eval_sql_batch(spark, eval_expr, args_list, input_types)
+            sql_values = _eval_sql_batch(spark, eval_expr, args_list, input_types, native)
         except Exception:
             logger.debug("sql batch of %d failed; retrying per row", len(batch), exc_info=True)
             for args, py_value, py_exc in batch:
                 try:
-                    sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type)
+                    sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type, native)
                     _judge(args, py_value, py_exc, sql_value, None)
                 except Exception as exc:
                     _judge(args, py_value, py_exc, _SENTINEL_RAISED, exc)

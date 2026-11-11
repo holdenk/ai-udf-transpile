@@ -42,7 +42,7 @@ from ai_udf_transpile.backends.bytecode import BytecodeBackend  # noqa: E402
 from ai_udf_transpile.catalog import CacheRow  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
 from ai_udf_transpile.sandbox import make_sandbox  # noqa: E402
-from ai_udf_transpile.targets import KIND_JAVA_UDF  # noqa: E402
+from ai_udf_transpile.targets import KIND_JAVA_UDF, KIND_RUST  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
@@ -224,12 +224,17 @@ def _ai_section(row: CacheRow) -> list[str]:
     if row.status == "success":
         if row.target_kind == KIND_JAVA_UDF:
             return [f"- **AI ({label})**: java UDF:{tail}", "", "```java", row.impl_source or "", "```"]
+        if row.target_kind == KIND_RUST:
+            head = f"- **AI ({label})**: rust UDF (Comet native):{tail}"
+            return [head, "", "```rust", row.impl_source or "", "```"]
         return [f"- **AI ({label})**: `{row.catalyst_sql}`{tail}"]
     if row.status == "failed":
         lines = [f"- **AI ({label})**: failed: {row.error}{tail}"]
         # The rejected candidate is half the story: show it when the row kept it.
         if row.target_kind == KIND_JAVA_UDF and row.impl_source:
             return lines + ["", "```java", row.impl_source, "```"]
+        if row.target_kind == KIND_RUST and row.impl_source:
+            return lines + ["", "```rust", row.impl_source, "```"]
         if row.catalyst_sql:
             lines.append(f"- **rejected rewrite**: `{row.catalyst_sql}`")
         return lines

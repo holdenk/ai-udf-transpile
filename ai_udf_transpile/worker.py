@@ -20,7 +20,7 @@ from ai_udf_transpile.backends import get_backend
 from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.catalog import Catalog, configured_tolerance, open_catalog, publish_verified
 from ai_udf_transpile.sandbox import make_sandbox
-from ai_udf_transpile.targets import TranspileResult
+from ai_udf_transpile.targets import KIND_RUST, TranspileResult
 from ai_udf_transpile.verify import (
     hypothesis_check,
     rejected_rewrite,
@@ -57,6 +57,31 @@ def _reported_model(backend: Any) -> Optional[str]:
         return None
 
 
+def _rust_offered(spark: Any, input_types: list[str], return_type: str) -> bool:
+    """Ask for Rust only where this session could build, verify and serve it."""
+    if spark is None:
+        return False
+    try:
+        from ai_udf_transpile.rustc import rust_offered
+
+        return rust_offered(spark, input_types, return_type)
+    except Exception:
+        logger.debug("rust target probe failed; not offering rust", exc_info=True)
+        return False
+
+
+def _rust_refusal(spark: Any, result: TranspileResult, row: Any) -> Optional[str]:
+    """Why a Rust rewrite cannot be taken here (never asked for, or not runnable)."""
+    if result.kind != KIND_RUST:
+        return None
+    from ai_udf_transpile.rustc import rust_unservable, supports_types
+
+    if not supports_types(row.input_types, row.return_type):
+        return f"rust target does not support ({', '.join(row.input_types)}) -> {row.return_type}"
+    reason = rust_unservable(spark)
+    return f"rust rewrite cannot run in this session: {reason}" if reason else None
+
+
 def process_row(
     catalog: Catalog,
     row: Any,
@@ -80,21 +105,17 @@ def process_row(
             # hypothesis_passed=False means this payload was already rejected;
             # re-verifying it would burn every retry on the same failure, so
             # let the row go to the backend instead.
-            result = TranspileResult(
-                kind=row.target_kind or "catalyst",
-                sql=row.catalyst_sql,
-                java_source=row.impl_source,
-                class_name=row.impl_class,
-                binary=row.impl_binary,
-                entry=row.impl_entry,
-            )
+            result = row.as_result()
+            result.model = None
             origin = "human"
         else:
             job = row.as_job()
+            if _rust_offered(spark, job.input_types, job.return_type):
+                job.targets = [*job.targets, KIND_RUST]
             with make_sandbox(job, inputs=conf.get_value(conf.AI_REPRESENTATION, spark)) as sandbox:
                 result = backend.run(job, sandbox)
         model = result.model
-        rejected = rejected_rewrite(result)
+        rejected = rejected_rewrite(result) or _rust_refusal(spark, result, row)
         if rejected:
             catalog.mark_failed(
                 key, rejected, origin=origin, model=model or _reported_model(backend), result=result

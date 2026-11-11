@@ -94,7 +94,44 @@ def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
         if row.impl_source:
             logger.debug("java_udf impl_source without impl_class; cannot reconstruct")
             return None
+    if row.target_kind == "rust":
+        return _reconstruct_rust(row, return_type, spark)
     return None
+
+
+def _reconstruct_rust(row: Any, return_type: Any, spark: Any) -> Any:
+    """A Rust rewrite, or None wherever attaching it could fail the query.
+
+    Spark cannot evaluate a Comet native UDF, so "not sure" means the Python
+    UDF: target switched off, Comet not live, a master whose executors may
+    not see the library. A library that is not built yet (a row from the
+    shared table, a wiped cache) starts a background build and keeps Python
+    for now -- UDF definition never waits on cargo.
+    """
+    from ai_udf_transpile import rustc
+
+    if not row.impl_source or not rustc.supports_types(row.input_types, row.return_type):
+        return None
+    # A row from the shared table was verified by whoever wrote it, not here.
+    # SQL and jars are served as-is; source about to become native code in
+    # this process gets the scan again first.
+    from ai_udf_transpile.verify import rejected_rewrite
+
+    if rejected_rewrite(row.as_result()):
+        logger.debug("rust rewrite for %s not served: forbidden construct", row.udf_key[:12])
+        return None
+    reason = rustc.rust_unservable(spark)
+    if reason:
+        logger.debug("rust rewrite for %s not served: %s", row.udf_key[:12], reason)
+        return None
+    compiled = rustc.cached_library(spark, row.impl_source, row.input_types, row.return_type)
+    if compiled is None:
+        rustc.compile_in_background(spark, row.impl_source, row.input_types, row.return_type)
+        return None
+    import pyspark.sql.functions as F
+
+    rustc.register_rust_udf(spark, compiled, row.input_types, row.return_type)
+    return F.expr(rustc.call_expr(compiled.name, row.input_types)).cast(return_type)
 
 
 def _spark_version(spark: Any) -> str:

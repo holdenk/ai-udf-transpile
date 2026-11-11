@@ -236,10 +236,23 @@ jobs:
           sed 's/^export //; s/"//g' comet.env >> "$GITHUB_ENV"
       - name: Install Python deps
         run: pip install -e ".[dev]"
+      # The rust target's tests build UDF libraries against this Comet's
+      # comet-udf-sdk; the first build compiles arrow. The cache directory is
+      # content-addressed (SDK identity is part of every name), so it only
+      # needs to move when Comet does.
+      - name: Cache Rust UDF builds
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ai_udf_transpile/rust
+          key: rust-udf-${{ steps.comet.outputs.sha }}-${{ runner.os }}-${{ hashFiles('ai_udf_transpile/rustc.py') }}
+          restore-keys: rust-udf-${{ steps.comet.outputs.sha }}-${{ runner.os }}-
       - name: Pytest with Comet
         env:
           SPARK_HOME: ${{ github.workspace }}/spark
           AI_UDF_TRANSPILE_TEST_COMET_JAR: ${{ env.COMET_JAR }}
+          # The checkout the jar was built from: its native/comet-udf-sdk is
+          # what tests/test_rust_udf_comet.py compiles Rust UDFs against.
+          COMET_HOME: ${{ github.workspace }}/comet
         run: |
           export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
           export PYSPARK_PYTHON="$(which python)" PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"

@@ -22,7 +22,7 @@ from typing import Any, Optional
 from ai_udf_transpile.catalog import HIT, WAIT, CacheRow, dumps, tolerance_serves
 from ai_udf_transpile.catalog.delta import _ident, _row_from_spark, _sql_str
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog
-from ai_udf_transpile.targets import KIND_CATALYST, TranspileResult
+from ai_udf_transpile.targets import TranspileResult
 
 logger = logging.getLogger(__name__)
 
@@ -223,15 +223,7 @@ class WritebackCatalog:
 
     def _backfill(self, remote: CacheRow) -> None:
         """Warm the local cache with a remote success; marked written-back so it never echoes."""
-        result = TranspileResult(
-            kind=remote.target_kind or KIND_CATALYST,
-            sql=remote.catalyst_sql,
-            java_source=remote.impl_source,
-            class_name=remote.impl_class,
-            binary=remote.impl_binary,
-            entry=remote.impl_entry,
-            model=remote.model,
-        )
+        result = remote.as_result()
         self._staging.upsert_success(
             udf_key=remote.udf_key,
             source_text=remote.source_text,
