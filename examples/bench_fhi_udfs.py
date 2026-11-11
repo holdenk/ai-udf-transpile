@@ -279,12 +279,21 @@ def main() -> int:
         else:
             print(f"{n}: catalog row is success but the UDF was not served -- python only")
 
-    # -- Benchmark: interleave arms so warmup is fair.
+    # -- Benchmark: interleave arms so warmup is fair. The plans are checked
+    # first: a "transpiled" number that quietly ran in a python worker would
+    # be the python number again.
+    def runs_python(df) -> bool:
+        return "EvalPython" in df._jdf.queryExecution().executedPlan().toString()
+
     arms: list[tuple[str, str, object]] = []
     for n in names:
-        arms.append(("python", n, frames[n].select(py_udfs[n](*cols[n]))))
+        py_df = frames[n].select(py_udfs[n](*cols[n]))
+        assert runs_python(py_df), f"{n}: python arm has no python eval node"
+        arms.append(("python", n, py_df))
         if n in ai_udfs:
-            arms.append(("transpiled", n, frames[n].select(ai_udfs[n](*cols[n]))))
+            tx_df = frames[n].select(ai_udfs[n](*cols[n]))
+            assert not runs_python(tx_df), f"{n}: transpiled arm still evaluates python"
+            arms.append(("transpiled", n, tx_df))
     for _arm, _n, arm_df in arms:  # warmup
         noop_seconds(arm_df)
     secs: dict[tuple[str, str], float] = {}
