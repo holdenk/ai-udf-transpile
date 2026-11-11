@@ -34,7 +34,9 @@ A working experiment, not a dependency:
   and every service-calling row is a python-raise + sql-value allowance --
   so a hallucinated rewrite of `kms_encrypt` verifies in an env without
   AWS credentials. Verification cannot refute a service it cannot reach;
-  do not serve rewrites of service-calling UDFs from such an env.
+  do not serve rewrites of service-calling UDFs from such an env, or set
+  `requireApproval=network` so a person signs them off first (see
+  [Manual approval](#manual-approval)).
 - **Generated code runs in your driver.** The rewrite is SQL you execute
   and, for java UDFs, javac output loaded into the session. The CLI
   backends write into a sandbox directory — that is a work dir, not a
@@ -349,6 +351,56 @@ who can append to that table can run SQL and Java in every reader's driver.
 
 Failed rewrites cool down for 24h (`failCooldownSeconds`) and stop retrying
 after `maxRetries` (default 3).
+
+## Manual approval
+
+Hypothesis is weakest exactly where UDFs get interesting: string columns
+that secretly hold dates or JSON, nested struct/map/array values, and UDFs
+that call a service the verifier cannot reach. For those you can require a
+person to sign off before a rewrite is served:
+
+```python
+spark.conf.set("spark.sql.experimental.aiUdfTranspile.requireApproval", "hard")
+```
+
+| value | gates |
+|---|---|
+| `none` (default) | nothing |
+| `all` | every AI rewrite |
+| `string`, `struct`, `map`, `array`, `binary`, `timestamp` | rewrites whose input or return type contains that type (comma-separate several) |
+| `network` | UDFs whose source imports or calls a network client (`boto3`, `requests`, `socket`, `urllib`, `httpx`, DB/Kafka clients, ...; a denylist in `ai_udf_transpile/approval.py`) |
+| `hard` | `string,struct,map,array,network` |
+
+A gated rewrite still goes through every automated check (Hypothesis,
+reconstruction smoke test); passing them parks it in `awaiting_approval`
+instead of `success`, so Spark keeps running the Python UDF and nothing is
+written back. Review the queue with:
+
+```bash
+python -m ai_udf_transpile.approve --sqlite-path /tmp/ai_udf_transpile.sqlite          # interactive
+python -m ai_udf_transpile.approve --sqlite-path ... --list
+python -m ai_udf_transpile.approve --sqlite-path ... --approve 3fa2c1 --reviewer alice  # key prefixes ok
+python -m ai_udf_transpile.approve --sqlite-path ... --reject 3fa2c1 --reason "drops the tz"
+```
+
+The interactive loop shows each UDF's Python source, the SQL or Java
+rewrite, the backend/model, which flags it tripped, and a few of the real
+input rows it was checked against, then asks approve / reject / skip /
+quit. The reviewer (`--reviewer`, else `$AI_UDF_TRANSPILE_REVIEWER`, else
+`$USER`) and time are recorded on the row (`reviewed_by`, `reviewed_at`).
+Approve serves it; reject fails it with the reason (candidate kept), and it
+goes back to the backend after the normal cooldown, bounded by
+`maxRetries`. Any new payload for a key clears its review.
+
+The policy is checked when a rewrite is served, too: turn `requireApproval`
+on and existing unreviewed successes it covers are parked on their next
+lookup. With a write-back table, an unreviewed shared row is not served to
+a reader that requires approval; it is copied locally as
+`awaiting_approval`, and approving it re-publishes it with the sign-off.
+Human rewrites (`register_impl`) and the deterministic `bytecode` backend
+are never gated. The CLI talks to the SQLite catalog; for `catalog=delta`,
+use `catalog.awaiting_approval()`, `catalog.approve(key, reviewer)`, and
+`catalog.reject(key, reviewer, reason)`, or `ai_udf_transpile.approve.review(catalog, reviewer=...)`.
 
 ## Tests
 

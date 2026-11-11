@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ai_udf_transpile.catalog import (
+    AWAITING_APPROVAL,
     HIT,
     MISS,
     WAIT,
@@ -20,6 +21,7 @@ from ai_udf_transpile.catalog import (
     loads_dict,
     loads_list,
     provisional_visible,
+    rejection_error,
     retries_exhausted,
     tolerance_serves,
 )
@@ -97,6 +99,8 @@ def _row_from_sql(raw: sqlite3.Row) -> CacheRow:
         created_at=raw["created_at"],
         updated_at=raw["updated_at"],
         written_back_at=raw["written_back_at"] if "written_back_at" in keys else None,
+        reviewed_by=raw["reviewed_by"] if "reviewed_by" in keys else None,
+        reviewed_at=raw["reviewed_at"] if "reviewed_at" in keys else None,
     )
 
 
@@ -131,6 +135,10 @@ class SqliteCatalog:
                 self._conn.execute("UPDATE cache SET publish_ready = 1 WHERE status = 'success'")
             if "tolerance" not in cols:
                 self._conn.execute("ALTER TABLE cache ADD COLUMN tolerance REAL")
+            if "reviewed_by" not in cols:
+                self._conn.execute("ALTER TABLE cache ADD COLUMN reviewed_by TEXT")
+            if "reviewed_at" not in cols:
+                self._conn.execute("ALTER TABLE cache ADD COLUMN reviewed_at TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -156,6 +164,13 @@ class SqliteCatalog:
                 return WAIT, row
             if row.reconstructable():
                 if tolerance_serves(row.tolerance, spark):
+                    from ai_udf_transpile.approval import blocks_serving
+
+                    if blocks_serving(row, spark):
+                        # requireApproval covers this row (turned on after it
+                        # was verified, or backfilled unreviewed): park it.
+                        self._park_for_approval(udf_key, from_status="success")
+                        return WAIT, self._fetch(udf_key)
                     return HIT, row
                 # Checked more loosely than this session allows. Recheck it.
                 now = iso_now()
@@ -280,6 +295,8 @@ class SqliteCatalog:
                     failed_at = NULL,
                     publish_ready = 0,
                     written_back_at = NULL,
+                    reviewed_by = NULL,
+                    reviewed_at = NULL,
                     claimed_at = CASE WHEN ? THEN NULL ELSE COALESCE(claimed_at, ?) END,
                     updated_at = ?
                 WHERE udf_key = ?
@@ -387,6 +404,8 @@ class SqliteCatalog:
         hypothesis_passed: Optional[bool],
         visible: bool = True,
         tolerance: Optional[float] = None,
+        reviewed_by: Optional[str] = None,
+        reviewed_at: Optional[str] = None,
     ) -> None:
         if not return_type or not input_types:
             raise ValueError("upsert_success requires known types")
@@ -402,8 +421,8 @@ class SqliteCatalog:
                     return_type, spark_version, closure_fingerprint, captures_json,
                     status, target_kind, catalyst_sql, impl_source, impl_class,
                     impl_entry, impl_binary, origin, model, hypothesis_passed, tolerance,
-                    attempt_count, claimed_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    reviewed_by, reviewed_at, attempt_count, claimed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(udf_key) DO UPDATE SET
                     source_text = excluded.source_text,
                     param_names = excluded.param_names,
@@ -424,6 +443,8 @@ class SqliteCatalog:
                     model = excluded.model,
                     hypothesis_passed = excluded.hypothesis_passed,
                     tolerance = excluded.tolerance,
+                    reviewed_by = excluded.reviewed_by,
+                    reviewed_at = excluded.reviewed_at,
                     error = NULL,
                     failed_at = NULL,
                     publish_ready = 0,
@@ -452,11 +473,65 @@ class SqliteCatalog:
                     result.model,
                     hyp,
                     tolerance,
+                    reviewed_by,
+                    reviewed_at,
                     claimed,
                     now,
                     now,
                 ),
             )
+
+    # -- manual approval ---------------------------------------------------
+
+    def _park_for_approval(self, udf_key: str, *, from_status: str) -> None:
+        now = iso_now()
+        self._conn.execute(
+            "UPDATE cache SET status = ?, claimed_at = NULL, publish_ready = 0, updated_at = ? "
+            "WHERE udf_key = ? AND status = ?",
+            (AWAITING_APPROVAL, now, udf_key, from_status),
+        )
+
+    def mark_awaiting_approval(self, udf_key: str) -> None:
+        """Park a verified rewrite for review. Accepts provisional (worker) or success rows."""
+        with self._lock:
+            self._park_for_approval(udf_key, from_status="provisional")
+            self._park_for_approval(udf_key, from_status="success")
+
+    def awaiting_approval(self) -> list[CacheRow]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM cache WHERE status = ? ORDER BY updated_at ASC, udf_key ASC",
+                (AWAITING_APPROVAL,),
+            )
+            return [_row_from_sql(raw) for raw in cur.fetchall()]
+
+    def approve(self, udf_key: str, reviewer: str) -> bool:
+        """Serve a parked rewrite. Clears written_back_at so the approved row is re-published."""
+        now = iso_now()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE cache SET status = 'success', reviewed_by = ?, reviewed_at = ?,
+                    publish_ready = 1, written_back_at = NULL, error = NULL, updated_at = ?
+                WHERE udf_key = ? AND status = ?
+                """,
+                (reviewer, now, now, udf_key, AWAITING_APPROVAL),
+            )
+            return cur.rowcount == 1
+
+    def reject(self, udf_key: str, reviewer: str, reason: str = "") -> bool:
+        """Fail a parked rewrite (candidate kept). The normal cooldown/maxRetries apply."""
+        now = iso_now()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE cache SET status = 'failed', error = ?, failed_at = ?, reviewed_by = ?,
+                    reviewed_at = ?, publish_ready = 0, updated_at = ?
+                WHERE udf_key = ? AND status = ?
+                """,
+                (rejection_error(reviewer, reason), now, reviewer, now, now, udf_key, AWAITING_APPROVAL),
+            )
+            return cur.rowcount == 1
 
     def reclaim_stale(self, timeout_seconds: int, max_retries: int) -> int:
         from datetime import datetime, timedelta, timezone

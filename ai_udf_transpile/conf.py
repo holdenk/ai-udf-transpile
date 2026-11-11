@@ -48,6 +48,10 @@ MAX_SAMPLES = PREFIX + "maxSamples"
 WRITEBACK_TABLE = PREFIX + "writebackTable"
 WRITEBACK_FORMAT = PREFIX + "writebackFormat"
 WRITEBACK_THRESHOLD = PREFIX + "writebackThreshold"
+# Park AI rewrites in awaiting_approval until a person signs off
+# (python -m ai_udf_transpile.approve). none | all | comma list of
+# string,struct,map,array,binary,timestamp,network | hard. See approval.py.
+REQUIRE_APPROVAL = PREFIX + "requireApproval"
 
 DEFAULTS: dict[str, str] = {
     CATALOG: "sqlite",
@@ -79,6 +83,7 @@ DEFAULTS: dict[str, str] = {
     WRITEBACK_TABLE: "",
     WRITEBACK_FORMAT: "parquet",
     WRITEBACK_THRESHOLD: "32",
+    REQUIRE_APPROVAL: "none",
 }
 
 # Side channel so tests and the worker thread can read values even if the JVM

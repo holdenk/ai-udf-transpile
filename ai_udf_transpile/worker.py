@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, Optional
 
 from ai_udf_transpile import conf
+from ai_udf_transpile.approval import row_approval_reasons
 from ai_udf_transpile.backends import get_backend
 from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.catalog import Catalog, configured_tolerance, open_catalog, publish_verified
@@ -169,6 +170,20 @@ def process_row(
             if smoke_err:
                 catalog.mark_failed(key, smoke_err, origin=origin, model=model)
                 logger.info("transpile failed (reconstruction) key=%s: %s", key[:12], smoke_err)
+                return
+            reasons = row_approval_reasons(row, spark, origin=origin)
+            if reasons:
+                # Passed every automated check, but requireApproval says a
+                # person signs off first: not served, not published.
+                catalog.mark_awaiting_approval(key)
+                logger.info(
+                    "transpile awaiting approval key=%s origin=%s model=%s (%s); "
+                    "review with python -m ai_udf_transpile.approve",
+                    key[:12],
+                    origin,
+                    model,
+                    "; ".join(reasons),
+                )
                 return
             catalog.promote_success(key)
             publish_verified(catalog, key)
