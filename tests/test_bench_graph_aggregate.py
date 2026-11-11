@@ -119,6 +119,17 @@ def test_aggregate_routes_kind_labeled_rows_to_the_ai_arms(tmp_path):
         "declined,1000,100,,,,,failed,,claude,m,fhi,party\n",
         encoding="utf-8",
     )
+    # With an arm column, only the live AI arm on the nullable column counts:
+    # the pinned naive/tuned rewrites and the non-null column are exhibits.
+    (tmp_path / "bench_fhi_arms.csv").write_text(
+        "function,arm,column_nullable,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,status,target_kind,backend,model,bench\n"
+        "f,naive,True,1000,100,30,0.3,success,catalyst,pinned,,fhi\n"
+        "f,tuned,True,1000,100,190,1.9,success,catalyst,pinned,,fhi\n"
+        "f,ai,True,1000,100,150,1.5,success,catalyst,claude,m,fhi\n"
+        "f,ai,False,1000,100,160,1.6,success,catalyst,claude,m,fhi\n",
+        encoding="utf-8",
+    )
     spec = importlib.util.spec_from_file_location("bench_graph_aggregate", AGGREGATE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -127,3 +138,4 @@ def test_aggregate_routes_kind_labeled_rows_to_the_ai_arms(tmp_path):
     assert points["ai_java"] == [("fhi/java_one", 0.4)]
     assert points["ai_catalyst_comet"] == [("fhi/sql_two", 9.0)]
     assert points["transpiled"] == [] and points["vanilla"] == []
+    assert module.collect([tmp_path / "bench_fhi_arms.csv"])["ai_catalyst"] == [("fhi arms/f", 1.5)]

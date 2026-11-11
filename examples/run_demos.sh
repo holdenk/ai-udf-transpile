@@ -9,7 +9,7 @@
 #   examples/run_demos.sh --bench --rust-accel [--rust-accel-conf key=value]
 #   examples/run_demos.sh --bench-bytecode        # python vs static (AST) vs bytecode->SQL vs Java bytecode eval
 #   examples/run_demos.sh --bench-tpcds           # TPC-DS-inspired UDF patterns vs vanilla SQL
-#   examples/run_demos.sh --bench-fhi             # real pipeline text UDFs (regex, PII scrub) vs their rewrites
+#   examples/run_demos.sh --bench-fhi             # real pipeline text UDFs: python vs pinned naive/tuned rewrites vs the live AI
 #   examples/run_demos.sh --all-benches --csv out.csv  # every bench: micro (+comet if COMET_JAR), bytecode, tpcds, fhi, catalog; then the graphs
 #   examples/run_demos.sh --dump                  # + dump $AI_UDF_TRANSPILE_SQLITE to docs/EXAMPLES_TRANSPILED.md
 #   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
@@ -190,7 +190,9 @@ fi
 # Before the catalog bench: its fills land in the same cache, so the coverage
 # bench picks these functions up too.
 if [ "$BENCH_FHI" -eq 1 ]; then
-  FHI_ARGS=(examples/bench_fhi_udfs.py)
+  # --ai: the live arm, whose fills land in the cache; without it the bench
+  # only times its pinned naive/tuned rewrites.
+  FHI_ARGS=(examples/bench_fhi_udfs.py --ai)
   if [ -n "$CSV" ]; then
     FHI_ARGS+=(--csv "$FHI_CSV")
   fi

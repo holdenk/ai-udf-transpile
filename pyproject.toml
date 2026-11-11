@@ -53,7 +53,7 @@ Homepage = "https://github.com/holdenk/ai-udf-transpile"
 include = ["ai_udf_transpile*"]
 
 [tool.setuptools.package-data]
-ai_udf_transpile = ["resources/prompt.md", "java/*.java"]
+ai_udf_transpile = ["resources/prompt.md", "resources/fhi/*", "java/*.java"]
 
 [tool.ruff]
 line-length = 110

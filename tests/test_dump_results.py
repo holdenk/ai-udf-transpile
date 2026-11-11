@@ -280,6 +280,19 @@ def test_perf_lines_unit(tmp_path):
     assert merged["ai"] == (
         "6.0M rows/s (3.0x vs python) · comet (catalog bench) 9.0M rows/s (4.5x vs python)"
     )
+    # bench_fhi_udfs rows for its pinned arms and its non-null column are
+    # skipped: the doc's AI line is the live arm on the nullable column.
+    arms = tmp_path / "arms.csv"
+    arms.write_text(
+        "function,arm,column_nullable,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,status,target_kind,backend,model,bench\n"
+        "f,naive,True,1000,1000000,300000,0.3,success,catalyst,pinned,,fhi\n"
+        "f,ai,False,1000,1000000,9000000,9.0,success,catalyst,claude,m,fhi\n"
+        "f,ai,True,1000,1000000,1500000,1.5,success,catalyst,claude,m,fhi\n"
+        "f,tuned,True,1000,1000000,1900000,1.9,success,catalyst,pinned,,fhi\n",
+        encoding="utf-8",
+    )
+    assert _load_dump_module()._perf_lines([str(arms)])["f"]["ai"] == "1.5M rows/s (1.5x vs python)"
     # python-only row (no transpiled arm served) keeps the top, no ai suffix
     assert perf["plus_two"]["ai"] == ""
     assert perf["plus_two"]["top"].endswith("interpreted python 1.5M rows/s")

@@ -111,6 +111,11 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
             continue
         if "target_kind" in rows[0]:  # bench_catalog / bench_fhi_udfs CSV
             for r in rows:
+                # bench_fhi_udfs also times its pinned naive/tuned rewrites and a
+                # non-nullable column; the doc's AI line is the live arm on the
+                # ordinary (nullable) column.
+                if r.get("arm", "ai") != "ai" or r.get("column_nullable", "True") != "True":
+                    continue
                 py_rate = r.get("python_rows_per_second")
                 tx_rate = r.get("transpiled_rows_per_second")
                 if not py_rate and not tx_rate:

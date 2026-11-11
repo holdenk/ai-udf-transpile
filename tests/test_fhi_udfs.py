@@ -243,3 +243,89 @@ def test_bench_frames_exercise_every_port(spark):
         for row in rows:  # the UDF path returns what a direct call returns
             assert row["out"] == func(*[row[c] for c in cols]), name
         assert len({row["out"] for row in rows}) >= 2, name
+
+
+def _load_bench():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "examples" / "bench_fhi_udfs.py"
+    spec = importlib.util.spec_from_file_location("bench_fhi_udfs", path)
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    return bench
+
+
+_PINNED_CASES = {
+    "fhi_verdict_has_legal_check": test_verdict_has_legal_check,
+    "fhi_parse_verdict": test_parse_verdict,
+    "fhi_clean_health_history": test_clean_health_history,
+    "fhi_treatment_from_findings": test_treatment_from_findings,
+    "fhi_diagnosis_from_findings": test_diagnosis_from_findings,
+    "fhi_normalize_entity_text": test_normalize_entity_text,
+    "fhi_deidentify_text": test_deidentify_text,
+}
+
+# What the naive parse_verdict SQL gets wrong: it compares the distinct
+# matched WORDS, so two spellings of one answer read as two answers. The
+# gate passed it (generated strings are too short to hold two verdict
+# words); it stays pinned as the exhibit, with its misses pinned here.
+_KNOWN_NAIVE_MISSES = {
+    "fhi_parse_verdict": {("VERDICT: UNVIABLE and NON VIABLE",)},
+}
+
+
+def test_every_function_has_a_naive_rewrite_and_the_scanner_passes_them():
+    from ai_udf_transpile.backends.fhi_rewrites import VARIANTS, fhi_rewrite
+    from ai_udf_transpile.verify import rejected_rewrite
+
+    for name in FHI_UDFS:
+        assert fhi_rewrite(name, "naive") is not None, name
+        for variant in VARIANTS:
+            result = fhi_rewrite(name, variant)
+            if result is None:
+                continue
+            assert result.reconstructable(), (name, variant)
+            assert rejected_rewrite(result) is None, (name, variant)
+            if result.kind == "java_udf":
+                assert result.class_name and result.class_name.startswith("ai_udf."), (name, variant)
+    # The one function whose naive rewrite already wins has no tuned twin.
+    assert fhi_rewrite("fhi_diagnosis_from_findings", "tuned") is None
+    with pytest.raises(ValueError):
+        fhi_rewrite("fhi_parse_verdict", "fast")
+
+
+@pytest.mark.spark
+@pytest.mark.parametrize("variant", ["naive", "tuned"])
+@pytest.mark.parametrize("name", sorted(FHI_UDFS))
+def test_pinned_rewrite_agrees_with_python(spark, name, variant):
+    """Both pinned rewrites return what the python returns: on the cases
+    above, on the adversarial inputs, and on the bench's own rows in both
+    column flavors."""
+    from fhi_adversarial import ADVERSARIAL
+    from pyspark.sql.types import _parse_datatype_string
+
+    from ai_udf_transpile.backends.fhi_rewrites import fhi_rewrite
+
+    result = fhi_rewrite(name, variant)
+    if result is None:
+        pytest.skip(f"{name} has no {variant} rewrite")
+    bench = _load_bench()
+    func, return_type = FHI_UDFS[name]
+    cols = list(bench.FRAME_EXPRS[name])
+    column = bench.rewrite_column(spark, result, cols, _parse_datatype_string(return_type), variant)
+
+    known = _KNOWN_NAIVE_MISSES.get(name, set()) if variant == "naive" else set()
+    inputs = [tuple(c[:-1]) for c in _PINNED_CASES[name].pytestmark[0].args[1]] + list(ADVERSARIAL[name])
+    frame = spark.createDataFrame([(i, *args) for i, args in enumerate(inputs)], ["i", *cols])
+    for flavor in bench.FLAVORS:
+        sample = bench.frame(spark, name, 120, flavor)
+        assert sample.schema[cols[0]].nullable is (flavor == "nullable")
+        for row in sample.select(*cols, column.alias("out")).collect():
+            if row["out"] != func(*[row[c] for c in cols]):
+                # The bench seeds the known miss on purpose (its rows begin with it).
+                assert any(row[cols[0]].startswith(miss[0]) for miss in known), (name, variant, flavor)
+
+    got = {row["i"]: row["out"] for row in frame.select("i", column.alias("out")).collect()}
+    misses = {args for i, args in enumerate(inputs) if got[i] != func(*args)}
+    assert misses == known, (name, variant)

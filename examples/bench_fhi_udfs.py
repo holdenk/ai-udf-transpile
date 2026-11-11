@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real pipeline UDF benchmark: interpreted python vs whatever the AI chain serves.
+"""Real pipeline UDF benchmark: when is a faithful rewrite a regression?
 
 The functions are the scalar text UDFs of Fight Health Insurance's
 training-data pipeline (ai_udf_transpile/backends/fhi_udfs.py): verdict
@@ -8,31 +8,43 @@ scrubber. Nobody wrote them to be transpiled, and every one is regex or a
 line loop over free text, so this is the bench where the rewrite has to get
 Python's `re`, `strip()` and `splitlines()` right in Catalyst SQL or Java.
 
-Two arms per function, over synthetic rows shaped like the real columns
-(verdict blocks, reviewer findings, a letter with PII in it):
+Getting them right is not the same as getting them fast. Each function has
+two pinned rewrites (backends/fhi_rewrites.py), both faithful:
 
-  python      the UDF as an interpreted Python UDF (transpilePyUDFs=false)
-  transpiled  the UDF after AI transpilation (inline worker), Catalyst SQL
-              or a Java UDF -- the backend picks; the CSV says which
+  python   the UDF as an interpreted Python UDF (transpilePyUDFs=false)
+  naive    verbatim what an AI backend served on its first verified
+           attempt -- for most of these, slower than the python
+  tuned    hand-written with what the naive one turned out to cost in mind
+           (native trim instead of a regex strip, a Java line loop instead
+           of regexes over the whole text, an ASCII fast path)
+  ai       (--ai) whatever the AI chain serves today, through the plugin
 
-A function the backend declines, or whose rewrite Hypothesis rejects, keeps
-serving python: it gets a python number and no transpiled one. So does a
-rewrite that verified but that Spark will not serve: each arm's physical
-plan is checked before it is timed, and a "transpiled" arm that still has a
-python eval node is reported as not_served (Spark drops a rewrite with a
-higher-order-function lambda in it and runs the python instead, silently).
+and each arm runs over the same rows twice: once in a column Spark must
+treat as nullable and once in a column it can prove non-null. That is one
+of the regression conditions on its own -- a rewrite that opens with
+`CASE WHEN x IS NULL THEN NULL` loses Spark's subexpression sharing on a
+nullable column and gets it back on a non-nullable one, where the optimizer
+deletes the guard.
 
-Strings are the values under test, so partyOnStrings is on by default: the
-gate generates arbitrary text (unicode whitespace, odd line terminators) on
-top of the seeded domain rows. --sampled-strings-only turns that off and
-verifies on the seeded rows alone -- a weaker gate. The CSV's string_gate
-column says which gate this run verified a rewrite under, or `cached` when
-the rewrite was already in $AI_UDF_TRANSPILE_SQLITE and this run verified
-nothing (the catalog does not record the gate a row was earned under).
+Next to every measured ratio the table prints what
+ai_udf_transpile.regress guessed from the two texts alone (ok / at-risk /
+likely-regression / not-served), so each run is also a check of that guess.
+
+A rewrite that verified but that Spark will not serve gets no number: an
+expression with a higher-order-function lambda in it is dropped at plan
+time and the python UDF runs instead, silently. Each arm's physical plan is
+checked before it is timed.
+
+With --ai, strings are the values under test, so partyOnStrings is on by
+default; --sampled-strings-only verifies on the seeded rows alone. The
+string_gate column says which gate this run verified a rewrite under, or
+`cached` when the rewrite was already in $AI_UDF_TRANSPILE_SQLITE and this
+run verified nothing.
 
   export SPARK_HOME=~/spark
   python examples/bench_fhi_udfs.py [rows] [--rounds N] [--csv PATH]
-  python examples/bench_fhi_udfs.py --only fhi_deidentify_text --sampled-strings-only
+  python examples/bench_fhi_udfs.py --ai                     # + the live AI arm
+  python examples/bench_fhi_udfs.py --only fhi_clean_health_history --nullability both
 """
 
 from __future__ import annotations
@@ -40,6 +52,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import sys
 import tempfile
 import time
@@ -59,8 +72,12 @@ from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.backends import ai_backend  # noqa: E402
+from ai_udf_transpile.backends.fhi_rewrites import VARIANTS, fhi_rewrite  # noqa: E402
 from ai_udf_transpile.backends.fhi_udfs import FHI_UDFS  # noqa: E402
+from ai_udf_transpile.javac import compile_java, register_java_udf, verify_function_name  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
+from ai_udf_transpile.regress import NOT_SERVED, regression_risk  # noqa: E402
+from ai_udf_transpile.targets import KIND_CATALYST, TranspileResult  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
@@ -177,10 +194,39 @@ FRAME_EXPRS: dict[str, dict[str, str]] = {
 }
 
 
-def frame(spark, name: str, n: int):
+# Same values, different static nullability: Spark cannot prove nullif(...)
+# non-null and can prove coalesce(..., '') non-null. No row is actually NULL
+# in either, so the two columns differ only in what the optimizer may assume.
+FLAVORS = {"nullable": "nullif({e}, '\\u0000')", "nonnull": "coalesce({e}, '')"}
+
+# The regex-heavy functions cost microseconds a row in every arm; scale
+# their frames down so one function does not own the wall clock.
+ROW_SCALE = {
+    "fhi_deidentify_text": 0.1,
+    "fhi_treatment_from_findings": 0.25,
+    "fhi_normalize_entity_text": 0.25,
+}
+
+
+def frame(spark, name: str, n: int, flavor: str = "nullable"):
     base = spark.range(0, n, numPartitions=min(PARTITIONS, max(1, n))).toDF("x")
-    df = base.select(*[F.expr(expr).alias(col) for col, expr in FRAME_EXPRS[name].items()])
+    wrap = FLAVORS[flavor]
+    df = base.select(*[F.expr(wrap.format(e=expr)).alias(col) for col, expr in FRAME_EXPRS[name].items()])
     return df.cache() if n > 64 else df
+
+
+def rewrite_column(spark, result: TranspileResult, cols: list[str], rtype, tag: str):
+    """A pinned rewrite as a Column over `cols`, the way the plugin would
+    reconstruct it: SQL with its placeholders bound, or a registered Java UDF."""
+    if result.kind == KIND_CATALYST:
+        sql = result.sql
+        for i, col in enumerate(cols):
+            sql = re.sub(rf"_udf_param_{i}(?!\d)", f"`{col}`", sql)
+        return F.expr(sql).cast(rtype)
+    compiled = compile_java(spark, result.java_source, result.class_name)
+    fname = verify_function_name(f"fhi_{tag}", compiled.jar_bytes)
+    register_java_udf(spark, fname, compiled.class_name, compiled.jar_bytes, rtype, janino=compiled.janino)
+    return F.expr(f"{fname}({', '.join(f'`{c}`' for c in cols)})").cast(rtype)
 
 
 def noop_seconds(df) -> float:
@@ -213,58 +259,9 @@ def wait_for_catalog(catalog, source_text, spark_version, timeout=900):
     return ("timeout", None, None, None, None, None)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("rows", nargs="?", type=int, default=1_000_000)
-    parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--csv", metavar="PATH", help="write results CSV")
-    parser.add_argument(
-        "--only", action="append", default=[], metavar="NAME", help="bench just this function (repeatable)"
-    )
-    parser.add_argument(
-        "--sampled-strings-only",
-        action="store_true",
-        help="verify on the seeded domain rows alone (partyOnStrings off): a weaker gate",
-    )
-    parser.add_argument("--timeout", type=int, default=900, help="seconds to wait for each fill")
-    args = parser.parse_args()
-    unknown = [n for n in args.only if n not in FHI_UDFS]
-    if unknown:
-        parser.error(f"unknown function(s): {', '.join(unknown)}; have {', '.join(FHI_UDFS)}")
-    names = args.only or list(FHI_UDFS)
-    rows = args.rows
-
-    spark = (
-        SparkSession.builder.master("local[*]")
-        .appName("ai-udf-transpile-fhi-bench")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", str(PARTITIONS))
-        .config("spark.sql.ansi.enabled", "true")
-        .config(TRANSPILE_CONF, "false")
-        # The letter frame is ~700 chars a row; a million of them cached does
-        # not fit the 1g default heap reliably (it OOMed on one run in two).
-        .config("spark.driver.memory", os.environ.get("AI_UDF_TRANSPILE_BENCH_DRIVER_MEMORY", "4g"))
-        .getOrCreate()
-    )
-    string_gate = "sampled" if args.sampled_strings_only else "party"
-    print(
-        f"=== FHI PIPELINE UDF BENCHMARK ({rows:,} rows, min of {args.rounds} rounds, "
-        f"string gate: {string_gate}) ===\n"
-    )
-
-    funcs = {n: FHI_UDFS[n][0] for n in names}
-    rtypes = {n: _parse_datatype_string(FHI_UDFS[n][1]) for n in names}
-    cols = {n: list(FRAME_EXPRS[n]) for n in names}
-    frames = {n: frame(spark, n, rows) for n in names}
-    for df in frames.values():
-        df.count()
-
-    # -- Python arm: transpile off, every UDF is interpreted python.
-    py_udfs = {n: UserDefinedFunction(funcs[n], rtypes[n]) for n in names}
-    for n in names:
-        assert not py_udfs[n].transpiled
-
-    # -- Transpiled arm: enable the plugin, let the backend fill each UDF.
+def fill_from_ai(spark, args, names, funcs, rtypes, cols):
+    """The live arm: enable the plugin, let the backend fill each UDF, and
+    return {name: (served udf or None, status, kind, backend, model, string_gate)}."""
     sqlite = os.environ.get("AI_UDF_TRANSPILE_SQLITE") or os.path.join(
         tempfile.mkdtemp(prefix="ai-udf-fhi-"), "cache.sqlite"
     )
@@ -272,6 +269,7 @@ def main() -> int:
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
     spark.conf.set(TRANSPILE_CONF, "true")
     conf.set_value(conf.PARTY_ON_STRINGS, "false" if args.sampled_strings_only else "true", spark)
+    string_gate = "sampled" if args.sampled_strings_only else "party"
     version = str(spark.version)
     sources = {n: canonical_source_from_func(funcs[n]) for n in names}
     # A row already terminal in a reused catalog is served as it is: this run
@@ -288,86 +286,164 @@ def main() -> int:
         frame(spark, n, 48).select(seed_udf(*cols[n])).collect()
     conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
 
-    filled: dict[str, tuple] = {}
+    out = {}
     for n in names:
         UserDefinedFunction(funcs[n], rtypes[n])  # construction queues the pending row
-        filled[n] = wait_for_catalog(catalog, sources[n], version, args.timeout)
-        status, error = filled[n][0], filled[n][1]
+        status, error, backend, model, kind, attempts = wait_for_catalog(
+            catalog, sources[n], version, args.timeout
+        )
+        udf = None
         if status != "success":
             print(f"no rewrite for {n} ({status}): {error!r}")
-
-    ai_udfs: dict[str, UserDefinedFunction] = {}
-    for n in names:
-        if filled[n][0] != "success":
-            continue
-        udf = UserDefinedFunction(funcs[n], rtypes[n])
-        if udf.transpiled:
-            ai_udfs[n] = udf
         else:
-            print(f"{n}: catalog row is success but the UDF was not served -- python only")
+            udf = UserDefinedFunction(funcs[n], rtypes[n])
+            if not udf.transpiled:
+                print(f"{n}: catalog row is success but the UDF was not offered a rewrite -- python only")
+                udf = None
+        verified_now = attempts is not None and attempts != attempts_before[n]
+        out[n] = (
+            udf,
+            status,
+            kind or "",
+            backend or "",
+            model or "",
+            string_gate if verified_now else "cached",
+        )
+    return out
 
-    # -- Benchmark: interleave arms so warmup is fair. The plans are checked
-    # first: a "transpiled" number that quietly ran in a python worker would
-    # be the python number again.
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("rows", nargs="?", type=int, default=1_000_000)
+    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument(
+        "--csv", metavar="PATH", help="write results CSV (one row per function, arm and column)"
+    )
+    parser.add_argument(
+        "--only", action="append", default=[], metavar="NAME", help="bench just this function (repeatable)"
+    )
+    parser.add_argument(
+        "--nullability",
+        choices=["both", *FLAVORS],
+        default="both",
+        help="which input column to time each arm over (default: both)",
+    )
+    parser.add_argument("--ai", action="store_true", help="also time whatever the AI chain serves, live")
+    parser.add_argument(
+        "--sampled-strings-only",
+        action="store_true",
+        help="with --ai: verify on the seeded domain rows alone (partyOnStrings off): a weaker gate",
+    )
+    parser.add_argument("--timeout", type=int, default=900, help="with --ai: seconds to wait for each fill")
+    args = parser.parse_args()
+    unknown = [n for n in args.only if n not in FHI_UDFS]
+    if unknown:
+        parser.error(f"unknown function(s): {', '.join(unknown)}; have {', '.join(FHI_UDFS)}")
+    names = args.only or list(FHI_UDFS)
+    flavors = list(FLAVORS) if args.nullability == "both" else [args.nullability]
+
+    spark = (
+        SparkSession.builder.master("local[*]")
+        .appName("ai-udf-transpile-fhi-bench")
+        .config("spark.ui.enabled", "false")
+        .config("spark.ui.showConsoleProgress", "false")
+        .config("spark.sql.shuffle.partitions", str(PARTITIONS))
+        .config("spark.sql.ansi.enabled", "true")
+        .config(TRANSPILE_CONF, "false")
+        # The letter frame is ~700 chars a row; cached, it does not fit the
+        # 1g default heap reliably (it OOMed on one run in two).
+        .config("spark.driver.memory", os.environ.get("AI_UDF_TRANSPILE_BENCH_DRIVER_MEMORY", "4g"))
+        .getOrCreate()
+    )
+    print(f"=== FHI PIPELINE UDF BENCHMARK ({args.rows:,} rows base, min of {args.rounds} rounds) ===\n")
+
+    funcs = {n: FHI_UDFS[n][0] for n in names}
+    rtypes = {n: _parse_datatype_string(FHI_UDFS[n][1]) for n in names}
+    cols = {n: list(FRAME_EXPRS[n]) for n in names}
+
+    # -- Python arm: built while transpile is off, so it stays interpreted.
+    py_udfs = {n: UserDefinedFunction(funcs[n], rtypes[n]) for n in names}
+    for n in names:
+        assert not py_udfs[n].transpiled
+    live = fill_from_ai(spark, args, names, funcs, rtypes, cols) if args.ai else {}
+
     def runs_python(df) -> bool:
         return "EvalPython" in df._jdf.queryExecution().executedPlan().toString()
 
-    arms: list[tuple[str, str, object]] = []
-    not_served: set[str] = set()
-    for n in names:
-        py_df = frames[n].select(py_udfs[n](*cols[n]))
-        assert runs_python(py_df), f"{n}: python arm has no python eval node"
-        arms.append(("python", n, py_df))
-        if n in ai_udfs:
-            tx_df = frames[n].select(ai_udfs[n](*cols[n]))
-            if runs_python(tx_df):
-                not_served.add(n)
-                print(f"{n}: rewrite verified, but Spark still plans the python UDF -- python only")
-                continue
-            arms.append(("transpiled", n, tx_df))
-    for _arm, _n, arm_df in arms:  # warmup
-        noop_seconds(arm_df)
-    secs: dict[tuple[str, str], float] = {}
-    for _ in range(args.rounds):
-        for arm, n, arm_df in arms:
-            secs[(arm, n)] = min(secs.get((arm, n), float("inf")), noop_seconds(arm_df))
-
-    header = f"{'function':<30} {'python':>10} {'transpiled':>10} {'tx/py':>8}  served as"
-    print(header)
-    print("-" * len(header))
     out = []
     for n in names:
-        status, _error, backend, model, kind, attempts = filled[n]
-        if n in not_served:
-            status = "not_served"
-        verified_now = attempts is not None and attempts != attempts_before[n]
-        py_s = secs[("python", n)]
-        tx_s = secs.get(("transpiled", n))
-        speedup = round(py_s / tx_s, 1) if tx_s else ""
-        served = f"{kind} ({backend}/{model})" if tx_s else f"python ({status})"
-        print(
-            f"{n:<30} {py_s:>9.2f}s {(f'{tx_s:.2f}s' if tx_s else '-'):>10} "
-            f"{(f'{speedup}x' if tx_s else '-'):>8}  {served}"
-        )
-        out.append(
-            {
-                "function": n,
-                "rows": rows,
-                "python_rows_per_second": round(rows / py_s),
-                "transpiled_rows_per_second": round(rows / tx_s) if tx_s else "",
-                "transpiled_speedup_vs_python": speedup,
-                "comet_rows_per_second": "",
-                "comet_speedup_vs_python": "",
-                "status": status,
-                "target_kind": kind or "",
-                "backend": backend or "",
-                "model": model or "",
-                "bench": "fhi",
-                "string_gate": string_gate if verified_now else "cached",
-            }
-        )
+        rows = max(1000, int(args.rows * ROW_SCALE.get(n, 1.0)))
+        source = canonical_source_from_func(funcs[n])
+        for flavor in flavors:
+            df = frame(spark, n, rows, flavor)
+            df.count()
+            py_df = df.select(py_udfs[n](*cols[n]))
+            assert runs_python(py_df), f"{n}: python arm has no python eval node"
+            # arm -> (frame or None, status, kind, backend, model, string_gate, static risk)
+            arms: dict[str, tuple] = {}
+            for variant in VARIANTS:
+                result = fhi_rewrite(n, variant)
+                if result is None:
+                    continue
+                risk = regression_risk(source, result)
+                if risk.verdict == NOT_SERVED:
+                    # As plain SQL this would run; through the transpile hook
+                    # Spark keeps the python UDF, so there is no number to give.
+                    arms[variant] = (None, "not_served", result.kind, "pinned", "", "", risk)
+                    continue
+                arm_df = df.select(rewrite_column(spark, result, cols[n], rtypes[n], variant))
+                assert not runs_python(arm_df), f"{n}: pinned {variant} arm evaluates python"
+                arms[variant] = (arm_df, "success", result.kind, "pinned", "", "", risk)
+            if n in live:
+                udf, status, kind, backend, model, gate = live[n]
+                arm_df = df.select(udf(*cols[n])) if udf is not None else None
+                if arm_df is not None and runs_python(arm_df):
+                    print(f"{n}: rewrite verified, but Spark still plans the python UDF -- python only")
+                    arm_df, status = None, "not_served"
+                arms["ai"] = (arm_df, status, kind, backend, model, gate, None)
 
-    if args.csv:
+            timed = [("python", py_df)] + [(a, v[0]) for a, v in arms.items() if v[0] is not None]
+            for _arm, arm_df in timed:  # warmup
+                noop_seconds(arm_df)
+            secs: dict[str, float] = {}
+            for _ in range(args.rounds):  # interleaved, so drift hits every arm alike
+                for arm, arm_df in timed:
+                    secs[arm] = min(secs.get(arm, float("inf")), noop_seconds(arm_df))
+            df.unpersist()
+
+            py_s = secs["python"]
+            print(f"{n}  [{flavor} column, {rows:,} rows]  python {py_s:.2f}s")
+            for arm, (arm_df, status, kind, backend, model, gate, risk) in arms.items():
+                tx_s = secs.get(arm)
+                speedup = round(py_s / tx_s, 1) if tx_s else ""
+                measured = f"{tx_s:6.2f}s {speedup:>5}x" if tx_s else f"{'-':>7} {'(' + status + ')':>6}"
+                guess = f"   static guess: {risk}" if risk is not None else ""
+                print(f"    {arm:<6} {kind or '-':<9} {measured}{guess}")
+                out.append(
+                    {
+                        "function": n,
+                        "arm": arm,
+                        "column_nullable": flavor == "nullable",
+                        "rows": rows,
+                        "python_rows_per_second": round(rows / py_s),
+                        "transpiled_rows_per_second": round(rows / tx_s) if tx_s else "",
+                        "transpiled_speedup_vs_python": speedup,
+                        "comet_rows_per_second": "",
+                        "comet_speedup_vs_python": "",
+                        "status": status,
+                        "target_kind": kind,
+                        "backend": backend,
+                        "model": model,
+                        "bench": "fhi",
+                        "string_gate": gate,
+                        "static_risk": risk.verdict if risk is not None else "",
+                        "static_flags": " ".join(risk.flags) if risk is not None else "",
+                    }
+                )
+
+    if args.csv and out:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(out[0]))
             writer.writeheader()

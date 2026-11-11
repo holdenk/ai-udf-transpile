@@ -78,6 +78,10 @@ def _collect_by_kind(path: Path, rows: list[dict], points: dict[str, list[tuple[
     otherwise sniff them onto."""
     bench = path.stem.replace("bench_", "").replace("_", " ")
     for row in rows:
+        # bench_fhi_udfs: only the live AI arm on the nullable column is an
+        # AI rewrite as served; its pinned arms are exhibits, not output.
+        if row.get("arm", "ai") != "ai" or row.get("column_nullable", "True") != "True":
+            continue
         arm = _KIND_ARMS.get(row.get("target_kind", ""))
         if arm is None or row.get("status") != "success":
             continue  # declined, failed, or verified but not served: no rewrite ran
