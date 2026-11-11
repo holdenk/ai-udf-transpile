@@ -25,7 +25,7 @@ from ai_udf_transpile.keys import (
     udf_function_ast,
     udf_key,
 )
-from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, KIND_RUST, TranspileResult
+from ai_udf_transpile.targets import KIND_CATALYST, KIND_GPU_KERNEL, KIND_JAVA_UDF, KIND_RUST, TranspileResult
 from ai_udf_transpile.types import (
     categories_for_spark_types,
     input_categories,
@@ -199,6 +199,7 @@ def register_impl(
     then. It still must pass the reconstruction smoke test.
     """
     from ai_udf_transpile.backends.human import ORIGIN
+    from ai_udf_transpile.rapids import verify_result
     from ai_udf_transpile.transpiler import get_catalog
     from ai_udf_transpile.verify import hypothesis_check
 
@@ -236,10 +237,12 @@ def register_impl(
         binary=impl_binary,
         entry=impl_entry,
     )
-    if kind not in {KIND_CATALYST, KIND_JAVA_UDF, KIND_RUST}:
-        raise ValueError(f"register_impl kind must be catalyst, java_udf or rust, not {kind}")
+    if kind not in {KIND_CATALYST, KIND_JAVA_UDF, KIND_RUST, KIND_GPU_KERNEL}:
+        raise ValueError(f"register_impl kind must be catalyst, java_udf, rust or gpu_kernel, not {kind}")
     if not result.reconstructable():
         raise ValueError("register_impl needs catalyst_sql, a java_udf payload, or rust impl_source")
+    if kind == KIND_GPU_KERNEL and not (impl_entry and impl_entry.strip()):
+        raise ValueError("register_impl kind=gpu_kernel needs the CUDA kernel source in impl_entry")
     if kind == KIND_RUST:
         # A Rust UDF that Comet cannot run fails the query; refuse up front
         # rather than store a row no lookup here would serve.
@@ -267,7 +270,11 @@ def register_impl(
             samples = catalog.samples_for(key)
         except Exception:
             pass
-        ok, err = hypothesis_check(
+        # gpu_kernel: the java class is checked here, the kernel on a GPU. A
+        # kernel that cannot be checked (no RAPIDS, gpuKernel off) or that
+        # fails is dropped with a warning and the row is stored as java_udf.
+        ok, err = verify_result(
+            hypothesis_check,
             source_text=source,
             captures=captures,
             result=result,

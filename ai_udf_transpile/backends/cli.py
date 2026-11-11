@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared CLI backend: write sandbox, exec argv, parse OUT.sql / OUT.rs / OUT.java / stdout."""
+"""Shared CLI backend: write sandbox, exec argv, parse OUT.sql / OUT.rs / OUT.java (+ OUT.cu) / stdout."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from ai_udf_transpile.backends.base import BackendDecline, BackendError
 from ai_udf_transpile.javac import extract_java_class
 from ai_udf_transpile.targets import (
     KIND_CATALYST,
+    KIND_GPU_KERNEL,
     KIND_JAVA_UDF,
     KIND_RUST,
     TranspileJob,
@@ -58,10 +59,14 @@ def parse_sandbox(sandbox: Path, stdout: str = "", targets: Optional[list[str]] 
         if source and source.upper() == "DECLINE":
             raise BackendDecline("OUT.java: DECLINE")
         if source:
+            # OUT.cu rides on OUT.java only: the Java class is the CPU path a
+            # kernel needs, and a Catalyst rewrite already runs on the GPU.
+            kernel = _kernel_source(sandbox)
             return TranspileResult(
-                kind=KIND_JAVA_UDF,
+                kind=KIND_GPU_KERNEL if kernel else KIND_JAVA_UDF,
                 java_source=source,
                 class_name=extract_java_class(source),
+                entry=kernel,
             )
     text = (stdout or "").strip()
     if not text:
@@ -85,6 +90,17 @@ def parse_sandbox(sandbox: Path, stdout: str = "", targets: Optional[list[str]] 
         )
     sql = rest.strip() if first.strip().upper() == "SQL" else text
     return TranspileResult(kind=KIND_CATALYST, sql=sql)
+
+
+def _kernel_source(sandbox: Path) -> Optional[str]:
+    """OUT.cu, or None when it is absent, empty, or a DECLINE of the kernel alone."""
+    path = sandbox / "OUT.cu"
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    if not text or text.upper() == "DECLINE":
+        return None
+    return text
 
 
 # A real class declaration is followed by a body/extends/implements; bare

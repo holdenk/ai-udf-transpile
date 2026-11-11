@@ -354,8 +354,8 @@ def test_register_impl_rejects_unknown_kind():
     def f(x: int) -> int:
         return x + 1
 
-    with pytest.raises(ValueError, match="catalyst, java_udf or rust"):
-        register_impl(None, f, return_type="bigint", kind="gpu_kernel", catalyst_sql="_udf_param_0 + 1")
+    with pytest.raises(ValueError, match="catalyst, java_udf, rust or gpu_kernel"):
+        register_impl(None, f, return_type="bigint", kind="binary", catalyst_sql="_udf_param_0 + 1")
 
 
 def test_register_impl_rust_needs_a_row_function_and_a_comet_session():

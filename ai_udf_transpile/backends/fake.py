@@ -11,6 +11,7 @@ from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.keys import canonical_source_from_func, canonical_source_text
 from ai_udf_transpile.targets import (
     KIND_CATALYST,
+    KIND_GPU_KERNEL,
     KIND_JAVA_UDF,
     KIND_RUST,
     TranspileJob,
@@ -574,6 +575,10 @@ def collatz_steps(n: int) -> int:
         n = n // 2 if n % 2 == 0 else 3 * n + 1
         steps += 1
     return steps
+# gpu_kernel fixture: a loop SQL cannot express, one fixed-width input, and a
+# result that always fits the INT32 cudf's Java transform produces.
+def low_bits_set(x: int) -> int:
+    return bin(x & 0xFFFFFFFF).count("1")
 
 
 def _result(sql: str) -> TranspileResult:
@@ -621,6 +626,29 @@ public class Backwards implements UDF1<Object, Object> {
     public Object call(Object s) {
         return s == null ? null : new StringBuilder((String) s).reverse().toString();
     }
+}
+"""
+
+LOW_BITS_JAVA = """package ai_udf;
+
+import org.apache.spark.sql.api.java.UDF1;
+
+public class LowBits implements UDF1<Object, Object> {
+    @Override
+    public Object call(Object x) {
+        // python raises on None: a null here is "python raise + sql value", allowed.
+        if (x == null) return null;
+        return (long) Long.bitCount(((Long) x) & 0xFFFFFFFFL);
+    }
+}
+"""
+
+LOW_BITS_CUDA = """// popcount of the low 32 bits
+__device__ inline void udf(int32_t* out, int64_t x) {
+  uint64_t v = static_cast<uint64_t>(x) & 0xFFFFFFFFull;
+  int32_t n = 0;
+  while (v) { n += static_cast<int32_t>(v & 1); v >>= 1; }
+  *out = n;
 }
 """
 
@@ -788,6 +816,12 @@ FIXTURES: dict[str, TranspileResult] = {
     canonical_source_from_func(plus_one_rust): TranspileResult(kind=KIND_RUST, rust_source=PLUS_ONE_RS),
     canonical_source_from_func(backwards_rust): TranspileResult(kind=KIND_RUST, rust_source=BACKWARDS_RS),
     canonical_source_from_func(collatz_steps): TranspileResult(kind=KIND_RUST, rust_source=COLLATZ_STEPS_RS),
+    canonical_source_from_func(low_bits_set): TranspileResult(
+        kind=KIND_GPU_KERNEL,
+        java_source=LOW_BITS_JAVA,
+        class_name="ai_udf.LowBits",
+        entry=LOW_BITS_CUDA,
+    ),
     canonical_source_from_func(plus_one_java): TranspileResult(
         kind=KIND_JAVA_UDF,
         java_source=PLUS_ONE_JAVA,
@@ -977,4 +1011,9 @@ class FakeBackend:
             (sandbox / "OUT.sql").write_text(result.sql + "\n", encoding="utf-8")
         if result.java_source:
             (sandbox / "OUT.java").write_text(result.java_source + "\n", encoding="utf-8")
-        return result
+        if result.kind == KIND_GPU_KERNEL and result.entry:
+            (sandbox / "OUT.cu").write_text(result.entry + "\n", encoding="utf-8")
+        # A copy: the worker rewrites a result in place (compiled jar, a
+        # gpu_kernel that is served as its java_udf), and the fixture table
+        # must hand the next run the original.
+        return replace(result)

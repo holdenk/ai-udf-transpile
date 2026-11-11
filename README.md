@@ -6,6 +6,8 @@ agent (CoCo / Pi / Claude / Codex / Cursor; a deterministic fake backend
 stands in for tests only) to rewrite the rest into Catalyst SQL or a Java UDF
 (or, opt-in under Comet, a native Rust UDF), then
 Hypothesis-checks the rewrite against the original Python before it is served.
+Under Spark RAPIDS a Java UDF can also carry a CUDA kernel
+([experimental](#gpu-kernel-target-spark-rapids)).
 
 Queries never wait on the agent. A miss inserts a `pending` catalog row and
 Spark keeps the interpreted Python UDF. A background worker (inline driver
@@ -43,6 +45,10 @@ A working experiment, not a dependency:
   backends write into a sandbox directory — that is a work dir, not a
   security boundary. Same trust hole in the shared write-back table:
   anyone who can append to it runs SQL and Java in every reader's driver.
+- **The GPU kernel target has never met a GPU.** `gpu_kernel` (CUDA behind
+  a Spark RAPIDS `RapidsUDF`, off by default) is built and tested up to the
+  point where a kernel would execute; see
+  [GPU kernel target](#gpu-kernel-target-spark-rapids).
 - **Benchmarks are honest but narrow.** Single node, one AI backend, five
   functions, min of 3. The graph below is that run, not a promise about
   your cluster.
@@ -404,6 +410,91 @@ a data point, not a promise:
 | `collatz_steps` | rust | 324,418 | 6,655,398 | 20.5x |
 | `is_prime` | rust | 767,327 | 12,894,005 | 16.8x |
 | `longest_digit_run` | catalyst (the model found a regexp form) | — | — | — |
+
+## GPU kernel target (Spark RAPIDS)
+
+Under Spark RAPIDS a Catalyst rewrite already runs on the GPU. A Java UDF
+does not: RAPIDS keeps that projection on the CPU (or, with
+`spark.rapids.sql.rowBasedUDF.enabled`, calls it row by row inside the GPU
+plan) unless the UDF class also implements `com.nvidia.spark.RapidsUDF`,
+whose `evaluateColumnar(int numRows, ColumnVector... args)` RAPIDS calls
+from `GpuProject` with cudf columns. That is the documented way to put your
+own GPU code in a RAPIDS plan: a UDF, not a plan node.
+
+`gpu_kernel` uses it. The model writes the Java UDF as before (`OUT.java`)
+and, next to it, the same function as one CUDA device function (`OUT.cu`):
+
+```cpp
+__device__ inline void udf(int32_t* out, int64_t x) {
+  uint64_t v = static_cast<uint64_t>(x) & 0xFFFFFFFFull;
+  int32_t n = 0;
+  while (v) { n += static_cast<int32_t>(v & 1); v >>= 1; }
+  *out = n;
+}
+```
+
+The plugin generates a second class around the two: `call` delegates to the
+Java UDF, `evaluateColumnar` hands the CUDA source to libcudf's JIT
+(`ColumnView.transform`). Nothing native is built here; libcudf compiles the
+kernel on the executor the first time it runs.
+
+```python
+spark.conf.set("spark.sql.experimental.aiUdfTranspile.gpuKernel", "true")  # default false
+enable(spark, backend="coco")
+```
+
+The kernel is offered to the model only when the conf is on, the session has
+`spark.plugins=com.nvidia.spark.SQLPlugin`, and the signature fits (below).
+A human can register one with
+`register_impl(..., kind="gpu_kernel", impl_source=java, impl_class=..., impl_entry=cuda)`.
+
+**Two legs.** The Java class is verified first, exactly as a `java_udf`.
+The wrapper is then registered in a sibling session (`newSession`, so no
+conf on the user's session moves), the physical plan is checked for
+`gpu_<name>(` -- how RAPIDS prints a `RapidsUDF` expression; a CPU fallback
+or a row UDF inside a GPU plan prints differently -- and Hypothesis runs
+again through that plan. The row is stored as `gpu_kernel` only if all of
+that passes. No RAPIDS, conf off, unsupported signature, a kernel that does
+not compile, a CPU plan, or a mismatch: the kernel is dropped with a warning
+and the row is the plain `java_udf`. A `gpu_kernel` row read by a session
+without RAPIDS serves its Java class.
+
+**What fits today.** cudf's Java `transform` is one column in, INT32 out,
+NULL in gives NULL out. So: exactly one fixed-width parameter
+(`boolean`/`tinyint`/`smallint`/`int`/`bigint`/`float`/`double`), a return
+of `int`, `bigint`, or `boolean` (the INT32 is widened or cast, so a
+`bigint` result has to fit in 32 bits -- `x + 1` does not qualify, a
+popcount does), and no kernel that returns NULL for a real input or a value
+for NULL. libcudf's C++ `cudf::transform` already takes many columns, any
+fixed-width or string output, and null-aware kernels; the Java binding
+(`ColumnViewJni.cpp`) hardcodes the narrow case. Widening that binding
+upstream is the unlock, and `rapids.stock_abi` is the one place here that
+would change.
+
+**Not run on hardware.** No GPU was available where this was written.
+Covered without one: the wrapper compiles with `-Xlint:all -Werror` against
+the cudf 26.10.0 Java sources and `RapidsUDF`
+(`AI_UDF_TRANSPILE_TEST_RAPIDS_CLASSPATH` runs that test), and on a CPU
+session with stub RAPIDS classes the build, merged jar, sibling session,
+registration, row path, plan probe, both verification legs, catalog row,
+and serving all run for real. Not covered: the kernel executing, libcudf's
+JIT accepting the source, and RAPIDS planning the wrapper onto the GPU.
+`tests/test_gpu_kernel_spark.py::test_on_gpu_kernel_is_verified_and_served`
+is that acceptance test; it skips unless the session runs RAPIDS:
+
+```bash
+AI_UDF_TRANSPILE_TEST_GPU_JAR=/path/to/rapids-4-spark.jar pytest tests/test_gpu_kernel_spark.py -k on_gpu
+```
+
+Getting there needs a RAPIDS build with a shim for a Spark that has the
+transpiler hook (4.3+). As of RAPIDS 26.12-SNAPSHOT the shims stop at 4.2.0
+plus a `5.0.0-SNAPSHOT` one, so today that means Spark master with RAPIDS
+built from source.
+
+**Trust.** A kernel is native code on your GPU. The scan in
+`rapids.kernel_error` pins the one accepted shape (one function, exact
+parameter types, no preprocessor, the output only ever written as `*out`)
+and is a tripwire, not a sandbox.
 
 ## Demos & benchmarks
 

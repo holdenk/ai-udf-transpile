@@ -133,7 +133,7 @@ def spark():
             .config("spark.pyspark.python", sys.executable)
             .config("spark.pyspark.driver.python", sys.executable)
         )
-        for key, value in _comet_configs():
+        for key, value in _comet_configs() or _rapids_configs():
             builder = builder.config(key, value)
         session = builder.getOrCreate()
         session.range(1).count()
@@ -157,4 +157,20 @@ def _comet_configs() -> list[tuple[str, str]]:
         ("spark.comet.enabled", "true"),
         ("spark.memory.offHeap.enabled", "true"),
         ("spark.memory.offHeap.size", "1g"),
+    ]
+
+
+def _rapids_configs() -> list[tuple[str, str]]:
+    """A GPU box points the test session at a Spark RAPIDS jar via env.
+
+    Unset (the default everywhere, CI included) or dangling jar: plain Spark,
+    and the one test that needs a GPU skips.
+    """
+    jar = os.environ.get("AI_UDF_TRANSPILE_TEST_GPU_JAR", "")
+    if not jar or not Path(jar).exists():
+        return []
+    return [
+        ("spark.jars", jar),
+        ("spark.plugins", "com.nvidia.spark.SQLPlugin"),
+        ("spark.rapids.sql.enabled", "true"),
     ]

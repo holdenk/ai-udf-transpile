@@ -75,7 +75,7 @@ def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
     _pin_session(spark)
     if row.target_kind == "catalyst" and row.catalyst_sql:
         return F.expr(row.catalyst_sql).cast(return_type)
-    if row.target_kind == "java_udf":
+    if row.target_kind in ("java_udf", "gpu_kernel"):
         n = len(row.param_names)
         args = ", ".join(f"_udf_param_{i}" for i in range(n))
         if spark is not None and row.impl_class and (row.impl_binary or row.impl_source):
@@ -88,6 +88,12 @@ def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
                 # which a row stored before that rename does not carry.
                 compiled = compile_java(spark, row.impl_source, row.impl_class)
                 binary, class_name = compiled.jar_bytes, compiled.class_name
+            if row.target_kind == "gpu_kernel":
+                gpu = _gpu_kernel_column(row, class_name, binary, args, return_type, spark)
+                if gpu is not None:
+                    return gpu
+                # No RAPIDS here, the conf is off, or the wrapper would not
+                # load: the row's java class is the verified CPU path.
             # Content-addressed like the verify path: a key-addressed name
             # would keep serving a stale jar after a re-verify stored new
             # bytes for the same key (the artifact cache refuses overwrite
@@ -161,6 +167,25 @@ def _rust_elsewhere(row: Any, spark: Any) -> bool:
     from ai_udf_transpile.rustc import rust_unservable
 
     return rust_unservable(spark) is not None
+
+
+def _gpu_kernel_column(row: Any, class_name: str, binary: Any, args: str, return_type: Any, spark: Any) -> Any:
+    """The RapidsUDF wrapper of a gpu_kernel row as a Column, or None to serve the java class."""
+    import pyspark.sql.functions as F
+
+    from ai_udf_transpile.javac import register_java_udf, verify_function_name
+    from ai_udf_transpile.rapids import serving_class
+
+    wrapper = serving_class(spark, class_name, binary)
+    if wrapper is None:
+        return None
+    try:
+        fname = verify_function_name("ai_udf_gpu", binary)
+        register_java_udf(spark, fname, wrapper, binary, return_type)
+        return F.expr(f"{fname}({args})").cast(return_type)
+    except Exception:
+        logger.debug("gpu_kernel wrapper did not register; serving the java class", exc_info=True)
+        return None
 
 
 def _spark_version(spark: Any) -> str:

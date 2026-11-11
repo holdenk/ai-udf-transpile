@@ -69,6 +69,9 @@ RUST_SHARED_BUILD_DIR = PREFIX + "rust.sharedBuildDir"
 # Each verification query is cancelled after this long: a candidate whose loop
 # never ends (a Java or Rust rewrite) fails verification instead of hanging it.
 VERIFY_QUERY_TIMEOUT = PREFIX + "verifyQueryTimeoutSeconds"
+# Offer, verify, and serve CUDA row kernels (gpu_kernel) when the session runs
+# Spark RAPIDS. Off: a gpu_kernel row is served as its java UDF.
+GPU_KERNEL = PREFIX + "gpuKernel"
 
 DEFAULTS: dict[str, str] = {
     CATALOG: "sqlite",
@@ -109,6 +112,7 @@ DEFAULTS: dict[str, str] = {
     RUST_BUILD_TIMEOUT: "900",
     RUST_SHARED_BUILD_DIR: "false",
     VERIFY_QUERY_TIMEOUT: "300",
+    GPU_KERNEL: "false",
 }
 
 # Side channel so tests and the worker thread can read values even if the JVM
