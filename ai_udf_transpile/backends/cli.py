@@ -91,7 +91,8 @@ def parse_sandbox(sandbox: Path, stdout: str = "", targets: Optional[list[str]] 
 # `class ` in prose ("this class of input") is not Java.
 _JAVA_DECL_RE = re.compile(r"\bclass\s+\w+\s*(?:\{|extends\b|implements\b)")
 # The one function a Rust rewrite must define; nothing else on stdout is Rust.
-_RUST_DECL_RE = re.compile(r"\bpub\s+fn\s+udf\s*\(")
+# At the start of a line: `concat(_udf_param_0, 'pub fn udf(')` is SQL.
+_RUST_DECL_RE = re.compile(r"^\s*pub\s+fn\s+udf\s*\(", re.MULTILINE)
 
 
 ArgvBuilder = Callable[[str, Path, str], list[str]]

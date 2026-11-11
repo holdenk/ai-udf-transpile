@@ -84,14 +84,20 @@ _FORBIDDEN_JAVA = re.compile(
 # and the environment through std, files read at COMPILE time through
 # include!/env!/#[path], and FFI through extern. arrow and the SDK are the
 # glue's business -- a row function never needs them. A module is named
-# either as a path segment (`fs::read`, `std::fs`) or in a `use std::{..}`
-# group. Denylist, not a sandbox: the same caveat as the Java scan.
+# either as a path segment (`fs::read`, `std::fs`) or in a `use`. A `use`
+# can also rename the crate root or glob it (`use std as s; use s::fs as q`,
+# `use std::*; use fs as q`), after which the module is never followed by
+# `::`: so a forbidden module anywhere in a `use`, a renamed crate root, and
+# a crate-root glob are refused outright. Denylist, not a sandbox: the same
+# caveat as the Java scan.
 _RUST_MODULES = r"(?:fs|process|net|env|os|ffi|ptr|thread|io|path|arch|intrinsics)"
 _FORBIDDEN_RUST = re.compile(
     r"\b(?:unsafe|extern)\b"
     r"|\b" + _RUST_MODULES + r"\s*::"
     r"|\b(?:std|core|alloc)\s*::\s*" + _RUST_MODULES + r"\b"
-    r"|\buse\s+(?:::\s*)?(?:std|core|alloc)\s*::\s*\{[^;]*\b" + _RUST_MODULES + r"\b"
+    r"|\buse\b[^;]*\b" + _RUST_MODULES + r"\b"
+    r"|\b(?:std|core|alloc)\s+as\b"
+    r"|\buse\b[^;]*\b(?:std|core|alloc)\s*::\s*(?:\*|\{[^;]*\*)"
     r"|\b(?:arrow\w*|comet_udf_sdk|libc)\s*::"
     r"|\b(?:SystemTime|Instant)\b"  # the clock: Comet plans the call as immutable
     # A macro can paste a module name into a path (`std::$m::read`), which

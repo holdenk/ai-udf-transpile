@@ -109,12 +109,18 @@ UDFS = [
 
 
 def _row(func):
+    """This session's row for ``func``: same source AND same Spark version.
+
+    A shared cache can hold the same source under another Spark version, or
+    the "+no-rust" twin a session without Comet queued; neither is ours.
+    """
     catalog = get_catalog()
+    spark = SparkSession.getActiveSession()
     with catalog._lock:
         return catalog._conn.execute(
             "SELECT status, target_kind, impl_source, catalyst_sql, model, error FROM cache "
-            "WHERE source_text = ?",
-            (canonical_source_from_func(func),),
+            "WHERE source_text = ? AND spark_version = ?",
+            (canonical_source_from_func(func), str(spark.version)),
         ).fetchone()
 
 

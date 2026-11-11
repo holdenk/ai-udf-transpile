@@ -269,11 +269,18 @@ if ! git -C "$COMET_HOME_ARG" diff --quiet || ! git -C "$COMET_HOME_ARG" diff --
   error "comet checkout has local changes: $COMET_HOME_ARG (clean it first)"
 fi
 
-echo "updating Comet checkout at $COMET_HOME_ARG"
-git -C "$COMET_HOME_ARG" fetch --tags origin
-git -C "$COMET_HOME_ARG" checkout "$COMET_REF"
-if git -C "$COMET_HOME_ARG" show-ref --verify --quiet "refs/remotes/origin/$COMET_REF"; then
-  git -C "$COMET_HOME_ARG" pull --ff-only origin "$COMET_REF"
+# --skip-build reuses the jar already built in this checkout, so the
+# checkout must stay on the ref that jar came from: COMET_HOME (exported
+# below) is the SDK the rust target builds against, and it has to match.
+if [ "$SKIP_BUILD" -eq 1 ]; then
+  echo "skip-build: keeping the Comet checkout at $COMET_HOME_ARG as is (--ref not applied)"
+else
+  echo "updating Comet checkout at $COMET_HOME_ARG"
+  git -C "$COMET_HOME_ARG" fetch --tags origin
+  git -C "$COMET_HOME_ARG" checkout "$COMET_REF"
+  if git -C "$COMET_HOME_ARG" show-ref --verify --quiet "refs/remotes/origin/$COMET_REF"; then
+    git -C "$COMET_HOME_ARG" pull --ff-only origin "$COMET_REF"
+  fi
 fi
 
 echo "Spark detected: $SPARK_MINOR (scala $SPARK_SCALA)"

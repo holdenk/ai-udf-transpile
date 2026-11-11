@@ -293,6 +293,12 @@ def test_fixtures_pass_the_scan(source):
         "fn f<'a>(s: &'a str) -> &'a str { s } let _ = std::fs::read(\"/x\"); let _c = 'x';",
         # A raw string ends at its own closing hashes, not at the first quote.
         'let _a = r##"a "# b"##; std::process::exit(0); let _b = "";',
+        # A renamed or globbed crate root hides the module from `fs::`.
+        'use std as s; use s::fs as q; let _ = q::metadata("/").is_ok();',
+        'use std::*; use fs as q; let _ = q::metadata("/").is_ok();',
+        "use ::core as c; let _ = c::mem::size_of::<i64>();",
+        "use std::{*}; let _ = 1;",
+        'use std::{fs as quiet}; let _ = quiet::read("/x");',
     ],
 )
 def test_scan_rejects(body):
@@ -310,6 +316,7 @@ def test_scan_rejects(body):
         'let _raw = r#"unsafe { std::process::exit(1) }"#;',
         "let _fsync = 1; let _envelope = 2; let _iota = 3; let _pathological = 4;",
         "use std::collections::HashMap; let _m: HashMap<i64, i64> = HashMap::new();",
+        "use std::fmt::Write as _; let _io = 3 as i64; let _path = 2;",
         'let _s = format!("{}", 1); let _v: Vec<char> = "ab".chars().rev().collect();',
         "fn helper<'a>(s: &'a str) -> &'a str { s } let _ = helper(\"x\");",
         "/* outer /* inner std::fs */ still a comment: unsafe { std::process::exit(0) } */",
@@ -391,6 +398,8 @@ def test_rust_on_stdout(tmp_path):
     assert named.kind == KIND_RUST and named.rust_source.startswith("pub fn udf(")
     # Prose that merely mentions a function is still SQL-or-nothing.
     assert parse_sandbox(tmp_path, "_udf_param_0 + 1").kind == "catalyst"
+    # ...and so is SQL whose string literal happens to spell the signature.
+    assert parse_sandbox(tmp_path, "concat(_udf_param_0, 'pub fn udf(')").kind == "catalyst"
 
 
 # -- what the model is shown --------------------------------------------------
