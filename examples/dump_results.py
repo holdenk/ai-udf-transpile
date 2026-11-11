@@ -137,8 +137,10 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     "ai": "",
                 }
                 if tx_rate and r["status"] == "success":
+                    # A rust rewrite's only arm is Comet's: say where it ran.
+                    where = ", Comet native" if r.get("target_kind") == "rust" else ""
                     arms["ai"] = (
-                        f"{_fmt_rate(tx_rate)} rows/s ({r['transpiled_speedup_vs_python']}x vs python)"
+                        f"{_fmt_rate(tx_rate)} rows/s ({r['transpiled_speedup_vs_python']}x vs python{where})"
                     )
                 comet = r.get("comet_rows_per_second")
                 if comet and arms["ai"] and r.get("comet_speedup_vs_python"):
@@ -175,6 +177,16 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                         "top": top,
                         "static": "",
                         "ai": f"{_fmt_rate(java)} rows/s ({r['ai_java_speedup_vs_regular']}x vs python)",
+                    }
+                rust = r.get("transpiled_ai_rust_rows_per_second")
+                if rust:
+                    perf[r["function"] + "_rust"] = {
+                        "top": top,
+                        "static": "",
+                        "ai": (
+                            f"{_fmt_rate(rust)} rows/s"
+                            f" ({r['ai_rust_speedup_vs_regular']}x vs python, Comet native)"
+                        ),
                     }
         elif "declined" in rows[0]:  # bench_tpcds CSV
             for r in rows:
@@ -259,6 +271,8 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
         "and each transpiled arm's rows/s at the end of its own line -- with a",
         "comet arm when the catalog bench ran against a Comet build; no perf",
         "= not benched or the interpreted arm raises on the bench sample.",
+        "Rust rewrites (the opt-in `rust` target) run only inside Comet, so",
+        "their one number is Comet's and says so.",
         "",
     ]
     try:

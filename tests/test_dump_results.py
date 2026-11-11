@@ -312,6 +312,32 @@ def test_perf_lines_unit(tmp_path):
         "static": "",
         "ai": "885k rows/s (no python baseline)",
     }
+    # a rust rewrite's number is Comet's, labeled as such, with no comet suffix
+    rust_cat = tmp_path / "rust_catalog.csv"
+    rust_cat.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model\n"
+        "collatz_steps,1000,300000,6000000,20.0,,,success,rust,claude,m\n",
+        encoding="utf-8",
+    )
+    perf = _load_dump_module()._perf_lines([str(rust_cat)])
+    assert perf["collatz_steps"]["ai"] == "6.0M rows/s (20.0x vs python, Comet native)"
+    # micro: a rust twin gets its own section key, like the java twin
+    rust_micro = tmp_path / "rust_micro.csv"
+    rust_micro.write_text(
+        "function,kinds,regular_rows_per_second,transpiled_static_rows_per_second,"
+        "transpiled_ai_catalyst_rows_per_second,transpiled_ai_java_rows_per_second,"
+        "transpiled_ai_rust_rows_per_second,static_speedup_vs_regular,ai_catalyst_speedup_vs_regular,"
+        "ai_java_speedup_vs_regular,ai_rust_speedup_vs_regular,transpile_succeeded_static,"
+        "transpile_succeeded_ai_catalyst,transpile_succeeded_ai_java,transpile_succeeded_ai_rust,"
+        "ai_backend,ai_model\n"
+        "edit_distance,catalyst+rust,100000,,9000000,,2000000,,90.0,,20.0,False,True,False,True,claude,m\n",
+        encoding="utf-8",
+    )
+    perf = _load_dump_module()._perf_lines([str(rust_micro)])
+    assert perf["edit_distance_rust"]["ai"] == "2.0M rows/s (20.0x vs python, Comet native)"
+    assert "edit_distance_java" not in perf
     # merge precedence: later files take over per function with their deeper arms
     perf = _load_dump_module()._perf_lines([str(cat), str(micro)])
     assert perf["has_item"]["top"].endswith("interpreted python 2.0M rows/s")  # catalog-only

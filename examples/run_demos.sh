@@ -11,6 +11,7 @@
 #   examples/run_demos.sh --bench-tpcds           # TPC-DS-inspired UDF patterns vs vanilla SQL
 #   examples/run_demos.sh --bench-fhi             # real pipeline text UDFs: python vs pinned naive/tuned rewrites vs the live AI
 #   examples/run_demos.sh --all-benches --csv out.csv  # every bench: micro (+comet if COMET_JAR), bytecode, tpcds, fhi, catalog; then the graphs
+#   (a Comet jar in COMET_JAR also runs demo_rust_udf.py and adds the rust arms)
 #   examples/run_demos.sh --dump                  # + dump $AI_UDF_TRANSPILE_SQLITE to docs/EXAMPLES_TRANSPILED.md
 #   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 #
@@ -154,6 +155,11 @@ run_demo "quickstart" examples/demo_quickstart.py
 run_demo "full demo" examples/demo.py
 run_demo "inspect" examples/demo_transpile_inspect.py
 run_demo "multi-model" examples/demo_multi_model.py
+# The rust target needs a live Comet; with a jar configured its rows land in
+# the same cache, so the dump and the catalog bench cover them too.
+if [ -n "${AI_UDF_TRANSPILE_COMET_JAR:-}" ] || [ -n "${COMET_JAR:-}" ]; then
+  run_demo "rust udf (comet)" examples/demo_rust_udf.py
+fi
 [ "$LIVE" -eq 1 ] && run_demo "live backends" examples/demo_live_backends.py
 if [ "$BENCH" -eq 1 ]; then
   if [ "$RUST_ACCEL" -eq 1 ] && [ "$RUST_PRESET" = "comet" ]; then

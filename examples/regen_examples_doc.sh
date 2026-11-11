@@ -22,7 +22,9 @@ set -u -o pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # A .comet-env (examples/setup_comet.sh --write-env-file) adds the comet arm
-# to bench_catalog's numbers; without it the doc just has no comet bullets.
+# to bench_catalog's numbers, and runs demo_rust_udf.py so rust-target rows
+# (and their Comet-native numbers) land in the doc; without it the doc just
+# has no comet bullets and no rust rows.
 [ -f "$REPO_ROOT/.comet-env" ] && source "$REPO_ROOT/.comet-env"
 
 export AI_UDF_TRANSPILE_BACKEND="${AI_UDF_TRANSPILE_BACKEND:-ensemble}"

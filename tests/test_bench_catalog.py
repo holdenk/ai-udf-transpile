@@ -18,7 +18,7 @@ from pyspark.sql.types import LongType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import enable, shutdown  # noqa: E402
-from ai_udf_transpile.backends.fake import always_decline, plus_one  # noqa: E402
+from ai_udf_transpile.backends.fake import PLUS_ONE_RS, always_decline, plus_one  # noqa: E402
 from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
 
 pytestmark = pytest.mark.spark
@@ -120,3 +120,49 @@ def test_bench_catalog_comet_arm(catalog, tmp_path):
     assert float(rows["plus_one"]["comet_speedup_vs_python"]) > 0
     # always_decline has no served rewrite: no comet number either
     assert rows["always_decline"]["comet_rows_per_second"] == ""
+
+
+def test_bench_catalog_benches_a_rust_row_under_comet_only(catalog, tmp_path):
+    """A rust rewrite is never served by the plain session; the comet one times it."""
+    import shutil
+    import sqlite3
+
+    jar = os.environ.get("AI_UDF_TRANSPILE_TEST_COMET_JAR", "")
+    if not jar or not Path(jar).exists():
+        pytest.skip("set AI_UDF_TRANSPILE_TEST_COMET_JAR to a Comet jar to run the comet arm")
+    if not shutil.which("cargo") or not os.environ.get("COMET_HOME"):
+        pytest.skip("needs cargo and $COMET_HOME (comet-udf-sdk) to build the rust row")
+    # Turn plus_one's verified SQL row into a rust row: the bench serves what
+    # the catalog says, and this row function computes the same thing.
+    with sqlite3.connect(catalog) as conn:
+        conn.execute(
+            "UPDATE cache SET target_kind = 'rust', catalyst_sql = NULL, impl_source = ? "
+            "WHERE status = 'success'",
+            (PLUS_ONE_RS,),
+        )
+    out = tmp_path / "bench_catalog_rust.csv"
+    env = {**os.environ, "AI_UDF_TRANSPILE_COMET_JAR": jar}
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(BENCH),
+            "--sqlite",
+            catalog,
+            "--rows",
+            "1000",
+            "--rounds",
+            "1",
+            "--csv",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,  # a cold build compiles arrow
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "rust rewrite -- runs only under Comet" in proc.stdout
+    row = {r["function"]: r for r in csv.DictReader(out.open())}["plus_one"]
+    assert row["target_kind"] == "rust"
+    assert row["transpiled_rows_per_second"] and float(row["transpiled_speedup_vs_python"]) > 0
+    assert row["comet_rows_per_second"] == ""  # its one number is the transpiled one

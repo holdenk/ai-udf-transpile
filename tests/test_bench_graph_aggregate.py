@@ -94,6 +94,33 @@ def test_aggregate_collects_and_excludes_fallbacks(tmp_path):
     assert "best 20.0x" in proc.stdout
 
 
+def test_aggregate_rust_arm_is_comet_native_whatever_the_file_is_called(tmp_path):
+    header = [
+        "function",
+        "kinds",
+        "regular_rows_per_second",
+        "transpiled_ai_rust_rows_per_second",
+        "ai_rust_speedup_vs_regular",
+        "transpile_succeeded_ai_rust",
+    ]
+    for name, speedup in (("bench_micro.csv", 30.0), ("bench_micro_comet.csv", 40.0)):
+        with open(tmp_path / name, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerow(["ok", "rust", 1_000_000, 30_000_000, speedup, True])
+            # The twin was served as SQL, not Rust: no rust point.
+            w.writerow(["sql", "catalyst", 1_000_000, 9_000_000, 9.0, False])
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), str(tmp_path), "--png", str(tmp_path / "agg.png")],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "AI: Rust UDF (Comet native)" in proc.stdout
+    assert "2 points, best 40.0x" in proc.stdout
+    assert "no ai_rust_comet arm" not in proc.stderr
+
+
 def test_aggregate_rejects_unrecognized_csv(tmp_path):
     (tmp_path / "bench_nonsense.csv").write_text("a,b\n1,2\n", encoding="utf-8")
     proc = subprocess.run(

@@ -299,6 +299,8 @@ not make it safe on every plan. A served Rust UDF fails:
   `spark.comet.convert.rdd.enabled=true`;
 - over `spark.range`, unless `spark.comet.exec.range.enabled=true` (or
   `spark.comet.convert.range.enabled=true`);
+- over a `.cache()`d DataFrame, unless `spark.comet.exec.inMemoryCache.enabled=true`
+  (or `spark.comet.convert.inMemoryCache.enabled=true`);
 - over `VALUES` / local relations (the optimizer evaluates those eagerly),
   in a filter on partition columns, and as the sort key of a global sort
   (`orderBy(f(x))`; select it as a column and sort on that instead);
@@ -378,7 +380,14 @@ static and both AI kinds. A second transpilation timing CSV (auto-written when
 `--csv` is set, or explicit via `--transpilation-timing-csv`) captures one-time transpile fill costs
 and plain-vs-AI UDF lookup/definition costs. `--rust-accel` runs the same
 bench with rust acceleration Spark configs enabled (default preset: Comet; add
-`--rust-accel-conf key=value` for local overrides). For the Comet preset, set
+`--rust-accel-conf key=value` for local overrides). Under the Comet preset it
+also switches the `rust` target on and adds a fifth arm, AI as a Rust UDF run
+natively by Comet, filled through `*_rust` twins the way the Java arm uses
+`*_java` twins (a twin the backend served as SQL is not counted as a rust
+arm). `bench_catalog.py` times every cached rust row in its Comet session —
+the only place one can run — and `run_demos.sh` runs `demo_rust_udf.py`
+whenever a Comet jar is configured, so the regenerated
+`docs/EXAMPLES_TRANSPILED.md` carries rust rewrites and their numbers. For the Comet preset, set
 `AI_UDF_TRANSPILE_COMET_JAR` (or `COMET_JAR`) so the plugin jar is on Spark's
 classpath; `examples/setup_comet.sh` can clone/build Comet from source and emit
 the exports for your current Spark checkout.

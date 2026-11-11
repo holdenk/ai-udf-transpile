@@ -42,7 +42,10 @@ ARMS = {
     "static_comet": ("static (built-in AST, Comet)", "tab:blue"),
     "ai_catalyst_comet": ("AI: Catalyst SQL, Comet", "tab:purple"),
     "ai_java_comet": ("AI: Java UDF, Comet", "tab:green"),
+    # Only ever measured under Comet: one row, whatever the CSV is called.
+    "ai_rust": ("AI: Rust UDF (Comet native)", "tab:olive"),
 }
+COMET_ONLY_ARMS = frozenset({"ai_rust"})
 
 # csv signature column -> [(arm, speedup column, (fallback flag col, skip value))]
 _SCHEMAS = {
@@ -54,6 +57,7 @@ _SCHEMAS = {
             ("transpile_succeeded_ai_catalyst", "False"),
         ),
         ("ai_java", "ai_java_speedup_vs_regular", ("transpile_succeeded_ai_java", "False")),
+        ("ai_rust", "ai_rust_speedup_vs_regular", ("transpile_succeeded_ai_rust", "False")),
     ],
     "java_eval_rows_per_second": [
         ("static", "static_speedup_vs_python", None),
@@ -118,7 +122,7 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
                     continue  # declined/failed arm: no number, no point
                 if guard and row.get(guard[0]) == guard[1]:
                     continue  # python fallback perf, not a rewrite
-                if comet:
+                if comet and arm not in COMET_ONLY_ARMS:
                     variant = f"{arm}_comet"
                     if variant not in ARMS:
                         # Folding a rust-accelerated point into the plain
