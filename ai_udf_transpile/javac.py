@@ -38,9 +38,33 @@ class JavaCompileError(Exception):
     """Java source could not be compiled into a UDF class."""
 
 
+# Comments and literals, where a class name is text rather than a reference.
+# (verify._JAVA_SKIP is the same lexer; it is duplicated here so javac does
+# not import the verifier.)
+_JAVA_TEXT = re.compile(
+    r"//[^\n\r]*"
+    r"|/\*.*?\*/"
+    r'|"""(?:[^"\\]|\\.|"(?!""))*"""'
+    r'|"(?:[^"\\\n]|\\.)*"'
+    r"|'(?:[^'\\\n]|\\.)*'",
+    re.DOTALL,
+)
+
+
+def _code_only(source: str) -> str:
+    """The source with comments and literals blanked (newlines kept), so a
+    `// This class implements ...` comment is not read as a declaration."""
+    return _JAVA_TEXT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), source)
+
+
+def _declares(source: str, simple: str) -> bool:
+    return re.search(rf"\bclass\s+{re.escape(simple)}(?![\w$])", _code_only(source)) is not None
+
+
 def extract_java_class(source: str) -> Optional[str]:
-    pkg_match = _PACKAGE_RE.search(source)
-    class_match = _CLASS_RE.search(source)
+    code = _code_only(source)
+    pkg_match = _PACKAGE_RE.search(code)
+    class_match = _CLASS_RE.search(code)
     if not class_match:
         return None
     simple = class_match.group(1)
@@ -127,17 +151,25 @@ def _compile_janino(spark: Any, java_source: str) -> bytes:
     return _jar_entries(entries)
 
 
-# Comments and literals, where a class name is text rather than a reference.
-# (verify._JAVA_SKIP is the same lexer; it is duplicated here so javac does
-# not import the verifier.)
-_JAVA_TEXT = re.compile(
-    r"//[^\n\r]*"
-    r"|/\*.*?\*/"
-    r'|"""(?:[^"\\]|\\.|"(?!""))*"""'
-    r'|"(?:[^"\\\n]|\\.)*"'
-    r"|'(?:[^'\\\n]|\\.)*'",
-    re.DOTALL,
-)
+def _resolve_class(java_source: str, class_name: Optional[str]) -> Optional[tuple[str, str, str]]:
+    """(package, declared simple name, content-addressed simple name).
+
+    An explicitly supplied name wins when the source declares it (bare, or
+    already carrying this source's suffix); otherwise the first declaration
+    in the code (comments and literals excluded) is the class.
+    """
+    suffix = "_" + hashlib.sha256(java_source.encode("utf-8")).hexdigest()[:16]
+    declared = extract_java_class(java_source)
+    for candidate in (class_name, declared):
+        if not candidate:
+            continue
+        pkg, _, simple = candidate.rpartition(".")
+        base = simple[: -len(suffix)] if simple.endswith(suffix) else simple
+        if candidate is declared or _declares(java_source, base):
+            if not pkg and declared and candidate is not declared:
+                pkg = declared.rpartition(".")[0]
+            return pkg, base, base + suffix
+    return None
 
 
 def unique_class_name(java_source: str, class_name: Optional[str] = None) -> Optional[str]:
@@ -151,14 +183,11 @@ def unique_class_name(java_source: str, class_name: Optional[str] = None) -> Opt
     first one's code -- in verification as well as in serving. Hashing the
     source makes the name a function of the code, so one name, one body.
     """
-    resolved = class_name or extract_java_class(java_source)
-    if not resolved:
+    resolved = _resolve_class(java_source, class_name)
+    if resolved is None:
         return None
-    pkg, _, simple = resolved.rpartition(".")
-    suffix = "_" + hashlib.sha256(java_source.encode("utf-8")).hexdigest()[:16]
-    if not simple.endswith(suffix):
-        simple += suffix
-    return f"{pkg}.{simple}" if pkg else simple
+    pkg, _base, unique = resolved
+    return f"{pkg}.{unique}" if pkg else unique
 
 
 def _rename_class(java_source: str, old_simple: str, new_simple: str) -> str:
@@ -184,13 +213,12 @@ def compile_java(spark: Any, java_source: str, class_name: Optional[str] = None)
     """
     if spark is None:
         raise JavaCompileError("compile_java requires a SparkSession")
-    declared = extract_java_class(java_source)
-    unique = unique_class_name(java_source, declared or class_name)
-    if not unique:
+    resolved = _resolve_class(java_source, class_name)
+    if resolved is None:
         raise JavaCompileError("no class declaration found in Java source")
-    source = java_source
-    if declared:
-        source = _rename_class(java_source, declared.rpartition(".")[2], unique.rpartition(".")[2])
+    pkg, base, simple = resolved
+    unique = f"{pkg}.{simple}" if pkg else simple
+    source = _rename_class(java_source, base, simple)
     try:
         return CompiledJava(_compile_jdk(spark, source, unique), unique, janino=False)
     except JavaCompileError as exc:

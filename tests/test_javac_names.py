@@ -27,3 +27,29 @@ def test_unique_class_name_is_a_function_of_the_source():
     assert f"new {simple}()" in renamed and f"static {simple} make" in renamed
     # Comments, string literals and longer identifiers are left alone.
     assert "// Same is named" in renamed and '"Same"' in renamed and "SameOther.X" in renamed
+
+
+def test_a_comment_mentioning_class_is_not_the_declaration():
+    """`// This class implements ...` before the declaration used to be read
+    as a class named `implements`, by extract_java_class and so by the CLI
+    backend and compile_java alike."""
+    from ai_udf_transpile.javac import extract_java_class
+
+    src = (
+        "package ai_udf;\n// This class implements the rewrite.\n/* class Decoy */\n"
+        'public class Real implements UDF1<Object, Object> {\n    String s = "class Nope";\n}\n'
+    )
+    assert extract_java_class(src) == "ai_udf.Real"
+    name = unique_class_name(src)
+    assert name.startswith("ai_udf.Real_")
+    # An explicit name the source declares wins, bare or already suffixed, with
+    # or without its package; one it does not declare falls back to the code.
+    for explicit in ("ai_udf.Real", "Real", name, "ai_udf.Nope"):
+        assert unique_class_name(src, explicit) == name, explicit
+    assert unique_class_name("// class OnlyInAComment") is None
+
+
+def test_an_explicit_name_beats_an_earlier_declared_class():
+    src = "package p;\nclass Helper {}\npublic class Main { }\n"
+    assert unique_class_name(src).startswith("p.Helper_")  # first declaration, as before
+    assert unique_class_name(src, "p.Main").startswith("p.Main_")

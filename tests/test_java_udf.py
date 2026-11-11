@@ -102,3 +102,12 @@ def test_same_class_name_different_code_does_not_collide(spark):
             spark, fname, compiled.class_name, compiled.jar_bytes, StringType(), janino=compiled.janino
         )
         assert spark.sql(f"SELECT {fname}('x') AS v").first().v == f"{tag}:x"
+
+
+@pytest.mark.spark
+def test_compile_java_with_a_class_comment_before_the_declaration(spark):
+    src = BACKWARDS_JAVA.replace("public class", "// This class implements the rewrite.\npublic class", 1)
+    for explicit in (None, "ai_udf.Backwards"):
+        compiled = compile_java(spark, src, explicit)
+        assert compiled.class_name.startswith("ai_udf.Backwards_")
+        assert compiled.jar_bytes[:2] == b"PK"
