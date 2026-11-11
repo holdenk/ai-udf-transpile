@@ -72,6 +72,12 @@ def test_verdict_has_legal_check(text, expected):
         ("Verdict: non-viable", False),
         ("verdict: unviable", False),
         ("VERDICT: VIABLE or NOT_VIABLE", None),  # both words: unclear
+        # Two different negative words are still one answer. A rewrite that
+        # counts distinct matched words instead of distinct meanings returns
+        # NULL here -- and one did, verified, because the gate's generated
+        # strings (16 chars at most) cannot hold two verdict words.
+        ("VERDICT: UNVIABLE and NON VIABLE", False),
+        ("VERDICT: VIABLE, viable", True),
         ("VERDICT", None),  # no colon, no value
         ("VERDICT: maybe", None),
         ("REASON: x\n> `VERDICT: VIABLE`", True),

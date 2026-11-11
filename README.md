@@ -201,6 +201,7 @@ examples/run_demos.sh --bench --transpilation-timing-csv bench_transpilation_tim
 examples/run_demos.sh --bench --rust-accel
 examples/run_demos.sh --bench-bytecode   # static (AST) vs bytecode->SQL vs Java bytecode eval vs python
 examples/run_demos.sh --bench-tpcds     # TPC-DS-inspired UDF patterns vs vanilla SQL
+examples/run_demos.sh --bench-fhi       # real pipeline text UDFs (regex, PII scrub) vs their rewrites
 examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 ```
 
@@ -244,6 +245,33 @@ python-semantics rewrites (spark_substr's clamped slice, spark_str's
 'None', spark_eq's NULL-safe `=`) carry guards the naive vanilla expression
 lacks, and three UDFBench date parsers are declined outright — no faithful
 SQL exists for int() over a free-form prefix.
+
+`examples/bench_fhi_udfs.py` benchmarks UDFs nobody wrote for this plugin:
+seven scalar text UDFs from Fight Health Insurance's training-data pipeline
+(verdict parsing, entity cleanup, the findings regex extractors, the regex
+PII scrubber), ported self-contained into
+`ai_udf_transpile/backends/fhi_udfs.py`. Every one is regex or a line loop
+over free text. One local run (1M rows, 4 cores, PyPI Spark 4.3.0, one AI
+backend, partyOnStrings on): all seven got a rewrite that passed the gate on
+the first attempt, six as Catalyst SQL and the scrubber as a Java UDF --
+and only one of them is faster than the interpreted python (3.0x). The
+other five that Spark serves run at 0.3x-0.9x: a rewrite faithful to
+`str.strip()`, `splitlines()` and unicode `\s`/`\d`/`\b` spells those out
+as regex character classes and lookarounds, and `java.util.regex` over them
+loses to CPython's C string methods and `re`. Nothing in the serving path
+checks that a rewrite is faster before serving it. The seventh
+(`fhi_parse_verdict`) verified and is not served at all: its SQL has a
+`transform`/`filter` lambda, and Spark drops such a rewrite and plans the
+python UDF without saying so (`udf.transpiled` stays truthy; the bench
+checks the physical plan). That same rewrite is also wrong on an input the
+gate could not generate -- two different negative verdict words on one
+line -- because generated strings are 16 characters at most; a hand-built
+adversarial set agreed with python on the other 278 of 279 inputs.
+
+```bash
+examples/run_demos.sh --bench-fhi                       # or: python examples/bench_fhi_udfs.py
+python examples/bench_fhi_udfs.py --only fhi_deidentify_text --sampled-strings-only
+```
 
 The perf graphs are generated from that CSV by a CLI tool
 (`examples/bench_graph.py`, matplotlib — no AI in the loop, ever). One

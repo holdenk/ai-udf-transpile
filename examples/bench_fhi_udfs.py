@@ -87,13 +87,16 @@ _VERDICT_EXPR = (
             "Verdict: non-viable",
             "VERDICT: VIABLE or NOT_VIABLE",
             "SUMMARY: no decision line",
+            # Two spellings of one answer: the seed that catches a rewrite
+            # comparing matched words instead of what they mean.
+            "VERDICT: UNVIABLE and NON VIABLE",
         ],
         "x",
     )
     + r", '\nREASON: claim ', cast(x as string), ' is supported by the cited evidence.\nJUDGE: VIABLE\n', "
     + _pick(
         ["LEGAL: OK", "LEGAL: UNCHECKED", "LEGAL:", "  LEGAL: ERISA 503 deadline cited", "legal: ok"],
-        "x div 6",
+        "x div 7",
     )
     + ")"
 )
