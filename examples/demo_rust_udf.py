@@ -144,12 +144,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--rows", type=int, default=2_000_000)
     parser.add_argument("--timeout", type=float, default=900.0, help="seconds to wait per UDF")
+    parser.add_argument(
+        "--skip-if-unavailable",
+        action="store_true",
+        help="exit 0 with a note when this machine cannot build or run Rust UDFs (run_demos.sh)",
+    )
     args = parser.parse_args()
+    unavailable = 0 if args.skip_if_unavailable else 2
 
     jar = next((os.environ[k] for k in COMET_JAR_ENV_KEYS if os.environ.get(k)), "")
     if not jar or not Path(jar).exists():
         print("set COMET_JAR to a Comet 1.2+ jar (examples/setup_comet.sh builds one)", file=sys.stderr)
-        return 2
+        return unavailable
 
     builder = (
         SparkSession.builder.master("local[*]")
@@ -174,9 +180,13 @@ def main() -> int:
     conf.set_value(conf.TARGETS, "catalyst,java_udf,rust", spark)
 
     reason = rustc.rust_unservable(spark)
+    if not reason and not rustc.rust_offered(spark, ["bigint"], "bigint"):
+        reason = "no cargo or no comet-udf-sdk to build against (see the warning above)"
     if reason:
         print(f"this session cannot run Rust UDFs: {reason}", file=sys.stderr)
-        return 2
+        shutdown()
+        spark.stop()
+        return unavailable
     print(f"comet-udf-sdk: {rustc.resolve_sdk(spark).ident}")
     print(f"build cache:   {rustc.build_dir(spark)}")
 

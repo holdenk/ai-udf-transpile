@@ -12,6 +12,11 @@ KIND_RUST = "rust"
 KIND_GPU_KERNEL = "gpu_kernel"
 KIND_BINARY = "binary"
 
+# Appended to the spark_version a cache key is built from, for the twin row
+# a session that cannot run Rust gets when the main row's rewrite is Rust.
+# The worker never offers (or accepts) Rust for such a row.
+NO_RUST_SUFFIX = "+no-rust"
+
 V1_KINDS = frozenset({KIND_CATALYST, KIND_JAVA_UDF})
 # Served only when spark.sql.experimental.aiUdfTranspile.targets opts in: a
 # Rust UDF runs only inside Comet's native execution (see rustc.py).

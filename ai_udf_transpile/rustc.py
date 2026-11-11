@@ -823,7 +823,16 @@ def rust_offered(spark: Any, input_types: list[str], return_type: str) -> bool:
     """
     if not supports_types(input_types, return_type) or rust_unservable(spark) is not None:
         return False
-    root = str(build_dir(spark))
+    # Everything that decides buildability: changing any of it re-probes.
+    root = "\0".join(
+        [
+            str(build_dir(spark)),
+            conf.get_value(conf.RUST_COMET_SDK, spark, ""),
+            conf.get_value(conf.RUST_CARGO, spark, conf.DEFAULTS[conf.RUST_CARGO]),
+            os.environ.get("AI_UDF_TRANSPILE_COMET_HOME", ""),
+            os.environ.get("COMET_HOME", ""),
+        ]
+    )
     failed = _UNBUILDABLE.get(root)
     if failed is not None and time.monotonic() - failed[0] < _UNBUILDABLE_TTL:
         return False

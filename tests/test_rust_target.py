@@ -882,3 +882,145 @@ def test_build_lock_excludes_other_processes(tmp_path):
     with rustc._locked("ai_udf_rs_x", tmp_path):
         assert other_process_sees() == "held"
     assert other_process_sees() == "free"
+
+
+# -- review fixes ---------------------------------------------------------------
+
+
+def _rust(body: str) -> str:
+    return f"pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> {{\n    {body}\n    Ok(x)\n}}\n"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A C raw string is raw: the backslash does not escape its closing quote.
+        'let _a = cr"\\"; std::process::exit(0); let _b = "";',
+        'let _a = cr#"\\"#; std::process::exit(0); let _b = "";',
+    ],
+)
+def test_scan_sees_past_c_raw_strings(body):
+    assert "forbidden construct" in rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=_rust(body)))
+
+
+def test_scan_allows_a_variable_named_like_a_macro():
+    for body in ("let env = 3; if env != 0 { }", "let asm = 1; let _ = asm!= 2;"):
+        assert rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=_rust(body))) is None
+
+
+def test_scan_rejects_recursion():
+    # A Rust stack overflow aborts the process: the driver, in local mode.
+    source = (
+        "fn depth(n: i64) -> i64 { if n <= 0 { 0 } else { 1 + depth(n - 1) } }\n"
+        "pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x.map(depth)) }\n"
+    )
+    rejected = rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source))
+    assert rejected and "recursive (depth)" in rejected
+    recursive_udf = _rust("let _ = udf(None);")
+    assert "recursive (udf)" in rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=recursive_udf))
+
+
+def test_scan_allows_helpers_and_same_named_methods():
+    source = (
+        "fn trim(s: &str) -> &str { s.trim() }\n"  # a method of the same name is not recursion
+        "fn len(s: &str) -> usize { str::len(s) }\n"  # nor a path call
+        "fn twice(n: i64) -> i64 { n * 2 }\n"
+        "pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> {\n"
+        '    let _ = (trim(" a "), len("b"));\n'
+        "    Ok(x.map(twice))\n"
+        "}\n"
+    )
+    assert rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source)) is None
+
+
+def test_stray_out_rs_never_shadows_java_in_a_job_without_rust(tmp_path):
+    (tmp_path / "OUT.rs").write_text(PLUS_ONE_RS, encoding="utf-8")
+    (tmp_path / "OUT.java").write_text("package ai_udf; public class A {}", encoding="utf-8")
+    assert parse_sandbox(tmp_path, targets=["catalyst", "java_udf"]).kind == "java_udf"
+    assert parse_sandbox(tmp_path, targets=["catalyst", "java_udf", "rust"]).kind == KIND_RUST
+    (tmp_path / "OUT.java").unlink()
+    with pytest.raises(BackendDecline, match="does not accept Rust"):
+        parse_sandbox(tmp_path, targets=["catalyst", "java_udf"])
+    (tmp_path / "OUT.rs").unlink()
+    # Rust on stdout is SQL-or-nothing for a job without Rust (and fails verification as SQL).
+    assert parse_sandbox(tmp_path, PLUS_ONE_RS, targets=["catalyst"]).kind == "catalyst"
+
+
+def test_cli_backend_passes_the_job_targets(tmp_path):
+    from ai_udf_transpile.backends.cli import CLAUDE_SPEC, CliBackend
+
+    def runner(argv, cwd, **kwargs):
+        (Path(cwd) / "OUT.rs").write_text(PLUS_ONE_RS, encoding="utf-8")
+        (Path(cwd) / "OUT.java").write_text("package ai_udf; public class A {}", encoding="utf-8")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    backend = CliBackend(CLAUDE_SPEC, runner=runner)
+    (tmp_path / "PROMPT.md").write_text("p", encoding="utf-8")
+    assert backend.run(_job(), tmp_path).kind == "java_udf"
+    assert backend.run(_job(targets=["catalyst", "java_udf", "rust"]), tmp_path).kind == KIND_RUST
+
+
+def test_unbuildable_memo_is_per_toolchain(probe, monkeypatch):
+    spark = _comet_session()
+    probe.outcome["returncode"] = 101
+    assert not rustc.rust_offered(spark, ["bigint"], "bigint")
+    assert probe.calls == ["metadata"]
+    # A different SDK source is a different toolchain: probed again at once.
+    probe.outcome["returncode"] = 0
+    conf.set_value(conf.RUST_COMET_SDK, '{ git = "https://example.invalid/comet", tag = "1.2.0" }')
+    assert rustc.rust_offered(spark, ["bigint"], "bigint")
+    assert probe.calls == ["metadata", "metadata"]
+
+
+def test_native_rows_switch_is_refcounted():
+    from ai_udf_transpile.verify import _comet_native_rows
+
+    class _RuntimeConf:
+        def __init__(self):
+            self.values = {}
+
+        def get(self, key, default=None):
+            return self.values.get(key, default)
+
+        def set(self, key, value):
+            self.values[key] = value
+
+        def unset(self, key):
+            self.values.pop(key, None)
+
+    spark = types.SimpleNamespace(conf=_RuntimeConf())
+    key = "spark.comet.convert.rdd.enabled"
+    outer = _comet_native_rows(spark, True)
+    inner = _comet_native_rows(spark, True)
+    outer.__enter__()
+    inner.__enter__()
+    assert spark.conf.get(key) == "true"
+    outer.__exit__(None, None, None)  # the first one out must not restore yet
+    assert spark.conf.get(key) == "true"
+    inner.__exit__(None, None, None)
+    assert key not in spark.conf.values  # the value from before the first one: unset
+    spark.conf.set(key, "false")
+    with _comet_native_rows(spark, True):
+        assert spark.conf.get(key) == "true"
+    assert spark.conf.get(key) == "false"
+
+
+def test_no_rust_twin_rows_are_never_offered_or_accept_rust(tmp_path):
+    from ai_udf_transpile.targets import NO_RUST_SUFFIX
+
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    cat.insert_pending(
+        udf_key="k",
+        source_text="def f(x: int) -> int:\n    return x + 1\n",
+        param_names=["x"],
+        input_types=["bigint"],
+        input_categories=["numeric"],
+        return_type="bigint",
+        spark_version="4.3.0" + NO_RUST_SUFFIX,
+        closure_fingerprint="",
+        captures={},
+    )
+    assert cat.claim("k", "stub")
+    process_row(cat, cat.get("k"), _RustBackend(), spark=None, verify_fn=lambda **k: (True, None))
+    row = cat.get("k")
+    assert row.status == "failed" and "cannot run Rust" in row.error

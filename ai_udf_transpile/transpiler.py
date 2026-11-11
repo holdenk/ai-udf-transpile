@@ -17,6 +17,7 @@ from ai_udf_transpile.keys import (
     func_from_spark_stack,
     udf_key,
 )
+from ai_udf_transpile.targets import NO_RUST_SUFFIX
 from ai_udf_transpile.types import (
     input_categories,
     input_spark_types,
@@ -134,6 +135,15 @@ def _reconstruct_rust(row: Any, return_type: Any, spark: Any) -> Any:
     return F.expr(rustc.call_expr(compiled.name, row.input_types)).cast(return_type)
 
 
+def _rust_elsewhere(row: Any, spark: Any) -> bool:
+    """A served Rust row this session could never attach (no target, no Comet)."""
+    if row.target_kind != "rust":
+        return False
+    from ai_udf_transpile.rustc import rust_unservable
+
+    return rust_unservable(spark) is not None
+
+
 def _spark_version(spark: Any) -> str:
     if spark is None:
         return "unknown"
@@ -213,6 +223,13 @@ def get_transpiler_class() -> type:
                 if catalog is None:
                     return None
                 kind, row = catalog.lookup(key, spark=spark)
+                if kind == HIT and row is not None and _rust_elsewhere(row, spark):
+                    # Verified as Rust by a session that runs Comet; this one
+                    # cannot. A twin key gets its own SQL/Java rewrite rather
+                    # than pin the UDF to Python here.
+                    version += NO_RUST_SUFFIX
+                    key = udf_key(source, params, in_types, out_type, version, fingerprint)
+                    kind, row = catalog.lookup(key, spark=spark)
                 if kind == HIT and row is not None:
                     try:
                         return _reconstruct_column(row, returnType, spark)

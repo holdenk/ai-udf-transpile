@@ -74,8 +74,22 @@ def comet(spark):
             spark.conf.set(_COMET_SHUFFLE, prior)
 
 
+_PY_TRANSPILERS = "spark.sql.experimental.optimizer.pyTranspilers"
+
+
 @pytest.fixture
-def rust_session(comet, sqlite_path):
+def py_transpilers(spark):
+    """Put pyTranspilers back the way the test found it (the session is shared)."""
+    prior = spark.conf.get(_PY_TRANSPILERS, None)
+    yield
+    if prior is None:
+        spark.conf.unset(_PY_TRANSPILERS)
+    else:
+        spark.conf.set(_PY_TRANSPILERS, prior)
+
+
+@pytest.fixture
+def rust_session(comet, sqlite_path, py_transpilers):
     """enable() with the rust target opted in and the worker driven by hand."""
     enable(comet, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
     comet.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
@@ -85,7 +99,6 @@ def rust_session(comet, sqlite_path):
     if override:
         conf.set_value(conf.RUST_BUILD_DIR, override)
     yield comet
-    comet.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "catalyst,ai")
 
 
 def _parquet(spark, tmp_path, rows, schema):
@@ -235,19 +248,16 @@ def test_end_to_end_string_udf(rust_session, tmp_path):
     assert {r[0] for r in df.select(served("s")).collect()} == {"cba", None, "bña"}
 
 
-def test_target_off_means_no_rust_is_asked_for_or_served(comet, sqlite_path, tmp_path):
+def test_target_off_means_no_rust_is_asked_for_or_served(comet, sqlite_path, tmp_path, py_transpilers):
     # Same UDF, same Comet session, rust NOT in targets: the fake's only
     # fixture is Rust, so it declines, and the UDF stays interpreted Python.
     enable(comet, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
     comet.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
-    try:
-        assert not UserDefinedFunction(collatz_steps, LongType()).transpiled
-        assert poll_once(get_catalog(), FakeBackend(), comet)
-        status, kind, _entry, error = _status(get_catalog())
-        assert status == "failed" and kind is None and "declined" in error
-        assert not UserDefinedFunction(collatz_steps, LongType()).transpiled
-    finally:
-        comet.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "catalyst,ai")
+    assert not UserDefinedFunction(collatz_steps, LongType()).transpiled
+    assert poll_once(get_catalog(), FakeBackend(), comet)
+    status, kind, _entry, error = _status(get_catalog())
+    assert status == "failed" and kind is None and "declined" in error
+    assert not UserDefinedFunction(collatz_steps, LongType()).transpiled
 
 
 def test_served_row_goes_back_to_python_when_the_target_is_switched_off(rust_session):
@@ -257,6 +267,35 @@ def test_served_row_goes_back_to_python_when_the_target_is_switched_off(rust_ses
     assert UserDefinedFunction(plus_one_rust, LongType()).transpiled
     conf.set_value(conf.TARGETS, "catalyst,java_udf")
     assert not UserDefinedFunction(plus_one_rust, LongType()).transpiled
+
+
+def test_a_session_without_rust_gets_its_own_rewrite_queued(rust_session):
+    # The Rust row is not this session's to serve; rather than pin the UDF to
+    # Python, a twin key (spark_version + NO_RUST_SUFFIX) is queued for a
+    # SQL/Java rewrite, and the worker never offers that row Rust.
+    from ai_udf_transpile.targets import NO_RUST_SUFFIX
+
+    spark = rust_session
+    catalog = get_catalog()
+    UserDefinedFunction(plus_one_rust, LongType())
+    assert poll_once(catalog, FakeBackend(), spark)
+    conf.set_value(conf.TARGETS, "catalyst,java_udf")
+    assert not UserDefinedFunction(plus_one_rust, LongType()).transpiled
+    rows = catalog._conn.execute(
+        "SELECT spark_version, status, target_kind FROM cache ORDER BY created_at"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0][1:] == ("success", "rust")
+    assert rows[1][0].endswith(NO_RUST_SUFFIX) and rows[1][1] == "pending"
+    # The fake's only answer for plus_one_rust is Rust, which the twin never accepts.
+    assert poll_once(catalog, FakeBackend(), spark)
+    twin = catalog._conn.execute(
+        "SELECT status, error FROM cache WHERE spark_version LIKE ?", (f"%{NO_RUST_SUFFIX}",)
+    ).fetchone()
+    assert twin[0] == "failed" and "does not accept" in twin[1]
+    # And the Comet-capable session still serves the original Rust row.
+    conf.set_value(conf.TARGETS, "catalyst,java_udf,rust")
+    assert UserDefinedFunction(plus_one_rust, LongType()).transpiled
 
 
 def test_register_impl_rust(rust_session, tmp_path):

@@ -38,6 +38,9 @@ choice above to (still exactly one):
   `std::thread`, `std::path`, `std::ffi`, `std::ptr`; `include!`,
   `include_str!`, `include_bytes!`, `env!`, `macro_rules!`; `#[path]`,
   `#[link]`, `#[no_mangle]`. A row function needs none of them.
+- No recursion (a function that calls itself is rejected): a Rust stack
+  overflow aborts the whole process instead of failing the query. Write the
+  loop. Every loop must terminate on every input, NULL and empty included.
 - A panic fails the query, and integer overflow panics (overflow checks are
   on). Python ints never overflow: where an intermediate can leave `i64`
   while the result still fits, widen to `i128`; where the result itself

@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import ast
+import functools
 import importlib
 import inspect
 import linecache
 import logging
 import re
 import textwrap
+import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
@@ -95,7 +97,7 @@ _FORBIDDEN_RUST = re.compile(
     # A macro can paste a module name into a path (`std::$m::read`), which
     # no token scan sees; a row function has no use for defining one.
     r"|\bmacro_rules\b"
-    r"|\b(?:include|include_str|include_bytes|env|option_env|asm|global_asm|concat_idents)\s*!"
+    r"|\b(?:include|include_str|include_bytes|env|option_env|asm|global_asm|concat_idents)\s*!(?!=)"
     r"|#\s*!?\s*\[\s*(?:path|link\w*|no_mangle|export_name|used|global_allocator|cfg_attr|proc_macro\w*)\b"
 )
 _PLACEHOLDER = re.compile(r"_udf_param_\d+")
@@ -301,7 +303,10 @@ def _java_for_forbidden_scan(java: str) -> str:
 # then reads as a string covering the call. Raw strings (`r#"..."#`) have no
 # escapes, and `'a` is a lifetime unless a closing quote follows one char.
 _RUST_CHAR = re.compile(r"b?'(?:[^'\\\n]|\\(?:u\{[^}\n]*\}|x[0-9a-fA-F]{2}|.))'")
-_RUST_RAW_START = re.compile(r'b?r(#*)"')
+# Raw strings: r"", byte br"", and C cr"" (stable since Rust 1.77). A
+# backslash in any of them is a plain character, so a raw string read as an
+# escaped one would run on past its closing quote and hide the code after it.
+_RUST_RAW_START = re.compile(r'[bc]?r(#*)"')
 
 
 def _rust_blank_literals(rust: str) -> str:
@@ -375,6 +380,56 @@ def _rust_for_forbidden_scan(rust: str) -> str:
     return _RUST_RAW_IDENT.sub("", _rust_blank_literals(rust))
 
 
+_RUST_FN = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
+
+
+def _rust_recursive_fn(scanned: str) -> Optional[str]:
+    """The first function that calls itself, in blanked source, if any.
+
+    A Rust stack overflow is not a panic: it aborts the process, and in
+    local mode that process is the driver. Deep enough input reaches any
+    recursion depth, so a recursive rewrite is refused. Direct recursion
+    only: mutual recursion and runaway loops are the prompt's to prevent.
+    """
+    for match in _RUST_FN.finditer(scanned):
+        name = match.group(1)
+        start = scanned.find("{", match.end())
+        if start < 0:
+            continue
+        depth, end = 0, start
+        while end < len(scanned):
+            if scanned[end] == "{":
+                depth += 1
+            elif scanned[end] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+        # A method (`s.trim()` inside `fn trim`) or a path (`str::trim`) is
+        # another item; a bare call is the function itself.
+        if re.search(rf"(?<![.\w:]){re.escape(name)}\s*\(", scanned[start:end]):
+            return name
+    return None
+
+
+@functools.lru_cache(maxsize=256)
+def _rust_rejected(rust: str) -> Optional[str]:
+    """Scan verdict for one Rust source; memoized, since every lookup re-checks a served row."""
+    scanned = _rust_for_forbidden_scan(rust)
+    if _FORBIDDEN_RUST.search(scanned):
+        return (
+            "rust rewrite uses a forbidden construct "
+            "(unsafe/extern/fs/process/net/env/io/clock/include!/env!/macro_rules!/#[path]/arrow)"
+        )
+    recursive = _rust_recursive_fn(scanned)
+    if recursive:
+        return (
+            f"rust rewrite is recursive ({recursive}): a stack overflow aborts the "
+            "process instead of failing the query"
+        )
+    return None
+
+
 def rejected_rewrite(result: Any) -> Optional[str]:
     """Return an error if the rewrite must not be compiled or executed.
 
@@ -389,11 +444,8 @@ def rejected_rewrite(result: Any) -> Optional[str]:
         return "rewrite invokes reflect or java_method"
     if _FORBIDDEN_JAVA.search(_java_for_forbidden_scan(java)):
         return "java rewrite uses a forbidden API (Runtime/ProcessBuilder/reflection/exec/io/net/script)"
-    if _FORBIDDEN_RUST.search(_rust_for_forbidden_scan(rust)):
-        return (
-            "rust rewrite uses a forbidden construct "
-            "(unsafe/extern/fs/process/net/env/io/clock/include!/env!/macro_rules!/#[path]/arrow)"
-        )
+    if rust:
+        return _rust_rejected(rust)
     return None
 
 
@@ -674,6 +726,8 @@ def _row_values(args: tuple) -> dict[str, Any]:
 
 
 _COMET_RDD_CONVERT = "spark.comet.convert.rdd.enabled"
+_NATIVE_ROWS_LOCK = threading.Lock()
+_NATIVE_ROWS: dict[str, Any] = {"depth": 0}
 
 
 @contextmanager
@@ -689,15 +743,25 @@ def _comet_native_rows(spark: Any, native: bool):
     if not native:
         yield
         return
-    prior = spark.conf.get(_COMET_RDD_CONVERT, None)
-    spark.conf.set(_COMET_RDD_CONVERT, "true")
+    # Refcounted: overlapping verifications (the inline worker and a
+    # register_impl call) must restore the value from before the FIRST one,
+    # not whatever the other had set.
+    with _NATIVE_ROWS_LOCK:
+        if _NATIVE_ROWS["depth"] == 0:
+            _NATIVE_ROWS["prior"] = spark.conf.get(_COMET_RDD_CONVERT, None)
+            spark.conf.set(_COMET_RDD_CONVERT, "true")
+        _NATIVE_ROWS["depth"] += 1
     try:
         yield
     finally:
-        if prior is None:
-            spark.conf.unset(_COMET_RDD_CONVERT)
-        else:
-            spark.conf.set(_COMET_RDD_CONVERT, prior)
+        with _NATIVE_ROWS_LOCK:
+            _NATIVE_ROWS["depth"] -= 1
+            if _NATIVE_ROWS["depth"] == 0:
+                prior = _NATIVE_ROWS.pop("prior", None)
+                if prior is None:
+                    spark.conf.unset(_COMET_RDD_CONVERT)
+                else:
+                    spark.conf.set(_COMET_RDD_CONVERT, prior)
 
 
 def _eval_sql(

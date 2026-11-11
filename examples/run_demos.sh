@@ -158,7 +158,9 @@ run_demo "multi-model" examples/demo_multi_model.py
 # The rust target needs a live Comet; with a jar configured its rows land in
 # the same cache, so the dump and the catalog bench cover them too.
 if [ -n "${AI_UDF_TRANSPILE_COMET_JAR:-}" ] || [ -n "${COMET_JAR:-}" ]; then
-  run_demo "rust udf (comet)" examples/demo_rust_udf.py
+  # Skips (exit 0) without cargo or comet-udf-sdk: a jar set only for the
+  # --rust-accel SQL arms must not turn the whole run red.
+  run_demo "rust udf (comet)" examples/demo_rust_udf.py --skip-if-unavailable
 fi
 [ "$LIVE" -eq 1 ] && run_demo "live backends" examples/demo_live_backends.py
 if [ "$BENCH" -eq 1 ]; then

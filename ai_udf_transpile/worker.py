@@ -20,7 +20,7 @@ from ai_udf_transpile.backends import get_backend
 from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.catalog import Catalog, configured_tolerance, open_catalog, publish_verified
 from ai_udf_transpile.sandbox import make_sandbox
-from ai_udf_transpile.targets import KIND_RUST, TranspileResult
+from ai_udf_transpile.targets import KIND_RUST, NO_RUST_SUFFIX, TranspileResult
 from ai_udf_transpile.verify import (
     hypothesis_check,
     rejected_rewrite,
@@ -57,6 +57,10 @@ def _reported_model(backend: Any) -> Optional[str]:
         return None
 
 
+def _no_rust_row(row: Any) -> bool:
+    return (getattr(row, "spark_version", "") or "").endswith(NO_RUST_SUFFIX)
+
+
 def _rust_offered(spark: Any, input_types: list[str], return_type: str) -> bool:
     """Ask for Rust only where this session could build, verify and serve it."""
     if spark is None:
@@ -74,6 +78,8 @@ def _rust_refusal(spark: Any, result: TranspileResult, row: Any) -> Optional[str
     """Why a Rust rewrite cannot be taken here (never asked for, or not runnable)."""
     if result.kind != KIND_RUST:
         return None
+    if _no_rust_row(row):
+        return "rust rewrite for a row that exists because its session cannot run Rust"
     from ai_udf_transpile.rustc import rust_unservable, supports_types
 
     if not supports_types(row.input_types, row.return_type):
@@ -110,7 +116,7 @@ def process_row(
             origin = "human"
         else:
             job = row.as_job()
-            if _rust_offered(spark, job.input_types, job.return_type):
+            if not _no_rust_row(row) and _rust_offered(spark, job.input_types, job.return_type):
                 job.targets = [*job.targets, KIND_RUST]
             with make_sandbox(job, inputs=conf.get_value(conf.AI_REPRESENTATION, spark)) as sandbox:
                 result = backend.run(job, sandbox)

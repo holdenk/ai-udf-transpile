@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -176,10 +177,15 @@ RUST_TWINS = {
 }
 
 
+_NATIVE_DIR: list[str] = []
+
+
 def _native(spark, sample):
-    """``sample`` as a parquet scan, which Comet reads natively."""
-    path = os.path.join(tempfile.mkdtemp(prefix="ai-udf-bench-rust-"), "sample")
-    sample.coalesce(1).write.parquet(path)
+    """``sample`` as a parquet scan, which Comet reads natively (one dir per run, removed at exit)."""
+    if not _NATIVE_DIR:
+        _NATIVE_DIR.append(tempfile.mkdtemp(prefix="ai-udf-bench-rust-"))
+    path = tempfile.mkdtemp(dir=_NATIVE_DIR[0])
+    sample.coalesce(1).write.mode("overwrite").parquet(path)
     return spark.read.parquet(path)
 
 
@@ -641,6 +647,8 @@ def main() -> int:
 
     shutdown()
     spark.stop()
+    if _NATIVE_DIR:
+        shutil.rmtree(_NATIVE_DIR[0], ignore_errors=True)
 
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
