@@ -166,3 +166,41 @@ def test_aggregate_routes_kind_labeled_rows_to_the_ai_arms(tmp_path):
     assert points["ai_catalyst_comet"] == [("fhi/sql_two", 9.0)]
     assert points["transpiled"] == [] and points["vanilla"] == []
     assert module.collect([tmp_path / "bench_fhi_arms.csv"])["ai_catalyst"] == [("fhi arms/f", 1.5)]
+
+
+def test_aggregate_reads_the_regen_names_and_the_catalog_bench(tmp_path):
+    # regen_examples_doc.sh names its CSVs examples_transpiled_bench*.csv, and
+    # its widest one is bench_catalog's: one arm per row, by target_kind.
+    with open(tmp_path / "examples_transpiled_bench_catalog.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "function",
+                "rows",
+                "python_rows_per_second",
+                "transpiled_rows_per_second",
+                "transpiled_speedup_vs_python",
+                "comet_rows_per_second",
+                "comet_speedup_vs_python",
+                "status",
+                "target_kind",
+                "backend",
+                "model",
+            ]
+        )
+        w.writerow(["sql_fn", 1000, 1, 3, 3.0, 6, 6.0, "success", "catalyst", "claude", "m"])
+        w.writerow(["java_fn", 1000, 1, 2, 2.0, "", "", "success", "java_udf", "claude", "m"])
+        w.writerow(["rust_fn", 1000, 1, 20, 20.0, "", "", "success", "rust", "claude", "m"])
+        w.writerow(["declined", 1000, 1, "", "", "", "", "failed", "", "claude", "m"])
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), str(tmp_path), "--png", str(tmp_path / "agg.png")],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = {line.split("  ")[0]: line for line in proc.stdout.splitlines()}
+    assert "1 points, best 3.0x" in lines["AI: Catalyst SQL"]
+    assert "1 points, best 6.0x" in lines["AI: Catalyst SQL, Comet"]
+    assert "1 points, best 2.0x" in lines["AI: Java UDF"]
+    assert "1 points, best 20.0x" in lines["AI: Rust UDF (Comet native)"]
+    assert "transpiled (tpcds patterns)" not in proc.stdout  # not misread as the tpcds schema

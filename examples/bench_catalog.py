@@ -333,6 +333,9 @@ def main() -> int:
             "target_kind": row.target_kind or "",
             "backend": row.backend or "",
             "model": row.model or "",
+            # Two rows can share a function name (a rust row and the "+no-rust"
+            # twin a non-Comet session queued): the key tells them apart.
+            "udf_key": row.udf_key,
         }
         out[row.udf_key] = entry
         if values is None or func is None:

@@ -323,6 +323,19 @@ def test_perf_lines_unit(tmp_path):
     )
     perf = _load_dump_module()._perf_lines([str(rust_cat)])
     assert perf["collatz_steps"]["ai"] == "6.0M rows/s (20.0x vs python, Comet native)"
+    # A rust row and its no-rust twin share a name: each keeps its own numbers by udf_key.
+    twins = tmp_path / "twins.csv"
+    twins.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,udf_key\n"
+        "collatz_steps,1000,300000,600000,2.0,,,success,java_udf,claude,m,kjava\n"
+        "collatz_steps,1000,300000,6000000,20.0,,,success,rust,claude,m,krust\n",
+        encoding="utf-8",
+    )
+    perf = _load_dump_module()._perf_lines([str(twins)])
+    assert perf["kjava"]["ai"] == "600k rows/s (2.0x vs python)"
+    assert perf["krust"]["ai"] == "6.0M rows/s (20.0x vs python, Comet native)"
     # micro: a rust twin gets its own section key, like the java twin
     rust_micro = tmp_path / "rust_micro.csv"
     rust_micro.write_text(
