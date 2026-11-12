@@ -342,3 +342,47 @@ def test_register_impl_rust_needs_the_target(comet, sqlite_path):
 
 def _only_key(catalog) -> str:
     return catalog._conn.execute("SELECT udf_key FROM cache").fetchone()[0]
+
+
+# A loop that outlives the deadline by far, yet ends on its own: about 20
+# billion iterations in all, shared by every row of the batch, so the
+# cancelled task thread stops spinning well before the rest of the run.
+_SLOW_RS = """use std::sync::atomic::{AtomicU64, Ordering};
+static CHUNKS: AtomicU64 = AtomicU64::new(0);
+pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> {
+    while CHUNKS.fetch_add(1, Ordering::Relaxed) < 20_000 {
+        let mut i: u64 = 0;
+        while i < 1_000_000 {
+            i = std::hint::black_box(i + 1);
+        }
+    }
+    Ok(x.map(|v| v + 1))
+}
+"""
+
+
+def test_a_candidate_that_never_finishes_fails_verification_in_time(rust_session):
+    """CodeRabbit: a non-terminating native loop held verification, and the worker, forever."""
+    import time
+
+    conf.set_value(conf.VERIFY_QUERY_TIMEOUT, "2", rust_session)
+    try:
+        start = time.monotonic()
+        ok, err = hypothesis_check(
+            source_text=canonical_source_from_func(plus_one_rust),
+            captures={},
+            result=TranspileResult(kind=KIND_RUST, rust_source=_SLOW_RS),
+            input_types=["bigint"],
+            return_type="bigint",
+            spark=rust_session,
+            max_examples=4,
+            func=plus_one_rust,
+        )
+        elapsed = time.monotonic() - start
+    finally:
+        conf.set_value(conf.VERIFY_QUERY_TIMEOUT, conf.DEFAULTS[conf.VERIFY_QUERY_TIMEOUT], rust_session)
+    assert ok is False and "longer than 2s" in err
+    # One deadline, not one per example: a timeout is never retried row by row.
+    assert elapsed < 60, elapsed
+    # The batch ran in one partition, so the session still has a free core.
+    assert rust_session.range(3).count() == 3

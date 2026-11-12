@@ -22,8 +22,24 @@ with cargo against the Comet SDK of the session's jar (or `$COMET_HOME`),
 caches it by content, and registers it. Verification runs the built library
 through Comet on the same Hypothesis inputs as the other targets. A scan
 refuses `unsafe`, FFI, filesystem/process/network/env access, include
-macros, `#[path]`, `use` aliases that hide those, and recursion (a Rust stack
-overflow aborts the process).
+macros, `#[path]`, and `use` aliases that hide those.
+
+**A stack overflow aborts the process** (the driver, in local mode), so the
+scan also refuses whatever can overflow the stack. That covers recursion by
+name through helpers, methods, paths, aliases and function values; trait
+impls, `dyn` and `std::any`; recursive types; and more than 256 KB of
+arrays. Three adversarial rounds shaped those rules. A bypass counted only
+if rustc compiled it and the binary really overflowed its stack: 6, then 4,
+then 35 variants of 3 more shapes, all now tests in `tests/test_rust_target.py`.
+59 realistic non-recursive rewrites written by the attackers pass, except
+methods named after a std method they call on a parameter (`fn parse`
+calling `p.parse()`), which the error message asks the model to rename.
+
+**Verification has a deadline** (`verifyQueryTimeoutSeconds`, 300): a
+Java or Rust candidate whose loop never ends fails verification instead of
+hanging the worker. The task thread cannot be stopped mid-row, so in local
+mode it keeps one core busy (native batches run in one partition so it is
+one).
 
 **Numbers.** From `examples/demo_rust_udf.py` (2M rows, native range, Comet
 1.2.0): `collatz_steps` 20.5x and `is_prime` 16.8x over the interpreted UDF,

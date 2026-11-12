@@ -281,6 +281,7 @@ All under `spark.sql.experimental.aiUdfTranspile.`:
 | `rust.cargo` | `cargo` | the cargo binary |
 | `rust.buildTimeoutSeconds` | `900` | per cargo invocation |
 | `rust.sharedBuildDir` | `false` | `true` = `rust.buildDir` is the same path on every executor; serve on non-local masters |
+| `verifyQueryTimeoutSeconds` | `300` | each verification query is cancelled after this; a Java/Rust candidate that never terminates fails verification (its task thread keeps a core busy in local mode) |
 
 **The one place this plugin is not fail-open.** Spark cannot evaluate a Comet
 native UDF. Where Comet does not take the operator holding the call, the

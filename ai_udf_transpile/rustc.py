@@ -423,10 +423,12 @@ def resolve_sdk(spark: Any = None) -> SdkSpec:
 
 def build_dir(spark: Any = None) -> Path:
     configured = conf.get_value(conf.RUST_BUILD_DIR, spark, "").strip()
+    # Absolute: cargo runs inside the generated crate and resolves a relative
+    # CARGO_TARGET_DIR against that, not against the driver's directory.
     if configured:
-        return Path(configured).expanduser()
+        return Path(configured).expanduser().absolute()
     cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return Path(cache) / "ai_udf_transpile" / "rust"
+    return (Path(cache) / "ai_udf_transpile" / "rust").absolute()
 
 
 def _cargo(spark: Any = None) -> str:

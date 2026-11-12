@@ -67,6 +67,7 @@ from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, rustc, shutdown  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
+from ai_udf_transpile.targets import NO_RUST_SUFFIX  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
@@ -222,6 +223,12 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
             if not (entry["transpiled_rows_per_second"] or rust):
                 continue
             name = entry["function"]
+            if row.spark_version.endswith(NO_RUST_SUFFIX):
+                # This session can run Rust, so the function's source resolves
+                # to its Rust row: timing it here would credit the twin with
+                # the Rust rewrite's number.
+                print(f"{name}: no-Rust twin -- this session serves the Rust row; not benched under Comet")
+                continue
             if rust and _values_for(row.input_types) is None:
                 print(f"{name}: no sample for {row.input_types}; rust row not benched")
                 continue
@@ -356,7 +363,9 @@ def main() -> int:
         spark.conf.set(TRANSPILE_CONF, "true")
         if row.status == "success":
             udf = UserDefinedFunction(func, rtype)
-            if not udf.transpiled and row.target_kind == "rust":
+            if row.target_kind == "rust":
+                # Never served here: what this session serves for the function
+                # is its no-Rust twin (if one is filled), whose number is the twin's.
                 print(f"{name}: rust rewrite -- runs only under Comet; benched in the comet phase")
             elif not udf.transpiled:
                 print(f"{name}: transpiled arm not served (no hit) -- python only")

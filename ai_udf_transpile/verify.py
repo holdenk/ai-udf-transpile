@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import functools
 import importlib
 import inspect
@@ -595,6 +596,201 @@ def _rust_std_receiver(before: str, fields: set[str]) -> bool:
     return not tail[i:].strip()
 
 
+def _rust_alias_resolver(scanned: str):
+    """A function mapping a ``use .. as`` alias (chains included) to the name it renames."""
+    aliases = {}
+    for use in _RUST_USE.finditer(scanned):
+        for target, alias in re.findall(r"([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)", use.group(0)):
+            aliases[alias] = target
+
+    def resolve(name: str) -> str:
+        for _ in range(len(aliases) + 1):
+            if name not in aliases or aliases[name] == name:
+                return name
+            name = aliases[name]
+        return name
+
+    return resolve
+
+
+_RUST_PRIM_SIZE = {
+    "i8": 1, "u8": 1, "bool": 1, "i16": 2, "u16": 2, "i32": 4, "u32": 4, "f32": 4, "char": 4,
+    "i64": 8, "u64": 8, "f64": 8, "isize": 8, "usize": 8, "i128": 16, "u128": 16,
+}  # fmt: skip
+# Anything else (String, Vec, Box, Option<..> of those, references) is a few
+# words on the stack; its contents live on the heap.
+_RUST_OTHER_SIZE = 24
+# What one rewrite may put on the stack, all arrays and local values together.
+# Executor task threads often get 1 MB; a lookup table is a few KB.
+_RUST_STACK_BUDGET = 256 * 1024
+_RUST_INFINITE = float("inf")
+
+
+def _rust_const_value(expr: str, consts: dict[str, str], depth: int = 0) -> float:
+    """An array length as a number: literals, + - * / % << >> ( ), and consts."""
+    if depth > 8:
+        return _RUST_INFINITE
+    text = re.sub(r"(?<=\d)_(?=\d)", "", expr)
+    text = re.sub(r"\b(\d+)(?:usize|u\d+|i\d+|isize)\b", r"\1", text)
+
+    def const(m: re.Match) -> str:
+        name = m.group(0)
+        if name in consts:
+            value = _rust_const_value(consts[name], consts, depth + 1)
+            return "1e30" if value == _RUST_INFINITE else str(int(value))
+        return "@"  # unknown name: not sizable
+
+    text = re.sub(r"\b[A-Za-z_]\w*\b", const, text)
+    if "@" in text or not re.fullmatch(r"[\d\s+\-*/%<>()e.]*", text):
+        return _RUST_INFINITE
+    try:
+        value = eval(text.replace("/", "//"), {"__builtins__": {}}, {})  # noqa: S307 -- digits and operators only
+    except Exception:
+        return _RUST_INFINITE
+    return float(value) if value >= 0 else _RUST_INFINITE
+
+
+def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Optional[str]:
+    """Why the source may need more stack than ``_RUST_STACK_BUDGET``, if it may.
+
+    Counts every array type or repeat expression (``[T; N]``, ``[x; N]``,
+    nested ones multiplied) and every mention of a local type in a function
+    body at its size. Over-counts on purpose: a type definition and its uses
+    both count.
+    """
+    consts = {
+        m.group(1): m.group(2)
+        for m in re.finditer(r"\bconst\s+([A-Za-z_]\w*)\s*:[^=;]*=\s*([^;]*);", scanned)
+    }
+    sizes: dict[str, float] = {}
+
+    def type_size(text: str, seen: frozenset = frozenset()) -> float:
+        text = text.strip()
+        if not text:
+            return 0
+        if text.startswith(("&", "*", "fn")):
+            return 8
+        if text.startswith("["):
+            return bracket_size(text[1 : _rust_close(text, 0)], seen)
+        if text.startswith("("):
+            return sum(type_size(p, seen) for p in _rust_split_top(text[1 : _rust_close(text, 0)]))
+        m = re.match(r"(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)", text)
+        name = resolve(m.group(1)) if m else ""
+        if name in _RUST_PRIM_SIZE:
+            return _RUST_PRIM_SIZE[name]
+        if name in types and name not in seen:
+            return local_size(name, seen | {name})
+        return _RUST_OTHER_SIZE
+
+    def local_size(name: str, seen: frozenset) -> float:
+        if name not in sizes:
+            body = types[name]
+            fields = [
+                re.sub(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?[A-Za-z_]\w*\s*:(?!:)", "", f, count=1)
+                for f in _rust_split_top(_rust_inner(body))
+            ]
+            # A struct is the sum of its fields; an enum is at least its largest
+            # variant, which the sum bounds from above.
+            sizes[name] = sum(type_size(f, seen) for f in fields) or _RUST_OTHER_SIZE
+        return sizes[name]
+
+    def bracket_size(inner: str, seen: frozenset = frozenset()) -> float:
+        parts = _rust_split_semicolon(inner)
+        if len(parts) != 2:
+            return 0  # a slice type, an index, or an array literal: no repeat
+        elem, length = parts
+        n = _rust_const_value(length, consts)
+        if n == _RUST_INFINITE:
+            return _RUST_INFINITE
+        nested = [bracket_size(elem[i + 1 : _rust_close(elem, i)], seen) for i in _rust_top_brackets(elem)]
+        if nested:
+            each = max(nested)
+        else:
+            words = [resolve(w) for w in re.findall(r"[A-Za-z_]\w*", elem)]
+            local = [w for w in words if w in types]
+            prim = [_RUST_PRIM_SIZE[w] for w in words if w in _RUST_PRIM_SIZE]
+            each = max([local_size(w, seen | {w}) for w in local] + prim or [8])
+        return n * each
+
+    def occurrences(text: str):
+        """Every array to count: ``vec![x; n]`` is heap, but an array inside it is not."""
+        for i in _rust_top_brackets(text):
+            inner = text[i + 1 : _rust_close(text, i)]
+            if re.search(r"\bvec\s*!\s*$", text[:i]):
+                yield from occurrences(inner)
+            else:
+                yield inner
+
+    total = 0.0
+    for inner in occurrences(scanned):
+        total += bracket_size(inner)
+        if total == _RUST_INFINITE:
+            return (
+                "rust rewrite has an array whose length this check cannot size (use "
+                "integer literals or consts): a large array on the stack overflows it"
+            )
+    for name, _, name_end, end in _rust_fn_bodies(scanned):
+        for word in re.findall(r"[A-Za-z_]\w*", scanned[name_end:end]):
+            if resolve(word) in types:
+                total += local_size(resolve(word), frozenset({resolve(word)}))
+    if total > _RUST_STACK_BUDGET:
+        return (
+            f"rust rewrite may put about {int(total) // 1024} KB on the stack (arrays and "
+            f"local values; at most {_RUST_STACK_BUDGET // 1024} KB): a stack overflow aborts "
+            "the process; put large buffers in a Vec"
+        )
+    return None
+
+
+def _rust_close(text: str, i: int) -> int:
+    """Index of the bracket closing the ``[``/``(`` at ``i`` (or the end)."""
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] in "([{":
+            depth += 1
+        elif text[j] in ")]}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(text)
+
+
+def _rust_top_brackets(text: str) -> list[int]:
+    """Start of every outermost ``[..]`` in ``text`` (nested ones are their contents)."""
+    out, i = [], 0
+    while True:
+        i = text.find("[", i)
+        if i < 0:
+            return out
+        out.append(i)
+        i = _rust_close(text, i) + 1
+
+
+def _rust_split_semicolon(text: str) -> list[str]:
+    """``text`` split at ``;`` outside any bracket."""
+    parts, depth, last = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            parts.append(text[last:i])
+            last = i + 1
+    parts.append(text[last:])
+    return parts
+
+
+def _rust_inner(body: str) -> str:
+    """The text inside the first ``{..}`` or ``(..)`` of a type definition."""
+    for i, ch in enumerate(body):
+        if ch in "{(":
+            return body[i + 1 : _rust_close(body, i)]
+        if ch == ";":
+            break
+    return body
+
+
 def _rust_impl_target(header: str) -> Optional[str]:
     """``S`` from an inherent ``impl<..> S<..>`` header (after the keyword)."""
     text = header.lstrip()
@@ -665,14 +861,16 @@ def _rust_recursion(scanned: str) -> Optional[str]:
             )
     # A recursive type (`struct Node { next: Option<Box<Node>> }`) recurses
     # with no function at all: dropping, cloning or comparing a long chain
-    # overflows inside std's glue.
+    # overflows inside std's glue. `Self` and `use .. as` aliases name it too.
     types = {
         m.group(2): scanned[m.end() : _rust_item_end(scanned, m.end())]
         for m in _RUST_TYPE_ITEM.finditer(scanned)
         if m.group(1) != "mod"
     }
+    resolve = _rust_alias_resolver(scanned)
     type_edges = {
-        name: {other for other in types if re.search(rf"\b{re.escape(other)}\b", text)}
+        name: {resolve(w) for w in re.findall(r"[A-Za-z_]\w*", text) if resolve(w) in types}
+        | ({name} if re.search(r"\bSelf\b", text) else set())
         for name, text in types.items()
     }
     for node in sorted(types):
@@ -689,6 +887,11 @@ def _rust_recursion(scanned: str) -> Optional[str]:
             if cur not in seen:
                 seen.add(cur)
                 stack.extend(type_edges.get(cur, ()))
+    # No recursion is needed to overflow: one big array on the stack does it
+    # (`let mut counts = [0u32; 1 << 20];` is 4 MB, the stack 1-8 MB).
+    big = _rust_stack_estimate(scanned, types, resolve)
+    if big:
+        return big
     statics = []  # (start, end) of every static/const item
     for match in _RUST_STATIC.finditer(scanned):
         before = scanned[: match.start()].rstrip()
@@ -1145,6 +1348,59 @@ def _comet_native_rows(spark: Any, native: bool):
                     spark.conf.set(_COMET_RDD_CONVERT, state["prior"])
 
 
+class VerifyQueryTimeout(RuntimeError):
+    """A verification query ran past ``verifyQueryTimeoutSeconds`` and was cancelled."""
+
+
+@contextlib.contextmanager
+def _query_deadline(spark: Any):
+    """Cancel the Spark jobs started inside after ``verifyQueryTimeoutSeconds``.
+
+    A candidate whose loop never ends (Java or Rust; SQL cannot loop) would
+    otherwise hold verification, and the worker, forever. Cancelling the job
+    group fails the driver's ``collect()`` at once. The task thread itself
+    cannot be stopped mid-row -- a JVM loop ignores the interrupt until it
+    returns, native code never sees it -- so in local mode it keeps one core
+    busy until the process exits. That costs a core; a hang costs the worker.
+    """
+    import threading
+    import uuid
+
+    from ai_udf_transpile import conf
+
+    seconds = conf.get_float(conf.VERIFY_QUERY_TIMEOUT, spark, 300.0)
+    sc = getattr(spark, "sparkContext", None)
+    if seconds <= 0 or sc is None:
+        yield
+        return
+    keys = ("spark.jobGroup.id", "spark.job.description", "spark.job.interruptOnCancel")
+    prior = {k: sc.getLocalProperty(k) for k in keys}
+    group = f"ai-udf-verify-{uuid.uuid4().hex}"
+    fired = threading.Event()
+
+    def cancel() -> None:
+        fired.set()
+        sc.cancelJobGroup(group)
+
+    sc.setJobGroup(group, "ai_udf_transpile verification", interruptOnCancel=True)
+    timer = threading.Timer(seconds, cancel)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    except Exception as exc:
+        if fired.is_set():
+            raise VerifyQueryTimeout(
+                f"verification query ran longer than {seconds:g}s and was cancelled "
+                "(a loop that does not terminate on this input?)"
+            ) from exc
+        raise
+    finally:
+        timer.cancel()
+        for key, value in prior.items():
+            sc.setLocalProperty(key, value)
+
+
 def _eval_sql(
     spark: Any, sql: str, args: tuple, input_types: list[str], return_type: str, native: bool = False
 ):
@@ -1152,7 +1408,7 @@ def _eval_sql(
     from pyspark.sql.types import StructType
 
     df = spark.createDataFrame([Row(**_row_values(args))], StructType(_param_fields(input_types)))
-    with _comet_native_rows(spark, native):
+    with _comet_native_rows(spark, native), _query_deadline(spark):
         value = df.selectExpr(f"({sql}) AS result").collect()[0][0]
     if not _representable(value, return_type):
         # Production always casts the result; verify did not. A value that
@@ -1180,10 +1436,14 @@ def _eval_sql_batch(
         values = {"_batch_id": idx}
         values.update(_row_values(args))
         data.append(Row(**values))
-    df = spark.createDataFrame(data, StructType(fields))
-    if not native:
-        df = df.orderBy("_batch_id")
-    with _comet_native_rows(spark, native):
+    if native:
+        # One partition: a candidate that never terminates spins one task
+        # thread per partition it runs in, and a cancelled native task cannot
+        # be stopped -- one core lost per runaway candidate, not all of them.
+        df = spark.createDataFrame(spark.sparkContext.parallelize(data, 1), StructType(fields))
+    else:
+        df = spark.createDataFrame(data, StructType(fields)).orderBy("_batch_id")
+    with _comet_native_rows(spark, native), _query_deadline(spark):
         collected = df.selectExpr("_batch_id", f"({sql}) AS result").collect()
     by_id = {int(record[0]): record[1] for record in collected}
     return [by_id[i] for i in range(len(rows))]
@@ -1468,12 +1728,20 @@ def hypothesis_check(
         args_list = [item[0] for item in batch]
         try:
             sql_values = _eval_sql_batch(spark, eval_expr, args_list, input_types, native)
+        except VerifyQueryTimeout as exc:
+            # Not a per-row error to retry: each retry would leave one more
+            # task thread spinning and wait out the deadline again.
+            mismatch.append(str(exc))
+            return
         except Exception:
             logger.debug("sql batch of %d failed; retrying per row", len(batch), exc_info=True)
             for args, py_value, py_exc in batch:
                 try:
                     sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type, native)
                     _judge(args, py_value, py_exc, sql_value, None)
+                except VerifyQueryTimeout as exc:
+                    mismatch.append(f"{exc} on {args!r}")
+                    return
                 except Exception as exc:
                     _judge(args, py_value, py_exc, _SENTINEL_RAISED, exc)
             return

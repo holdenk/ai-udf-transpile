@@ -1303,6 +1303,31 @@ def test_native_rows_state_is_per_session():
             "enum A { Leaf, More(Vec<B>) }\nstruct B { a: A }\n" + _udf("Ok(x)"),
             "recursive type",
         ),
+        # Third round: a recursive type named through `use .. as` or `Self`.
+        (
+            "use self::Node as Link;\nstruct Node { next: Option<Box<Link>> }\n" + _udf("Ok(x)"),
+            "recursive type (Node)",
+        ),
+        (
+            "use self::A as A1;\nuse self::A1 as Far;\n"
+            "struct A { b: Option<Box<B>> }\nstruct B { a: Option<Box<Far>> }\n" + _udf("Ok(x)"),
+            "recursive type",
+        ),
+        ("struct Node { next: Option<Box<Self>> }\n" + _udf("Ok(x)"), "recursive type (Node)"),
+        ("enum List { Cons(i64, Box<Self>), Nil }\n" + _udf("Ok(x)"), "recursive type (List)"),
+        # No recursion at all: one big array on the stack.
+        (_udf("let mut counts = [0u32; 1 << 20]; counts[0] = 1; Ok(x)"), "KB on the stack"),
+        (_udf("let v = vec![[0u8; 30_000_000]; 1]; Ok(x.map(|n| n + v[0][0] as i64))"), "KB on the stack"),
+        (
+            "const N: usize = 1 << 22;\n" + _udf("let a = [0u8; N]; Ok(x.map(|n| n + a[0] as i64))"),
+            "KB on the stack",
+        ),
+        (
+            "struct Big { a: [i64; 16_384] }\n"
+            + _udf("let p = [Big { a: [0; 16_384] }, Big { a: [0; 16_384] }]; Ok(x.map(|n| n + p[1].a[0]))"),
+            "KB on the stack",
+        ),
+        (_udf("let a = [0u8; x.unwrap_or(0) as usize]; Ok(x)"), "cannot size"),
         ("pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x) }\n" + " " * 20_001, "too long"),
     ],
 )
@@ -1346,6 +1371,12 @@ def test_scan_rejects_adversarial_recursion(source, reason):
         "    let mut t = [0u32; 4]; let mut i = 0; while i < 4 { t[i] = i as u32 * 3; i += 1; } t\n"
         "}\n"
         "const TABLE: [u32; 4] = table();\n" + _udf("Ok(x.map(|v| v + TABLE[(v & 3) as usize] as i64))"),
+        # Heap buffers and small tables are fine; only the stack is bounded.
+        "const TABLE_LEN: usize = 256;\nstatic CRC: [u32; TABLE_LEN] = [0; TABLE_LEN];\n"
+        + _udf(
+            "let v = vec![0u8; 30_000_000]; let small = [[0i64; 64]; 64]; let bytes = [0u8; 40_000];\n"
+            "Ok(x.map(|n| n + v[0] as i64 + small[0][0] + bytes[0] as i64 + CRC[0] as i64))"
+        ),
         # An enum variant named `Any`; `use std::cmp::max` beside a method `max`.
         "enum Tok { Any, Lit(char) }\n"
         "use std::cmp::max;\n"
@@ -1386,3 +1417,71 @@ def test_scan_corpus_of_realistic_rewrites_compiles_and_passes(tmp_path):
             text=True,
         )
         assert out.returncode == 0, (source, out.stderr)
+
+
+# -- verification deadline -------------------------------------------------------
+
+
+class _FakeSc:
+    def __init__(self):
+        self.props = {"spark.jobGroup.id": "outer"}
+        self.cancelled = []
+
+    def getLocalProperty(self, key):
+        return self.props.get(key)
+
+    def setLocalProperty(self, key, value):
+        if value is None:
+            self.props.pop(key, None)
+        else:
+            self.props[key] = value
+
+    def setJobGroup(self, group, description, interruptOnCancel=False):
+        self.props.update(
+            {"spark.jobGroup.id": group, "spark.job.interruptOnCancel": str(interruptOnCancel).lower()}
+        )
+
+    def cancelJobGroup(self, group):
+        self.cancelled.append(group)
+
+
+def test_query_deadline_cancels_a_query_that_never_ends(monkeypatch):
+    """A candidate whose loop never terminates fails verification instead of hanging it."""
+    import time
+
+    from ai_udf_transpile import verify
+
+    monkeypatch.setitem(conf._RUNTIME, conf.VERIFY_QUERY_TIMEOUT, "0.2")
+    sc = _FakeSc()
+    spark = types.SimpleNamespace(sparkContext=sc)
+    start = time.monotonic()
+    with pytest.raises(verify.VerifyQueryTimeout, match="longer than 0.2s"):
+        with verify._query_deadline(spark):
+            group = sc.props["spark.jobGroup.id"]
+            while not sc.cancelled:  # the "collect()" of a spinning candidate
+                time.sleep(0.01)
+            raise RuntimeError("Job group cancelled")
+    assert time.monotonic() - start < 5
+    assert sc.cancelled == [group]
+    assert sc.props == {"spark.jobGroup.id": "outer"}  # the caller's job group is back
+
+
+def test_query_deadline_leaves_a_fast_query_and_its_errors_alone(monkeypatch):
+    from ai_udf_transpile import verify
+
+    monkeypatch.setitem(conf._RUNTIME, conf.VERIFY_QUERY_TIMEOUT, "30")
+    sc = _FakeSc()
+    spark = types.SimpleNamespace(sparkContext=sc)
+    with verify._query_deadline(spark):
+        pass
+    with pytest.raises(ZeroDivisionError):
+        with verify._query_deadline(spark):
+            raise ZeroDivisionError
+    assert sc.cancelled == [] and sc.props == {"spark.jobGroup.id": "outer"}
+
+
+def test_build_dir_is_absolute(monkeypatch, tmp_path):
+    """cargo resolves a relative CARGO_TARGET_DIR inside the generated crate."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(conf._RUNTIME, conf.RUST_BUILD_DIR, "cache/rust")
+    assert rustc.build_dir() == tmp_path / "cache" / "rust"

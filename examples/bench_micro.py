@@ -461,8 +461,11 @@ def main() -> int:
             udf = UserDefinedFunction(udf_fn, rtype)
             assert udf.transpiled, f"{label} fill did not hit for {name}"
             # A Rust UDF runs only inside Comet: its sample is a parquet scan
-            # (a local relation is evaluated by Spark itself).
-            check = sample if label != "rust" else _native(spark, sample)
+            # (a local relation is evaluated by Spark itself). Any fill may come
+            # back as Rust under the rust preset, the original and the java
+            # twin included, so go by what was served, not by the label.
+            served = target_kinds[(name, "catalyst" if label == "ai" else label)]
+            check = _native(spark, sample) if served == "rust" else sample
             got = [r[0] for r in check.select(udf(*cols)).collect()]
             assert got == py_expect[name], f"{label} {name} rewrote wrongly"
             assert "EvalPython" not in df.select(udf(*cols))._jdf.queryExecution().toString()

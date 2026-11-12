@@ -66,6 +66,9 @@ RUST_BUILD_TIMEOUT = PREFIX + "rust.buildTimeoutSeconds"
 # Promise that rust.buildDir is the same path on every executor (shared
 # filesystem). Without it Rust rewrites are served on local masters only.
 RUST_SHARED_BUILD_DIR = PREFIX + "rust.sharedBuildDir"
+# Each verification query is cancelled after this long: a candidate whose loop
+# never ends (a Java or Rust rewrite) fails verification instead of hanging it.
+VERIFY_QUERY_TIMEOUT = PREFIX + "verifyQueryTimeoutSeconds"
 
 DEFAULTS: dict[str, str] = {
     CATALOG: "sqlite",
@@ -105,6 +108,7 @@ DEFAULTS: dict[str, str] = {
     # The first build against an SDK compiles arrow.
     RUST_BUILD_TIMEOUT: "900",
     RUST_SHARED_BUILD_DIR: "false",
+    VERIFY_QUERY_TIMEOUT: "300",
 }
 
 # Side channel so tests and the worker thread can read values even if the JVM
