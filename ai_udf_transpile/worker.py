@@ -8,6 +8,7 @@ SQLite/Delta. Do not deploy a broker.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import threading
@@ -187,13 +188,18 @@ def process_row(
                     set_catalog(catalog)
                     if spark is not None:
                         set_session(spark)
-            smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
-                spark,
-                source_text=row.source_text,
-                captures=row.captures,
-                input_types=row.input_types,
-                return_type=row.return_type,
-            )
+            from ai_udf_transpile.transpiler import no_rust_routing
+
+            # A twin row is reached through its twin key; without forcing it,
+            # a session that can run Rust would smoke-test the Rust row instead.
+            with no_rust_routing() if _no_rust_row(row) else contextlib.nullcontext():
+                smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
+                    spark,
+                    source_text=row.source_text,
+                    captures=row.captures,
+                    input_types=row.input_types,
+                    return_type=row.return_type,
+                )
             if smoke_err:
                 catalog.mark_failed(key, smoke_err, origin=origin, model=model)
                 logger.info("transpile failed (reconstruction) key=%s: %s", key[:12], smoke_err)

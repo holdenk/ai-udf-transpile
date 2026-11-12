@@ -1509,3 +1509,105 @@ def test_unsizable_array_lengths_are_refused_at_once(length):
     start = time.monotonic()
     assert _rust_const_value(length, {}) == float("inf")
     assert time.monotonic() - start < 1
+
+
+# -- review of the requireApproval x Rust integration ------------------------------
+
+
+def test_a_session_that_cannot_run_rust_never_parks_the_rust_row(tmp_path):
+    """requireApproval: lookup parks a gated row. A session that never serves the Rust row
+    must route to its twin before lookup, not park the row and wait on a review."""
+    import ast
+
+    from ai_udf_transpile import transpiler as T
+    from ai_udf_transpile.backends.fake import BACKWARDS_RS
+    from ai_udf_transpile.catalog.sqlite import SqliteCatalog
+
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    prior_catalog, prior_session = T.get_catalog(), T._SESSION_REF
+    T._SESSION_REF = None  # spark=None: this session cannot run Rust
+    T.set_catalog(cat)
+    try:
+        tree = ast.parse("def backwards(name: str) -> str:\n    return name[::-1]\n")
+
+        def call():
+            return T.get_transpiler_class()()._transpile_from_ast(
+                None, tree, tree.body[0], ["name"], "string"
+            )
+
+        call()  # MISS: the base row is queued
+        (base,) = [r[0] for r in cat._conn.execute("SELECT udf_key FROM cache")]
+        assert cat.claim(base, "fake")
+        cat.mark_success(base, TranspileResult(kind=KIND_RUST, rust_source=BACKWARDS_RS), "fake")
+        conf.set_value(conf.REQUIRE_APPROVAL, "all")
+        call()
+        assert cat.get(base).status == "success"  # untouched, not parked
+        rows = {r[0]: r[1] for r in cat._conn.execute("SELECT spark_version, status FROM cache")}
+        assert any(v.endswith("+no-rust") and s == "pending" for v, s in rows.items())  # the twin is queued
+        assert cat.awaiting_approval() == []
+    finally:
+        conf.set_value(conf.REQUIRE_APPROVAL, conf.DEFAULTS.get(conf.REQUIRE_APPROVAL, "none"))
+        T.set_catalog(prior_catalog)
+        T._SESSION_REF = prior_session
+
+
+def test_no_rust_routing_forces_the_twin_key(tmp_path):
+    """The worker's smoke test of a twin row must reconstruct that row, even where Rust runs."""
+    import ast
+
+    from ai_udf_transpile import transpiler as T
+    from ai_udf_transpile.catalog.sqlite import SqliteCatalog
+
+    cat = SqliteCatalog(tmp_path / "c.sqlite")
+    prior_catalog, prior_session = T.get_catalog(), T._SESSION_REF
+    T._SESSION_REF = None
+    T.set_catalog(cat)
+    try:
+        tree = ast.parse("def backwards(name: str) -> str:\n    return name[::-1]\n")
+
+        def call():
+            return T.get_transpiler_class()()._transpile_from_ast(
+                None, tree, tree.body[0], ["name"], "string"
+            )
+
+        with T.no_rust_routing():
+            call()  # MISS under the twin key, with no base row at all
+        (version,) = [r[0] for r in cat._conn.execute("SELECT spark_version FROM cache")]
+        assert version.endswith("+no-rust")
+    finally:
+        T.set_catalog(prior_catalog)
+        T._SESSION_REF = prior_session
+
+
+@pytest.mark.parametrize(
+    "body, reason",
+    [
+        # An unsizable element times zero is NaN, which compared false and hid the next array.
+        ("let a = [[0u8; M]; 0]; let b = [0u8; 30_000_000]; Ok(x)", "cannot size"),
+        ("let a = [0u8; " + "(" * 5000 + "1" + ")" * 5000 + "]; Ok(x)", "cannot size"),
+    ],
+)
+def test_stack_budget_fails_closed(body, reason):
+    rejected = rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=_udf(body)))
+    assert rejected and reason in rejected
+
+
+def test_const_lengths_are_evaluated_once():
+    """`const C8 = C7 + C7 + ...` chains: exponential without memoizing, now instant and exact."""
+    import time
+
+    lines = ["const C0: usize = 1;"] + [
+        f"const C{i}: usize = " + "+".join([f"C{i - 1}"] * 4) + ";" for i in range(1, 9)
+    ]
+    source = "\n".join(lines) + "\n" + _udf("let a = [0u8; C8]; Ok(x.map(|v| v + a.len() as i64))")
+    start = time.monotonic()
+    assert rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source)) is None  # 4**8 bytes fits
+    big = source.replace("let a = [0u8; C8];", "let a = [0u64; C8];")  # 512 KB does not
+    assert "KB on the stack" in rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=big))
+    assert time.monotonic() - start < 2
+
+
+def test_deeply_nested_source_gets_a_verdict_not_an_exception():
+    source = _udf("Ok(x)").replace("Ok(x)", "let a = " + "vec![" * 3000 + "0" + "]" * 3000 + "; Ok(x)")
+    rejected = rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source))
+    assert rejected is None or isinstance(rejected, str)

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import contextvars
 import logging
 import weakref
 from typing import Any, List, Optional
@@ -135,6 +137,22 @@ def _reconstruct_rust(row: Any, return_type: Any, spark: Any) -> Any:
     return F.expr(rustc.call_expr(compiled.name, row.input_types)).cast(return_type)
 
 
+_NO_RUST_ROUTING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ai_udf_no_rust_routing", default=False
+)
+
+
+@contextlib.contextmanager
+def no_rust_routing():
+    """Resolve UDFs to their no-Rust twin key inside the block (the worker's
+    smoke test of a twin row must reconstruct that row, not the Rust one)."""
+    token = _NO_RUST_ROUTING.set(True)
+    try:
+        yield
+    finally:
+        _NO_RUST_ROUTING.reset(token)
+
+
 def _rust_elsewhere(row: Any, spark: Any) -> bool:
     """A served Rust row this session could never attach (no target, no Comet)."""
     if row.target_kind != "rust":
@@ -222,14 +240,16 @@ def get_transpiler_class() -> type:
                 catalog = get_catalog()
                 if catalog is None:
                     return None
-                kind, row = catalog.lookup(key, spark=spark)
-                if kind == HIT and row is not None and _rust_elsewhere(row, spark):
-                    # Verified as Rust by a session that runs Comet; this one
-                    # cannot. A twin key gets its own SQL/Java rewrite rather
-                    # than pin the UDF to Python here.
+                # A Rust row this session cannot run (no Comet, no target) gets
+                # a twin key with its own SQL/Java rewrite rather than pin the
+                # UDF to Python here. Decided on a side-effect-free read, before
+                # lookup: lookup may park the row for approval or re-queue it,
+                # and a session that never serves the row must not change it.
+                peek = catalog.get(key)
+                if _NO_RUST_ROUTING.get() or (peek is not None and _rust_elsewhere(peek, spark)):
                     version += NO_RUST_SUFFIX
                     key = udf_key(source, params, in_types, out_type, version, fingerprint)
-                    kind, row = catalog.lookup(key, spark=spark)
+                kind, row = catalog.lookup(key, spark=spark)
                 if kind == HIT and row is not None:
                     try:
                         return _reconstruct_column(row, returnType, spark)

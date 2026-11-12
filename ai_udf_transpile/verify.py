@@ -10,6 +10,7 @@ import importlib
 import inspect
 import linecache
 import logging
+import math
 import re
 import textwrap
 import threading
@@ -626,9 +627,16 @@ _RUST_STACK_BUDGET = 256 * 1024
 _RUST_INFINITE = float("inf")
 
 
-def _rust_const_value(expr: str, consts: dict[str, str], depth: int = 0) -> float:
-    """An array length as a number: literals, + - * / % << >> ( ), and consts."""
-    if depth > 8:
+def _rust_const_value(
+    expr: str, consts: dict[str, str], depth: int = 0, memo: Optional[dict[str, float]] = None
+) -> float:
+    """An array length as a number: literals, + - * / % << >> ( ), and consts.
+
+    Each const is evaluated once (``memo``): `const B: usize = A + A + A;`
+    chains would otherwise re-evaluate exponentially.
+    """
+    memo = {} if memo is None else memo
+    if depth > 64 or len(expr) > 512:
         return _RUST_INFINITE
     text = re.sub(r"(?<=\d)_(?=\d)", "", expr)
     text = re.sub(r"\b(\d+)(?:usize|u\d+|i\d+|isize)\b", r"\1", text)
@@ -636,7 +644,10 @@ def _rust_const_value(expr: str, consts: dict[str, str], depth: int = 0) -> floa
     def const(m: re.Match) -> str:
         name = m.group(0)
         if name in consts:
-            value = _rust_const_value(consts[name], consts, depth + 1)
+            if name not in memo:
+                memo[name] = _RUST_INFINITE  # a cycle reads as unsizable
+                memo[name] = _rust_const_value(consts[name], consts, depth + 1, memo)
+            value = memo[name]
             return "1e30" if value == _RUST_INFINITE else str(int(value))
         return "@"  # unknown name: not sizable
 
@@ -667,7 +678,7 @@ def _rust_int_expr(text: str) -> float:
     """
     try:
         tree = ast.parse(text.strip(), mode="eval")
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
         return _RUST_INFINITE
 
     def value(node: ast.AST) -> int:
@@ -709,6 +720,7 @@ def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Option
         for m in re.finditer(r"\bconst\s+([A-Za-z_]\w*)\s*:[^=;]*=\s*([^;]*);", scanned)
     }
     sizes: dict[str, float] = {}
+    const_memo: dict[str, float] = {}
 
     def type_size(text: str, seen: frozenset = frozenset()) -> float:
         text = text.strip()
@@ -745,7 +757,7 @@ def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Option
         if len(parts) != 2:
             return 0  # a slice type, an index, or an array literal: no repeat
         elem, length = parts
-        n = _rust_const_value(length, consts)
+        n = _rust_const_value(length, consts, memo=const_memo)
         if n == _RUST_INFINITE:
             return _RUST_INFINITE
         nested = [bracket_size(elem[i + 1 : _rust_close(elem, i)], seen) for i in _rust_top_brackets(elem)]
@@ -756,6 +768,8 @@ def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Option
             local = [w for w in words if w in types]
             prim = [_RUST_PRIM_SIZE[w] for w in words if w in _RUST_PRIM_SIZE]
             each = max([local_size(w, seen | {w}) for w in local] + prim or [8])
+        if each == _RUST_INFINITE:
+            return _RUST_INFINITE  # an unsizable element stays unsizable, even times 0
         return n * each
 
     def occurrences(text: str):
@@ -779,7 +793,7 @@ def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Option
         for word in re.findall(r"[A-Za-z_]\w*", scanned[name_end:end]):
             if resolve(word) in types:
                 total += local_size(resolve(word), frozenset({resolve(word)}))
-    if total > _RUST_STACK_BUDGET:
+    if math.isnan(total) or total > _RUST_STACK_BUDGET:
         return (
             f"rust rewrite may put about {int(total) // 1024} KB on the stack (arrays and "
             f"local values; at most {_RUST_STACK_BUDGET // 1024} KB): a stack overflow aborts "
@@ -1052,7 +1066,10 @@ def _rust_rejected(rust: str) -> Optional[str]:
             "rust rewrite uses a forbidden construct "
             "(unsafe/extern/fs/process/net/env/io/clock/include!/env!/macro_rules!/#[path]/arrow)"
         )
-    return _rust_recursion(scanned)
+    try:
+        return _rust_recursion(scanned)
+    except (RecursionError, MemoryError):
+        return "rust rewrite is nested too deeply to check: flatten it"
 
 
 def rejected_rewrite(result: Any) -> Optional[str]:
