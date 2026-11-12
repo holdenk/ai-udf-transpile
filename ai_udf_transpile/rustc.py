@@ -322,6 +322,20 @@ def _sdk_dir(candidate: str) -> Optional[Path]:
 _PATH_SDKS: dict[tuple, SdkSpec] = {}
 
 
+def _workspace_manifest(crate: Path) -> Optional[Path]:
+    """The nearest ancestor Cargo.toml with a [workspace] table, if any."""
+    for parent in crate.parents:
+        candidate = parent / "Cargo.toml"
+        if not candidate.is_file():
+            continue
+        try:
+            if "workspace" in tomllib.loads(candidate.read_text(encoding="utf-8")):
+                return candidate
+        except Exception:
+            return None
+    return None
+
+
 def _path_sdk(crate: Path) -> SdkSpec:
     """A local SDK crate, identified by its bytes (a checkout can change ref).
 
@@ -329,13 +343,18 @@ def _path_sdk(crate: Path) -> SdkSpec:
     stat signature instead of re-read per UDF definition.
     """
     files_ = sorted([crate / "Cargo.toml", *crate.glob("src/**/*.rs")])
-    stamp = (str(crate), *((item.name, item.stat().st_mtime_ns, item.stat().st_size) for item in files_))
+    # The SDK takes its arrow version from the workspace manifest
+    # (`arrow = { workspace = true }`): an in-place bump there is a new SDK.
+    workspace = _workspace_manifest(crate)
+    if workspace is not None:
+        files_.append(workspace)
+    stamp = (str(crate), *((str(item), item.stat().st_mtime_ns, item.stat().st_size) for item in files_))
     cached = _PATH_SDKS.get(stamp)
     if cached is not None:
         return cached
     digest = hashlib.sha256()
     for item in files_:
-        digest.update(item.name.encode())
+        digest.update(str(item).encode())  # the crate's Cargo.toml and the workspace's differ by path
         digest.update(item.read_bytes())
     spec = SdkSpec(
         dependency=f"{{ path = {_toml_str(str(crate))} }}",

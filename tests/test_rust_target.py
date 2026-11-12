@@ -1033,3 +1033,92 @@ def test_no_rust_twin_rows_are_never_offered_or_accept_rust(tmp_path):
     process_row(cat, cat.get("k"), _RustBackend(), spark=None, verify_fn=lambda **k: (True, None))
     row = cat.get("k")
     assert row.status == "failed" and "cannot run Rust" in row.error
+
+
+# -- second CodeRabbit round ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # Recursion through a function value: no bare `udf(` call in the body.
+        "pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> {\n"
+        "    let f = udf;\n    match x { Some(v) if v > 0 => f(Some(v - 1)), _ => Ok(x) }\n}\n",
+        # A cycle of helpers.
+        "fn ping(n: i64) -> i64 { if n <= 0 { 0 } else { pong(n - 1) } }\n"
+        "fn pong(n: i64) -> i64 { ping(n) }\n"
+        "pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x.map(ping)) }\n",
+        # Through a function-pointer table.
+        "fn step(n: i64) -> i64 {\n"
+        "    let t: [fn(i64) -> i64; 1] = [step];\n"
+        "    if n > 0 { t[0](n - 1) } else { 0 }\n"
+        "}\n"
+        "pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x.map(step)) }\n",
+    ],
+)
+def test_scan_rejects_indirect_recursion(source):
+    rejected = rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source))
+    assert rejected and "recursive" in rejected
+
+
+def test_scan_allows_a_local_that_shadows_its_function():
+    source = (
+        "fn count(s: &str) -> i64 { let mut count = 0; for _c in s.chars() { count += 1; } count }\n"
+        "pub fn udf(x: Option<&str>) -> Result<Option<i64>, String> { Ok(x.map(count)) }\n"
+    )
+    assert rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source)) is None
+    # Shadowed, but still called: that is recursion.
+    called = source.replace("count }\n", "count + count(s) }\n", 1)
+    assert "recursive (count)" in rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=called))
+
+
+def test_scan_allows_a_call_chain_without_a_cycle():
+    source = (
+        "fn a(n: i64) -> i64 { b(n) + 1 }\n"
+        "fn b(n: i64) -> i64 { c(n) * 2 }\n"
+        "fn c(n: i64) -> i64 { n.abs().max(1) }\n"  # `.max` is a method, not a fn named max
+        "pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x.map(a)) }\n"
+    )
+    assert rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source)) is None
+
+
+def test_local_sdk_identity_includes_the_workspace_manifest(tmp_path, monkeypatch):
+    for key in ("AI_UDF_TRANSPILE_COMET_HOME", "COMET_HOME"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(rustc, "_PATH_SDKS", {})
+    _fake_checkout(tmp_path / "comet", arrow="59.2.0")
+    conf.set_value(conf.RUST_COMET_SDK, str(tmp_path / "comet"))
+    before = rustc.resolve_sdk().ident
+    # The SDK crate is untouched; only the workspace's arrow pin moves.
+    workspace = tmp_path / "comet" / "native" / "Cargo.toml"
+    workspace.write_text(workspace.read_text().replace("59.2.0", "60.0.0"), encoding="utf-8")
+    assert rustc.resolve_sdk().ident != before
+
+
+def test_native_rows_state_is_per_session():
+    from ai_udf_transpile.verify import _comet_native_rows
+
+    class _RuntimeConf:
+        def __init__(self, prior=None):
+            self.values = {} if prior is None else {"spark.comet.convert.rdd.enabled": prior}
+
+        def get(self, key, default=None):
+            return self.values.get(key, default)
+
+        def set(self, key, value):
+            self.values[key] = value
+
+        def unset(self, key):
+            self.values.pop(key, None)
+
+    key = "spark.comet.convert.rdd.enabled"
+    one = types.SimpleNamespace(conf=_RuntimeConf())
+    two = types.SimpleNamespace(conf=_RuntimeConf(prior="false"))
+    a, b = _comet_native_rows(one, True), _comet_native_rows(two, True)
+    a.__enter__()
+    b.__enter__()
+    a.__exit__(None, None, None)
+    assert key not in one.conf.values  # session one restored on its own exit
+    assert two.conf.get(key) == "true"  # session two still inside its scope
+    b.__exit__(None, None, None)
+    assert two.conf.get(key) == "false"  # its own prior, not session one's

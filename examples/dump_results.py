@@ -121,9 +121,13 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
             # row's numbers rather than whichever came last.
             names = Counter(r["function"] for r in live)
             for r in live:
-                keys = [r["function"]]
-                if names[r["function"]] > 1 and r.get("udf_key"):
-                    keys.append(r["udf_key"])
+                key = r.get("udf_key") or ""
+                # By udf_key whenever the CSV has one; by name only for a
+                # name no other catalog row in this CSV shares. dump() checks
+                # the key too, so a name entry never lands on another row.
+                keys = [key] if key else []
+                if names[r["function"]] == 1 or not key:
+                    keys.append(r["function"])
                 py_rate = r.get("python_rows_per_second")
                 tx_rate = r.get("transpiled_rows_per_second")
                 if not py_rate and not tx_rate:
@@ -131,11 +135,12 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                 if not py_rate:
                     # Interpreted arm could not run on the sample; the
                     # transpiled rate is still a real measurement.
-                    for key in keys:
-                        perf[key] = {
+                    for k in keys:
+                        perf[k] = {
                             "top": "",
                             "static": "",
                             "ai": f"{_fmt_rate(tx_rate)} rows/s (no python baseline)",
+                            **({"udf_key": key} if key else {}),
                         }
                     continue
                 # Same schema, different bench: bench_fhi_udfs.py names itself.
@@ -163,8 +168,10 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     # keep the catalog bench's, labeled, since its speedup is
                     # against that bench's own python baseline.
                     arms["ai"] += " · comet (catalog bench) " + prev_ai.split(" · comet ", 1)[1]
-                for key in keys:
-                    perf[key] = dict(arms)
+                if key:
+                    arms["udf_key"] = key
+                for k in keys:
+                    perf[k] = dict(arms)
         elif "kinds" in rows[0]:  # bench_micro wide CSV
             for r in rows:
                 py = _fmt_rate(r["regular_rows_per_second"])
@@ -213,6 +220,20 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     )
                 perf[r["function"]] = {"top": top, "static": "", "ai": ai}
     return perf
+
+
+def _perf_for(perf: dict[str, dict[str, str]], name: str, udf_key: str) -> dict[str, str]:
+    """The perf bullets for one catalog row.
+
+    By name first: later --perf-csv files (micro/tpcds/fhi, deeper arms)
+    override per function by name. A name entry that carries another catalog
+    row's udf_key (a Rust row's, for its "+no-rust" twin) is not this row's;
+    then only this row's own keyed entry, if any, applies.
+    """
+    p = perf.get(name) or {}
+    if not p or (p.get("udf_key") and p["udf_key"] != udf_key):
+        p = perf.get(udf_key) or {}
+    return p
 
 
 def _builtin_result(row: CacheRow) -> str:
@@ -288,7 +309,7 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
     try:
         for row in rows:
             name = _function_name(row.source_text) or row.udf_key[:12]
-            p = perf.get(row.udf_key) or perf.get(name) or {}
+            p = _perf_for(perf, name, row.udf_key)
             title = name
             if (row.spark_version or "").endswith(NO_RUST_SUFFIX):
                 # The rewrite a session that cannot run Rust got for a UDF

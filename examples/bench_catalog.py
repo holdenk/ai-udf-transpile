@@ -222,6 +222,9 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
             if not (entry["transpiled_rows_per_second"] or rust):
                 continue
             name = entry["function"]
+            if rust and _values_for(row.input_types) is None:
+                print(f"{name}: no sample for {row.input_types}; rust row not benched")
+                continue
             if rust:
                 # A lookup never waits on cargo; the bench can.
                 try:

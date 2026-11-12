@@ -418,6 +418,8 @@ def main() -> int:
     if rust_on:
         conf.set_value(conf.TARGETS, "catalyst,java_udf,rust", spark)
         reason = rustc.rust_unservable(spark)
+        if not reason and not rustc.rust_offered(spark, ["bigint"], "bigint"):
+            reason = "no cargo or no comet-udf-sdk to build against"
         if reason:
             print(f"warning: no rust arm: {reason}", file=sys.stderr)
             rust_on = False

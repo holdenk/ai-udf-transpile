@@ -389,16 +389,10 @@ def _rust_for_forbidden_scan(rust: str) -> str:
 _RUST_FN = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
 
 
-def _rust_recursive_fn(scanned: str) -> Optional[str]:
-    """The first function that calls itself, in blanked source, if any.
-
-    A Rust stack overflow is not a panic: it aborts the process, and in
-    local mode that process is the driver. Deep enough input reaches any
-    recursion depth, so a recursive rewrite is refused. Direct recursion
-    only: mutual recursion and runaway loops are the prompt's to prevent.
-    """
+def _rust_fn_bodies(scanned: str) -> list[tuple[str, str]]:
+    """(name, body) for every ``fn`` with a body, in blanked source."""
+    out = []
     for match in _RUST_FN.finditer(scanned):
-        name = match.group(1)
         start = scanned.find("{", match.end())
         if start < 0:
             continue
@@ -411,10 +405,44 @@ def _rust_recursive_fn(scanned: str) -> Optional[str]:
                 if depth == 0:
                     break
             end += 1
-        # A method (`s.trim()` inside `fn trim`) or a path (`str::trim`) is
-        # another item; a bare call is the function itself.
-        if re.search(rf"(?<![.\w:]){re.escape(name)}\s*\(", scanned[start:end]):
-            return name
+        out.append((match.group(1), scanned[start:end]))
+    return out
+
+
+def _rust_recursive_fn(scanned: str) -> Optional[str]:
+    """A function that can reach itself, in blanked source, if any.
+
+    A Rust stack overflow is not a panic: it aborts the process, and in
+    local mode that process is the driver. Deep enough input reaches any
+    recursion depth, so recursion is refused -- direct, through a function
+    value (`let f = udf; f(x)`), or through a cycle of helpers. Any bare
+    mention of a function's name in a body is an edge, call or not: a
+    method (`s.trim()`) or a path (`str::trim`) names another item and is
+    not one. Runaway loops are the prompt's to prevent.
+    """
+    bodies = _rust_fn_bodies(scanned)
+    names = {name for name, _ in bodies}
+    edges: dict[str, set[str]] = {name: set() for name in names}
+    for name, body in bodies:
+        for other in names:
+            word = re.escape(other)
+            # A body that binds the name itself (`let mut count = 0` inside
+            # `fn count`, a closure parameter) shadows the function: only a
+            # call then counts. Otherwise any mention is the function value.
+            shadowed = re.search(rf"\blet\s+(?:mut\s+)?{word}\b|\|[^|]*\b{word}\b[^|]*\|", body)
+            mention = rf"(?<![.\w:]){word}\s*\(" if shadowed else rf"(?<![.\w:]){word}\b(?!\s*!)"
+            if re.search(mention, body):
+                edges[name].add(other)
+    for root in sorted(names):
+        seen: set[str] = set()
+        stack = list(edges[root])
+        while stack:
+            node = stack.pop()
+            if node == root:
+                return root
+            if node not in seen:
+                seen.add(node)
+                stack.extend(edges.get(node, ()))
     return None
 
 
@@ -733,7 +761,8 @@ def _row_values(args: tuple) -> dict[str, Any]:
 
 _COMET_RDD_CONVERT = "spark.comet.convert.rdd.enabled"
 _NATIVE_ROWS_LOCK = threading.Lock()
-_NATIVE_ROWS: dict[str, Any] = {"depth": 0}
+# Per SparkSession (conf is per session): id -> {"depth": n, "prior": value}.
+_NATIVE_ROWS: dict[int, dict[str, Any]] = {}
 
 
 @contextmanager
@@ -752,22 +781,26 @@ def _comet_native_rows(spark: Any, native: bool):
     # Refcounted: overlapping verifications (the inline worker and a
     # register_impl call) must restore the value from before the FIRST one,
     # not whatever the other had set.
+    # Keyed by session: the spark object is held for the whole scope, so its
+    # id cannot be reused by another session while the entry exists.
+    session = id(spark)
     with _NATIVE_ROWS_LOCK:
-        if _NATIVE_ROWS["depth"] == 0:
-            _NATIVE_ROWS["prior"] = spark.conf.get(_COMET_RDD_CONVERT, None)
+        state = _NATIVE_ROWS.get(session)
+        if state is None:
+            state = _NATIVE_ROWS[session] = {"depth": 0, "prior": spark.conf.get(_COMET_RDD_CONVERT, None)}
             spark.conf.set(_COMET_RDD_CONVERT, "true")
-        _NATIVE_ROWS["depth"] += 1
+        state["depth"] += 1
     try:
         yield
     finally:
         with _NATIVE_ROWS_LOCK:
-            _NATIVE_ROWS["depth"] -= 1
-            if _NATIVE_ROWS["depth"] == 0:
-                prior = _NATIVE_ROWS.pop("prior", None)
-                if prior is None:
+            state["depth"] -= 1
+            if state["depth"] == 0:
+                del _NATIVE_ROWS[session]
+                if state["prior"] is None:
                     spark.conf.unset(_COMET_RDD_CONVERT)
                 else:
-                    spark.conf.set(_COMET_RDD_CONVERT, prior)
+                    spark.conf.set(_COMET_RDD_CONVERT, state["prior"])
 
 
 def _eval_sql(
