@@ -42,12 +42,16 @@ choice above to (still exactly one):
   overflow aborts the whole process instead of failing the query. Write the
   loop. Every loop must terminate on every input, NULL and empty included.
   The check is by name: any mention of a function's name inside a function
-  that it can reach from itself counts as a call, so never name a local or a
-  parameter after a function. Also rejected, because they can call a
-  function without naming it: trait impls (`impl Trait for Type`) and
-  `trait` items, `dyn`, `Any`, a struct/enum/`type` holding a `fn(..)` or
-  `Fn`, and a function used as a value in a `static` or `const`. Use plain
-  functions, inherent methods (`impl Type { .. }`), and closures.
+  that it can reach from itself counts as a call. So never name a local or a
+  parameter after a function, and never name a method after a std method it
+  calls (`fn parse` calling `s.parse()`), except on a field of `self` whose
+  type is std only (`fn len(&self) { self.items.len() }` is fine). Also
+  rejected, because they can call a function without naming it: trait impls
+  (`impl Trait for Type`) and `trait` items, `dyn`, `std::any`, a
+  struct/enum/`type`/`static`/`const` whose type holds a `fn(..)` or `Fn`,
+  and a function used as a value outside a function body. Use plain
+  functions, inherent methods (`impl Type { .. }`), closures, ASCII names,
+  and keep the module under 20,000 characters.
 - A panic fails the query, and integer overflow panics (overflow checks are
   on). Python ints never overflow: where an intermediate can leave `i64`
   while the result still fits, widen to `i128`; where the result itself

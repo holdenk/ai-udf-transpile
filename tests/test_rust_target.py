@@ -1103,7 +1103,7 @@ def _udf(body: str) -> str:
         # A function value in a static, called from the body.
         (
             "static F: fn(Option<i64>) -> Result<Option<i64>, String> = udf;\n" + _udf("F(x)"),
-            "outside a function body",
+            "static or const holding a function",
         ),
         # Trait dispatch names no function: `{}` calls Display::fmt on self.
         (
@@ -1111,11 +1111,11 @@ def _udf(body: str) -> str:
             "impl std::fmt::Display for W {\n"
             '    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "{}", self) }\n'
             "}\n" + _udf("Ok(x)"),
-            "trait impls",
+            "implements a trait",
         ),
         # An erased closure, Any, a type holding a function: closure fixpoints.
-        (_udf("let f: &dyn Fn(i64) -> i64 = &|n| n; Ok(x.map(f))"), "trait impls"),
-        (_udf("let _a: Option<&std::any::Any> = None; Ok(x)"), "trait impls"),
+        (_udf("let f: &dyn Fn(i64) -> i64 = &|n| n; Ok(x.map(f))"), "`dyn`"),
+        (_udf("let _a: Option<&std::any::Any> = None; Ok(x)"), "std::any"),
         ("struct S(Option<fn(&S, i64) -> i64>);\n" + _udf("Ok(x)"), "type holding a function (S)"),
         ("struct S([u8; 4], fn(i64) -> i64);\n" + _udf("Ok(x)"), "type holding a function (S)"),
     ],
@@ -1196,3 +1196,159 @@ def test_native_rows_state_is_per_session():
     assert two.conf.get(key) == "true"  # session two still inside its scope
     b.__exit__(None, None, None)
     assert two.conf.get(key) == "false"  # its own prior, not session one's
+
+
+# -- adversarial round on the by-name recursion check ------------------------------
+# Each bypass below compiled with rustc and overflowed its stack before the fix;
+# each false positive compiled, was not recursive, and was refused.
+
+
+@pytest.mark.parametrize(
+    "source, reason",
+    [
+        # A trait impl whose header holds a `;` (`.into()` reaches `from`).
+        (
+            "pub struct D(pub i64);\n"
+            "impl From<[i64; 2]> for D {\n"
+            "    fn from(a: [i64; 2]) -> Self {\n"
+            "        if a[0] <= 0 { D(a[1]) } else { let d: D = [a[0] - 1, a[1]].into(); d }\n"
+            "    }\n"
+            "}\n" + _udf("Ok(x.map(|n| D::from([n, 0]).0))"),
+            "implements a trait",
+        ),
+        # A call right after `..` (a range or slice bound) or `:` (a field init).
+        (
+            "fn depth(v: i64) -> i64 { if v <= 0 { 0 } else { let r = 0..depth(v - 1); r.end } }\n"
+            + _udf("Ok(x.map(depth))"),
+            "recursive (depth)",
+        ),
+        (
+            "pub struct H<F> { f: F }\n"
+            + _udf("let h = H { f:udf }; if x == Some(0) { (h.f)(None) } else { Ok(x) }"),
+            "recursive (udf)",
+        ),
+        # A path through a `use .. as` alias of the crate.
+        ("use crate as k;\n" + _udf("if x == Some(0) { k::udf(None) } else { Ok(x) }"), "recursive (udf)"),
+        # A const-generic block in an impl header hid the impl, so `walk` was no method.
+        (
+            "pub struct W<const N: usize>;\n"
+            "impl W<{ 1 + 1 }> {\n"
+            "    fn walk(&self, n: i64) -> i64 { if n <= 0 { 0 } else { self.walk(n - 1) } }\n"
+            "}\n" + _udf("Ok(x.map(|n| W::<2>.walk(n)))"),
+            "recursive (walk)",
+        ),
+        # A function stored at run time in a static, called back from itself.
+        (
+            "use std::sync::OnceLock;\n"
+            "static STEP: OnceLock<fn(i64) -> i64> = OnceLock::new();\n"
+            "fn step(n: i64) -> i64 { if n <= 0 { 0 } else { STEP.get().unwrap()(n - 1) } }\n"
+            + _udf("let _ = STEP.set(step); Ok(x.map(step))"),
+            "static or const holding a function",
+        ),
+        # A non-ASCII name, which the ASCII name patterns would never see.
+        (
+            "fn ñ(n: i64) -> i64 { if n <= 0 { 0 } else { ñ(n - 1) } }\n" + _udf("Ok(x.map(ñ))"),
+            "non-ASCII identifier",
+        ),
+        # A generic struct field holding the function, called through the method.
+        (
+            "struct W<F> { step: F }\n"
+            "impl<F: Fn(u64) -> u64> W<F> { fn step(&self, n: u64) -> u64 { (self.step)(n) } }\n"
+            "fn helper(n: u64) -> u64 { if n == 0 { 0 } else { W { step: helper }.step(n - 1) } }\n"
+            + _udf("Ok(x.map(|v| helper(v as u64) as i64))"),
+            "recursive (helper)",
+        ),
+        # A std-typed field does not hide a user type that a chain argument brings in.
+        (
+            "struct S { o: Option<i64> }\n"
+            "struct T;\n"
+            "impl T {\n"
+            "    fn go(&self, n: i64) -> i64 {\n"
+            "        if n <= 0 { 0 } else { S { o: None }.o.and(Some(T)).unwrap().go(n - 1) }\n"
+            "    }\n"
+            "}\n" + _udf("Ok(x.map(|n| T.go(n)))"),
+            "recursive (go)",
+        ),
+        ("pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x) }\n" + " " * 20_001, "too long"),
+    ],
+)
+def test_scan_rejects_adversarial_recursion(source, reason):
+    rejected = rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source))
+    assert rejected and reason in rejected
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # A constructor calling std constructors of the same name.
+        "struct P { out: Vec<char>, s: String }\n"
+        "impl P { fn new() -> Self { P { out: Vec::new(), s: String::new() } } }\n"
+        + _udf("let p = P::new(); Ok(x.map(|v| v + p.out.len() as i64 + p.s.len() as i64))"),
+        # Wrappers that forward to the std method of the same name on a std field,
+        # in a struct with only a lifetime parameter, through a no-argument chain.
+        "struct Stack { items: Vec<char> }\n"
+        "impl Stack {\n"
+        "    fn push(&mut self, c: char) { self.items.push(c); }\n"
+        "    fn pop(&mut self) -> Option<char> { self.items.pop() }\n"
+        "    fn len(&self) -> usize { self.items.len() }\n"
+        "    fn max(&self) -> Option<char> { self.items.iter().copied().max() }\n"
+        "}\n"
+        "struct Cursor<'a> { chars: std::iter::Peekable<std::str::Chars<'a>> }\n"
+        "impl<'a> Cursor<'a> { fn peek(&mut self) -> Option<char> { self.chars.peek().copied() } }\n"
+        + _udf(
+            "let mut s = Stack { items: Vec::new() }; s.push('a'); let _ = (s.pop(), s.max());\n"
+            'let mut c = Cursor { chars: "ab".chars().peekable() }; let _ = c.peek();\n'
+            "Ok(x.map(|v| v + s.len() as i64))"
+        ),
+        # A getter named like its field; a field named like a free function.
+        "struct Tally { vowels: i64 }\nimpl Tally { fn vowels(&self) -> i64 { self.vowels } }\n"
+        "struct Acc { total: i64 }\nfn total(xs: &[i64]) -> i64 { xs.iter().sum() }\n"
+        + _udf(
+            "let t = Tally { vowels: 1 }; let a = Acc { total: total(&[1, 2]) };\n"
+            "Ok(x.map(|v| v + t.vowels() + a.total))"
+        ),
+        # A const fn evaluated in a const initializer (a compile-time table).
+        "const fn table() -> [u32; 4] {\n"
+        "    let mut t = [0u32; 4]; let mut i = 0; while i < 4 { t[i] = i as u32 * 3; i += 1; } t\n"
+        "}\n"
+        "const TABLE: [u32; 4] = table();\n" + _udf("Ok(x.map(|v| v + TABLE[(v & 3) as usize] as i64))"),
+        # An enum variant named `Any`; `use std::cmp::max` beside a method `max`.
+        "enum Tok { Any, Lit(char) }\n"
+        "use std::cmp::max;\n"
+        "struct R;\nimpl R { fn max(a: i64, b: i64) -> i64 { if a > b { a } else { b } } }\n"
+        + _udf(
+            "let t = Tok::Any; let n = match t { Tok::Any => 1, Tok::Lit(_) => 2 };\n"
+            "Ok(x.map(|v| max(R::max(v, n), 0)))"
+        ),
+    ],
+)
+def test_scan_allows_std_named_methods_and_compile_time_calls(source):
+    assert rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source)) is None
+
+
+def test_scan_corpus_of_realistic_rewrites_compiles_and_passes(tmp_path):
+    """Every accepted source above is real Rust: compile them when rustc is here."""
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        pytest.skip("rustc not on PATH")
+    import subprocess
+
+    params = test_scan_allows_std_named_methods_and_compile_time_calls.pytestmark[0].args[1]
+    for i, source in enumerate(params):
+        path = tmp_path / f"c{i}.rs"
+        path.write_text("#![allow(dead_code, unused)]\n" + source)
+        out = subprocess.run(
+            [
+                rustc,
+                "--edition",
+                "2021",
+                "--crate-type",
+                "lib",
+                "-o",
+                str(tmp_path / f"c{i}.rlib"),
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert out.returncode == 0, (source, out.stderr)

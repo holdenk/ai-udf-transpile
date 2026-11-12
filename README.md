@@ -331,10 +331,13 @@ fallback; until then this target trades the plugin's safety for speed.
 - No recursion: a stack overflow aborts the process (the driver, in local
   mode) instead of failing the query. The check is by name, so any mention
   of a function inside something it can reach from itself is refused, a
-  same-named local included. Trait impls, `dyn`, `Any` and types that hold
-  a function are refused too, since they can call a function without
-  naming it. That catches accidental recursion; it is not a proof against
-  a rewrite written to evade it.
+  same-named local included. Trait impls, `dyn`, `std::any`, and types,
+  statics and consts that hold a function are refused too, since they can
+  call a function without naming it. An adversarial pass (bypasses
+  confirmed by compiling them with rustc and overflowing the stack) shaped
+  the current rules, and its cases are tests in
+  `tests/test_rust_target.py`. That catches accidental recursion; it is not
+  a proof against a rewrite written to evade it.
 - Functions must be pure: Comet plans every native UDF as immutable.
 
 `examples/demo_rust_udf.py` runs the whole path on three loop-shaped UDFs and
