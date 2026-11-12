@@ -439,7 +439,8 @@ def _rust_item_stop(scanned: str, pos: int) -> int:
     Generic arguments are skipped: ``;`` inside ``(..)``/``[..]``/``<..>`` is an
     array length (``impl From<[i64; 2]>``), and a ``{..}`` inside ``<..>`` is a
     const-generic argument (``impl W<{ 1 + 1 }>``), not the body. ``->`` and
-    ``=>`` close nothing.
+    ``=>`` close nothing, and ``<``/``>`` inside ``(..)``/``[..]`` are operators
+    (``[u8; 1 << 2]``), not generics.
     """
     depth = angle = 0
     n = len(scanned)
@@ -450,9 +451,9 @@ def _rust_item_stop(scanned: str, pos: int) -> int:
             depth += 1
         elif ch in ")]":
             depth -= 1
-        elif ch == "<":
+        elif ch == "<" and depth <= 0:  # inside (..)/[..] it may be `1 << 2`
             angle += 1
-        elif ch == ">" and (i == 0 or scanned[i - 1] not in "-="):
+        elif ch == ">" and depth <= 0 and (i == 0 or scanned[i - 1] not in "-="):
             angle -= 1
         elif ch == "{":
             if depth > 0 or angle > 0:
@@ -523,7 +524,15 @@ def _rust_split_top(text: str) -> list[str]:
 
 
 def _rust_std_fields(scanned: str, type_name: str) -> set[str]:
-    """Fields of the one struct ``type_name`` whose types are std values only."""
+    """Fields of the one struct ``type_name`` whose types are std values only.
+
+    A word the rewrite defines itself (``struct Range``, ``use S as Vec``)
+    is never std, whatever its name.
+    """
+    local = {m.group(2) for m in _RUST_TYPE_ITEM.finditer(scanned)}
+    for use in _RUST_USE.finditer(scanned):
+        local |= set(_RUST_AS.findall(use.group(0)))
+    std_words = _RUST_STD_FIELD_WORDS - local
     defs = [m for m in _RUST_TYPE_ITEM.finditer(scanned) if m.group(2) == type_name]
     if len(defs) != 1 or defs[0].group(1) != "struct":
         return set()
@@ -549,7 +558,7 @@ def _rust_std_fields(scanned: str, type_name: str) -> set[str]:
     return {
         name
         for name, typ in fields
-        if all(w in _RUST_STD_FIELD_WORDS for w in re.findall(r"[A-Za-z_]\w*", re.sub(r"'\w+", "", typ)))
+        if all(w in std_words for w in re.findall(r"[A-Za-z_]\w*", re.sub(r"'\w+", "", typ)))
     }
 
 
@@ -654,6 +663,32 @@ def _rust_recursion(scanned: str) -> Optional[str]:
                 f"rust rewrite defines a type holding a function ({match.group(2)}): a "
                 "closure handed such a value can call itself; pass functions as arguments"
             )
+    # A recursive type (`struct Node { next: Option<Box<Node>> }`) recurses
+    # with no function at all: dropping, cloning or comparing a long chain
+    # overflows inside std's glue.
+    types = {
+        m.group(2): scanned[m.end() : _rust_item_end(scanned, m.end())]
+        for m in _RUST_TYPE_ITEM.finditer(scanned)
+        if m.group(1) != "mod"
+    }
+    type_edges = {
+        name: {other for other in types if re.search(rf"\b{re.escape(other)}\b", text)}
+        for name, text in types.items()
+    }
+    for node in sorted(types):
+        seen: set[str] = set()
+        stack = list(type_edges[node])
+        while stack:
+            cur = stack.pop()
+            if cur == node:
+                return (
+                    f"rust rewrite defines a recursive type ({node}): dropping, cloning or "
+                    "comparing a deep value recurses and can overflow the stack; use a Vec "
+                    "with indices instead"
+                )
+            if cur not in seen:
+                seen.add(cur)
+                stack.extend(type_edges.get(cur, ()))
     statics = []  # (start, end) of every static/const item
     for match in _RUST_STATIC.finditer(scanned):
         before = scanned[: match.start()].rstrip()

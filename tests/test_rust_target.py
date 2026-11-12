@@ -1269,6 +1269,40 @@ def test_native_rows_state_is_per_session():
             "}\n" + _udf("Ok(x.map(|n| T.go(n)))"),
             "recursive (go)",
         ),
+        # Second round. A local type named like a std one is not std.
+        (
+            "struct Range { lo: i64 }\nstruct Span { r: Range }\n"
+            "impl Span { fn width(&self, n: i64) -> i64 { if n <= 0 { 0 } else { self.r.shrink(n - 1) } } }\n"
+            "impl Range { fn shrink(&self, n: i64) -> i64 { Span { r: Range { lo: self.lo } }.width(n) } }\n"
+            + _udf("Ok(x.map(|v| Span { r: Range { lo: 0 } }.width(v)))"),
+            "recursive (",
+        ),
+        # `1 << 2` in an array length is a shift, not two generic openers.
+        (
+            "fn walk(n: i64, pad: [u8; 1 << 2]) -> i64 { if n <= 0 { 0 } else { walk(n - 1, pad) } }\n"
+            + _udf("Ok(x.map(|v| walk(v, [0; 4])))"),
+            "recursive (walk)",
+        ),
+        (
+            "struct Buf<T>(T);\n"
+            "impl Buf<[u8; 1 << 4]> {\n"
+            "    fn fill(&self, n: i64) -> i64 { if n <= 0 { 0 } else { self.fill(n - 1) } }\n"
+            "}\n" + _udf("Ok(x.map(|v| Buf([0u8; 16]).fill(v)))"),
+            "recursive (fill)",
+        ),
+        # No function recurses, but dropping a long chain of a recursive type does.
+        (
+            "struct Node { next: Option<Box<Node>> }\n"
+            + _udf(
+                "let mut h: Option<Box<Node>> = None;\n"
+                "for _ in 0..x.unwrap_or(0) { h = Some(Box::new(Node { next: h })); } Ok(x)"
+            ),
+            "recursive type (Node)",
+        ),
+        (
+            "enum A { Leaf, More(Vec<B>) }\nstruct B { a: A }\n" + _udf("Ok(x)"),
+            "recursive type",
+        ),
         ("pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x) }\n" + " " * 20_001, "too long"),
     ],
 )

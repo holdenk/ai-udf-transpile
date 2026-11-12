@@ -333,7 +333,8 @@ fallback; until then this target trades the plugin's safety for speed.
   of a function inside something it can reach from itself is refused, a
   same-named local included. Trait impls, `dyn`, `std::any`, and types,
   statics and consts that hold a function are refused too, since they can
-  call a function without naming it. An adversarial pass (bypasses
+  call a function without naming it, and so are recursive types (dropping a
+  long `Option<Box<Node>>` chain recurses in std's drop glue). An adversarial pass (bypasses
   confirmed by compiling them with rustc and overflowing the stack) shaped
   the current rules, and its cases are tests in
   `tests/test_rust_target.py`. That catches accidental recursion; it is not

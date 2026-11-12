@@ -49,7 +49,9 @@ choice above to (still exactly one):
   rejected, because they can call a function without naming it: trait impls
   (`impl Trait for Type`) and `trait` items, `dyn`, `std::any`, a
   struct/enum/`type`/`static`/`const` whose type holds a `fn(..)` or `Fn`,
-  and a function used as a value outside a function body. Use plain
+  a function used as a value outside a function body, and a recursive type
+  (`struct Node { next: Option<Box<Node>> }`: dropping a long chain
+  overflows the stack; use a `Vec` with indices). Use plain
   functions, inherent methods (`impl Type { .. }`), closures, ASCII names,
   and keep the module under 20,000 characters.
 - A panic fails the query, and integer overflow panics (overflow checks are
