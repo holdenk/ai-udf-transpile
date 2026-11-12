@@ -1169,6 +1169,25 @@ def test_local_sdk_identity_includes_the_workspace_manifest(tmp_path, monkeypatc
     assert rustc.resolve_sdk().ident != before
 
 
+def test_local_sdk_identity_includes_its_build_script(tmp_path, monkeypatch):
+    """A build.rs change (nothing in src/ or the manifests) is a new SDK, not a cache hit."""
+    for key in ("AI_UDF_TRANSPILE_COMET_HOME", "COMET_HOME"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(rustc, "_PATH_SDKS", {})
+    _fake_checkout(tmp_path / "comet", arrow="59.2.0")
+    conf.set_value(conf.RUST_COMET_SDK, str(tmp_path / "comet"))
+    crate = rustc.resolve_sdk().path
+    (crate / "build.rs").write_text("fn main() {}\n", encoding="utf-8")
+    before = rustc.resolve_sdk().ident
+    (crate / "build.rs").write_text('fn main() { println!("cargo:rustc-cfg=changed"); }\n', encoding="utf-8")
+    assert rustc.resolve_sdk().ident != before
+    # Build output under target/ is not part of the SDK's identity.
+    (crate / "target" / "debug").mkdir(parents=True)
+    after = rustc.resolve_sdk().ident
+    (crate / "target" / "debug" / "out.rs").write_text("// generated\n", encoding="utf-8")
+    assert rustc.resolve_sdk().ident == after
+
+
 def test_native_rows_state_is_per_session():
     from ai_udf_transpile.verify import _comet_native_rows
 

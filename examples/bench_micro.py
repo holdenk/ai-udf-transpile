@@ -470,7 +470,12 @@ def main() -> int:
             assert got == py_expect[name], f"{label} {name} rewrote wrongly"
             assert "EvalPython" not in df.select(udf(*cols))._jdf.queryExecution().toString()
             by_label[label][name] = udf
-    ai_ok = {name: bool(u.transpiled) for name, u in ai_udfs.items()}
+    # The catalyst column is SQL (or Java) only: an original served as Rust
+    # under the rust preset is not a catalyst number.
+    ai_ok = {
+        name: bool(u.transpiled) and target_kinds.get((name, "catalyst")) != "rust"
+        for name, u in ai_udfs.items()
+    }
     # A real backend picks its own target; only an actual Java UDF is a java arm.
     java_ok = {
         name: bool(u.transpiled) and target_kinds[(name, "java")] == "java_udf"
