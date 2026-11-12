@@ -109,8 +109,13 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
             raise SystemExit(f"cannot read perf csv {path}: {exc}")
         if not rows:
             continue
-        if "target_kind" in rows[0]:  # bench_catalog CSV: every cached function
+        if "target_kind" in rows[0]:  # bench_catalog / bench_fhi_udfs CSV
             for r in rows:
+                # bench_fhi_udfs also times its pinned naive/tuned rewrites and a
+                # non-nullable column; the doc's AI line is the live arm on the
+                # ordinary (nullable) column.
+                if r.get("arm", "ai") != "ai" or r.get("column_nullable", "True") != "True":
+                    continue
                 py_rate = r.get("python_rows_per_second")
                 tx_rate = r.get("transpiled_rows_per_second")
                 if not py_rate and not tx_rate:
@@ -124,8 +129,10 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                         "ai": f"{_fmt_rate(tx_rate)} rows/s (no python baseline)",
                     }
                     continue
+                # Same schema, different bench: bench_fhi_udfs.py names itself.
+                bench = r.get("bench") or "catalog"
                 arms = {
-                    "top": f"- **perf (catalog bench)**: interpreted python {_fmt_rate(py_rate)} rows/s",
+                    "top": f"- **perf ({bench} bench)**: interpreted python {_fmt_rate(py_rate)} rows/s",
                     "static": "",
                     "ai": "",
                 }
@@ -139,6 +146,12 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     arms["ai"] += (
                         f" · comet {_fmt_rate(comet)} rows/s ({r['comet_speedup_vs_python']}x vs python)"
                     )
+                prev_ai = perf.get(r["function"], {}).get("ai", "")
+                if arms["ai"] and not comet and " · comet " in prev_ai:
+                    # A later bench on this schema (fhi) has no comet arm:
+                    # keep the catalog bench's, labeled, since its speedup is
+                    # against that bench's own python baseline.
+                    arms["ai"] += " · comet (catalog bench) " + prev_ai.split(" · comet ", 1)[1]
                 perf[r["function"]] = arms
         elif "kinds" in rows[0]:  # bench_micro wide CSV
             for r in rows:

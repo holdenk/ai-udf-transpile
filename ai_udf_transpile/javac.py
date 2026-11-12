@@ -38,9 +38,33 @@ class JavaCompileError(Exception):
     """Java source could not be compiled into a UDF class."""
 
 
+# Comments and literals, where a class name is text rather than a reference.
+# (verify._JAVA_SKIP is the same lexer; it is duplicated here so javac does
+# not import the verifier.)
+_JAVA_TEXT = re.compile(
+    r"//[^\n\r]*"
+    r"|/\*.*?\*/"
+    r'|"""(?:[^"\\]|\\.|"(?!""))*"""'
+    r'|"(?:[^"\\\n]|\\.)*"'
+    r"|'(?:[^'\\\n]|\\.)*'",
+    re.DOTALL,
+)
+
+
+def _code_only(source: str) -> str:
+    """The source with comments and literals blanked (newlines kept), so a
+    `// This class implements ...` comment is not read as a declaration."""
+    return _JAVA_TEXT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), source)
+
+
+def _declares(source: str, simple: str) -> bool:
+    return re.search(rf"\bclass\s+{re.escape(simple)}(?![\w$])", _code_only(source)) is not None
+
+
 def extract_java_class(source: str) -> Optional[str]:
-    pkg_match = _PACKAGE_RE.search(source)
-    class_match = _CLASS_RE.search(source)
+    code = _code_only(source)
+    pkg_match = _PACKAGE_RE.search(code)
+    class_match = _CLASS_RE.search(code)
     if not class_match:
         return None
     simple = class_match.group(1)
@@ -127,18 +151,79 @@ def _compile_janino(spark: Any, java_source: str) -> bytes:
     return _jar_entries(entries)
 
 
+def _resolve_class(java_source: str, class_name: Optional[str]) -> Optional[tuple[str, str, str]]:
+    """(package, declared simple name, content-addressed simple name).
+
+    An explicitly supplied name wins when the source declares it (bare, or
+    already carrying this source's suffix); otherwise the first declaration
+    in the code (comments and literals excluded) is the class.
+    """
+    suffix = "_" + hashlib.sha256(java_source.encode("utf-8")).hexdigest()[:16]
+    declared = extract_java_class(java_source)
+    for candidate in (class_name, declared):
+        if not candidate:
+            continue
+        pkg, _, simple = candidate.rpartition(".")
+        base = simple[: -len(suffix)] if simple.endswith(suffix) else simple
+        if candidate is declared or _declares(java_source, base):
+            if not pkg and declared and candidate is not declared:
+                pkg = declared.rpartition(".")[0]
+            return pkg, base, base + suffix
+    return None
+
+
+def unique_class_name(java_source: str, class_name: Optional[str] = None) -> Optional[str]:
+    """The name a source is compiled under: its class, suffixed with a hash of
+    the source text.
+
+    Every jar a session registers lands in one classloader, and a class name
+    resolves to whichever jar loaded it first. Two different rewrites that
+    happen to pick the same name (retry attempts, a re-verify after the UDF
+    changed, two functions both called `clean`) would otherwise all run the
+    first one's code -- in verification as well as in serving. Hashing the
+    source makes the name a function of the code, so one name, one body.
+    """
+    resolved = _resolve_class(java_source, class_name)
+    if resolved is None:
+        return None
+    pkg, _base, unique = resolved
+    return f"{pkg}.{unique}" if pkg else unique
+
+
+def _rename_class(java_source: str, old_simple: str, new_simple: str) -> str:
+    """Replace the identifier `old_simple` in code (not in comments or literals)."""
+    word = re.compile(rf"(?<![\w$]){re.escape(old_simple)}(?![\w$])")
+    out: list[str] = []
+    last = 0
+    for text in _JAVA_TEXT.finditer(java_source):
+        out.append(word.sub(new_simple, java_source[last : text.start()]))
+        out.append(text.group(0))
+        last = text.end()
+    out.append(word.sub(new_simple, java_source[last:]))
+    return "".join(out)
+
+
 def compile_java(spark: Any, java_source: str, class_name: Optional[str] = None) -> CompiledJava:
-    """Compile Java UDF source to jar bytes. JDK compiler first, Janino fallback."""
+    """Compile Java UDF source to jar bytes. JDK compiler first, Janino fallback.
+
+    The class is compiled under `unique_class_name` (the declared name plus a
+    hash of the source) and that is the name returned: callers register and
+    store `CompiledJava.class_name`, never the name the source declares.
+    Passing either name back in for the same source yields the same result.
+    """
     if spark is None:
         raise JavaCompileError("compile_java requires a SparkSession")
-    resolved = class_name or extract_java_class(java_source)
-    if not resolved:
+    resolved = _resolve_class(java_source, class_name)
+    if resolved is None:
         raise JavaCompileError("no class declaration found in Java source")
+    pkg, base, simple = resolved
+    unique = f"{pkg}.{simple}" if pkg else simple
+    source = _rename_class(java_source, base, simple)
     try:
-        return CompiledJava(_compile_jdk(spark, java_source, resolved), resolved, janino=False)
+        return CompiledJava(_compile_jdk(spark, source, unique), unique, janino=False)
     except JavaCompileError as exc:
         logger.info("JDK compile unavailable (%s); falling back to janino", exc)
-    return CompiledJava(_compile_janino(spark, java_source), resolved, janino=True)
+    return CompiledJava(_compile_janino(spark, source), unique, janino=True)
 
 
 def _stage_jar(name: str, jar_bytes: bytes) -> str:

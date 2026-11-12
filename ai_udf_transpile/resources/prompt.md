@@ -15,8 +15,46 @@ is rejected. DECLINE is cheap and final -- a wrong guess is wasted work.
 - `split` is a regex. `substr` is 1-based. `lpad` is not `zfill`.
 - `dayofweek` is Sunday=1. `lower` is not `casefold`.
 - Casts are not Python `int()` or `str()`. An `int` annotation is Spark `bigint`.
-- No `reflect` or `java_method`.
+- No `reflect`, `try_reflect` or `java_method`.
 - If you are not sure, DECLINE.
+
+## Faster than the Python, or it is not a rewrite
+
+A verified rewrite that runs slower than the interpreted UDF is a regression,
+and for text UDFs it is the easy thing to write. A rewrite saves one thing for
+certain: the per-row trip to the Python worker. Each `regexp_*` / `RLIKE`
+evaluation costs about as much as that whole trip, so:
+
+- **Never turn a `str` method into a regex.** `s.strip()` is
+  `btrim(s, '\u0009\u000a\u000b\u000c\u000d\u001c\u001d\u001e\u001f\u0020\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000')`
+  -- those 29 code points are exactly what Python strips, and `btrim` with a
+  character set needs no regex. `s.strip('.')` is `btrim(s, '.')`. Use
+  `startswith`, `contains`, `instr`, `substr`, `split_part` for their Python
+  twins; `split` and `regexp_replace` are regexes.
+- **Do not open with `CASE WHEN _udf_param_0 IS NULL THEN NULL`.** `btrim`,
+  `upper`, `substr` and `regexp_*` already return NULL for NULL. A leading
+  guard is the only condition Spark always evaluates, so it stops sharing
+  the subexpressions repeated in later branches and computes every copy. If
+  a subexpression is reused, make it appear in the FIRST `WHEN` condition.
+- **Line-by-line or character-by-character logic belongs in a Java UDF with
+  plain loops** (`charAt`, `startsWith(prefix, offset)`), not in one regex
+  over the whole text and not in `transform`/`filter`. Python's
+  `str.isspace()` set is the 29 code points above; `splitlines()` breaks on
+  `\n \r \x0b \x0c \x1c \x1d \x1e \x85 \u2028 \u2029` (`\r\n` is one break).
+- **Avoid `->` lambdas whenever a lambda-free spelling exists.** Spark 4.3
+  does not serve a scalar rewrite that contains one: it keeps the Python UDF
+  and says nothing.
+- **When the Python makes five or more `re` calls per row, the work only
+  changes engines**, and spelling Python's unicode `\s` / `\d` / `\w` / `\b` out for
+  `java.util.regex` makes it slower than CPython. Pay for that only on rows
+  that need it: for pure-ASCII text Java's cheap classes mean what Python's
+  mean (`\s` is `[\t-\r\x1c-\x20]`, `\d` is `[0-9]`, `\w` is
+  `[A-Za-z0-9_]`, `\b` is `\b`, `(?iu)` is `(?i)`). In SQL:
+  `CASE WHEN length(x) = octet_length(x) THEN <ascii spelling> ELSE <faithful spelling> END`.
+  In a Java UDF: test once at the top of `call` and pick a pattern set.
+  With one or two simple patterns, skip this: a plain `regexp_extract` /
+  `regexp_replace` with `(?iu)` already beats the Python, and a guard only
+  adds work.
 
 ## Inputs (authoritative)
 
@@ -150,10 +188,20 @@ Implement `org.apache.spark.sql.api.java.UDFN` (N = arity):
   arbitrary precision, so a `long` can overflow where Python cannot;
   `Double.toString` spells non-finite values `Infinity`/`NaN` where Python
   spells `inf`/`nan` — match Python's spelling if the UDF stringifies.
+- Regex lookbehind (Java UDFs and Spark `regexp_*` alike, both are
+  `java.util.regex`): a lookbehind over a character class steps back ONE
+  UTF-16 unit, so `(?<![\p{L}\p{N}_])` reads a lone low surrogate after a
+  letter or digit outside the BMP (U+10000 and up) and calls it a non-word
+  character. Python reads the whole code point. Write the lookbehind as
+  `(?<![\p{L}\p{N}_]{1,2})` / `(?<=[\p{L}\p{N}_]{1,2})`, or test
+  `Character.codePointBefore` in code. A `\b` emulation that skips this
+  leaves an SSN ending in a mathematical digit unredacted.
 - Forbidden APIs (the rewrite is rejected before it is ever compiled or run):
-  `Runtime.getRuntime`, `System.load`/`loadLibrary`/`exit`, `ProcessBuilder`,
-  reflection (`Class.forName`, `loadClass`, `getMethod`, `MethodHandles`),
-  any `exec(`, and anything under `java.io.`, `java.net.`, or `javax.script`.
+  `Runtime.getRuntime`, `System.load`/`loadLibrary`/`exit`/`getenv`/`getProperty`,
+  `ProcessBuilder`, reflection (`Class.forName`, `loadClass`, `ClassLoader`,
+  `getMethod`/`getDeclaredMethod` and the Constructor/Field variants,
+  `MethodHandles`), any `exec(`, and anything under `java.io.`, `java.net.`,
+  `java.nio.file`, `java.nio.channels`, `javax.net`, or `javax.script`.
   A row function needs none of them.
 
 ### Example (Java)
@@ -184,7 +232,7 @@ public class Backwards implements UDF1<Object, Object> {
 - The UDF calls a network/service/SDK (boto3, requests), reads the clock or
   randomness, or does I/O: no faithful rewrite exists.
 - You cannot match Python semantics for the declared types with confidence.
-- Never emit `reflect` or `java_method`. They invoke arbitrary JVM methods
+- Never emit `reflect`, `try_reflect` or `java_method`. They invoke arbitrary JVM methods
   and are rejected before the rewrite is run.
 
 Match Python semantics for the given types, including NULL (`None`).

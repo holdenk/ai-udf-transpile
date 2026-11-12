@@ -157,6 +157,21 @@ def _time_arm(df, udf, rounds: int) -> float | None:
     return best if best < float("inf") else None
 
 
+def _plans_python(df, udf) -> bool:
+    """True when the served arm's physical plan still evaluates the python UDF.
+
+    `udf.transpiled` only says a rewrite was offered. Spark drops one it
+    cannot apply (a higher-order-function lambda in the SQL is enough) and
+    plans the interpreted UDF instead, without a word -- and that arm's
+    number would be python's, wearing the transpiled label.
+    """
+    arm = df.select(udf(*[f"arg{i}" for i in range(len(df.columns))]))
+    try:
+        return "EvalPython" in arm._jdf.queryExecution().executedPlan().toString()
+    except Exception:
+        return False  # planning errors surface in _time_arm, as before
+
+
 def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], comet_jar: str) -> None:
     """The same served SQL, executed natively by Comet, in a fresh JVM: the jar
     must be on the driver classpath at launch, so the first session's gateway
@@ -319,10 +334,12 @@ def main() -> int:
         spark.conf.set(TRANSPILE_CONF, "true")
         if row.status == "success":
             udf = UserDefinedFunction(func, rtype)
-            if udf.transpiled:
-                tx_secs = _time_arm(df, udf, args.rounds)
-            else:
+            if not udf.transpiled:
                 print(f"{name}: transpiled arm not served (no hit) -- python only")
+            elif _plans_python(df, udf):
+                print(f"{name}: rewrite verified, but Spark still plans the python UDF -- python only")
+            else:
+                tx_secs = _time_arm(df, udf, args.rounds)
         py_rate = round(args.rows / py_t) if py_t else ""
         tx_rate = round(args.rows / tx_secs) if tx_secs else ""
         entry["python_rows_per_second"] = py_rate

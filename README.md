@@ -201,6 +201,7 @@ examples/run_demos.sh --bench --transpilation-timing-csv bench_transpilation_tim
 examples/run_demos.sh --bench --rust-accel
 examples/run_demos.sh --bench-bytecode   # static (AST) vs bytecode->SQL vs Java bytecode eval vs python
 examples/run_demos.sh --bench-tpcds     # TPC-DS-inspired UDF patterns vs vanilla SQL
+examples/run_demos.sh --bench-fhi       # real pipeline text UDFs (regex, PII scrub) vs their rewrites
 examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 ```
 
@@ -244,6 +245,34 @@ python-semantics rewrites (spark_substr's clamped slice, spark_str's
 'None', spark_eq's NULL-safe `=`) carry guards the naive vanilla expression
 lacks, and three UDFBench date parsers are declined outright — no faithful
 SQL exists for int() over a free-form prefix.
+
+`examples/bench_fhi_udfs.py` benchmarks UDFs nobody wrote for this plugin:
+seven scalar text UDFs from Fight Health Insurance's training-data pipeline
+(verdict parsing, entity cleanup, the findings regex extractors, the regex
+PII scrubber), ported self-contained into
+`ai_udf_transpile/backends/fhi_udfs.py`. Every one is regex or a line loop
+over free text, and it is where "verified" and "faster" came apart: all
+seven got a rewrite that passed the gate on the first attempt, and five of
+those were slower than the interpreted Python (0.3x-0.9x, at 100k rows and
+at 50M alike), while a sixth was never served because its SQL used a
+lambda. A rewrite faithful to `str.strip()`, `splitlines()` and Python's
+unicode `\s`/`\d`/`\b` spells them out as `java.util.regex` classes and
+lookarounds, and each regex evaluation costs about as much as the Python
+round trip the rewrite saves.
+
+The bench keeps both kinds of rewrite on purpose: per function, the AI's
+first verified rewrite (`naive`, the regression exhibit) and a hand-tuned
+faithful one (`tuned`), timed next to Python and, with `--ai`, whatever the
+backend serves today; each over a nullable and a provably non-null column,
+with `ai_udf_transpile.regress`'s static guess printed beside every ratio.
+After the prompt gained a section on speed, six of the seven AI rewrites
+beat Python. The numbers, what changed and why are in
+[CHANGELOG.md](CHANGELOG.md).
+
+```bash
+examples/run_demos.sh --bench-fhi                       # or: python examples/bench_fhi_udfs.py
+python examples/bench_fhi_udfs.py --ai --only fhi_deidentify_text --sampled-strings-only
+```
 
 The perf graphs are generated from that CSV by a CLI tool
 (`examples/bench_graph.py`, matplotlib — no AI in the loop, ever). One

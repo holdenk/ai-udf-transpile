@@ -78,14 +78,18 @@ def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
             from ai_udf_transpile.javac import compile_java, register_java_udf, verify_function_name
 
             binary = row.impl_binary
+            class_name = row.impl_class
             if binary is None and row.impl_source:
-                binary = compile_java(spark, row.impl_source, row.impl_class).jar_bytes
+                # Compiled under its content-addressed name (javac.unique_class_name),
+                # which a row stored before that rename does not carry.
+                compiled = compile_java(spark, row.impl_source, row.impl_class)
+                binary, class_name = compiled.jar_bytes, compiled.class_name
             # Content-addressed like the verify path: a key-addressed name
             # would keep serving a stale jar after a re-verify stored new
             # bytes for the same key (the artifact cache refuses overwrite
             # and the classloader will not reload the old class name).
             fname = verify_function_name("ai_udf", binary)
-            register_java_udf(spark, fname, row.impl_class, binary, return_type)
+            register_java_udf(spark, fname, class_name, binary, return_type)
             return F.expr(f"{fname}({args})").cast(return_type)
         if row.impl_source:
             logger.debug("java_udf impl_source without impl_class; cannot reconstruct")

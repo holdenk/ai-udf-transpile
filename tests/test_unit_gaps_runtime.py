@@ -29,7 +29,7 @@ from ai_udf_transpile.catalog import (
 )
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog
 from ai_udf_transpile.catalog.writeback import WritebackCatalog
-from ai_udf_transpile.javac import JavaCompileError, _stage_jar, compile_java
+from ai_udf_transpile.javac import JavaCompileError, _stage_jar, compile_java, unique_class_name
 from ai_udf_transpile.keys import canonical_source_from_func
 from ai_udf_transpile.targets import TranspileResult
 from ai_udf_transpile.transpiler import get_session, set_catalog
@@ -226,7 +226,8 @@ def test_compile_java_falls_back_to_janino_when_jdk_unavailable(monkeypatch):
     compiled = compile_java(object(), "public class Foo {}")
     assert compiled.janino is True
     assert compiled.jar_bytes == b"jarbytes"
-    assert compiled.class_name == "Foo"
+    assert compiled.class_name == unique_class_name("public class Foo {}")  # Foo_<source hash>
+    assert compiled.class_name.startswith("Foo_")
 
 
 def test_stage_jar_rewrites_when_content_changes():
@@ -253,7 +254,8 @@ def test_compile_and_register_java_udf_real_jdk(spark):
         compiled = compile_java(spark, java_source)
     except JavaCompileError as exc:
         pytest.skip(f"no javac/janino available: {exc}")
-    assert compiled.class_name == "ai_udf_test.Adder"
+    assert compiled.class_name == unique_class_name(java_source)
+    assert compiled.class_name.startswith("ai_udf_test.Adder_")
     from pyspark.sql.types import IntegerType
 
     fname = verify_function_name("ai_udf_test_adder", compiled.jar_bytes)

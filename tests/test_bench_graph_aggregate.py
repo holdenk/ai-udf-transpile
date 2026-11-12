@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -101,3 +102,40 @@ def test_aggregate_rejects_unrecognized_csv(tmp_path):
         text=True,
     )
     assert proc.returncode != 0
+
+
+def test_aggregate_routes_kind_labeled_rows_to_the_ai_arms(tmp_path):
+    # bench_catalog / bench_fhi_udfs share transpiled_rows_per_second with the
+    # tpcds CSV, but their rows are AI rewrites and say which kind was served.
+    (tmp_path / "bench_fhi.csv").write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,bench,string_gate\n"
+        "sql_one,1000,100,230,2.3,,,success,catalyst,claude,m,fhi,party\n"
+        "sql_two,1000,100,50,0.5,900,9.0,success,catalyst,claude,m,fhi,party\n"
+        "java_one,1000,100,40,0.4,,,success,java_udf,claude,m,fhi,party\n"
+        # verified but Spark planned the python UDF: no rewrite ran, no point
+        "dropped,1000,100,,,,,not_served,catalyst,claude,m,fhi,party\n"
+        "declined,1000,100,,,,,failed,,claude,m,fhi,party\n",
+        encoding="utf-8",
+    )
+    # With an arm column, only the live AI arm on the nullable column counts:
+    # the pinned naive/tuned rewrites and the non-null column are exhibits.
+    (tmp_path / "bench_fhi_arms.csv").write_text(
+        "function,arm,column_nullable,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,status,target_kind,backend,model,bench\n"
+        "f,naive,True,1000,100,30,0.3,success,catalyst,pinned,,fhi\n"
+        "f,tuned,True,1000,100,190,1.9,success,catalyst,pinned,,fhi\n"
+        "f,ai,True,1000,100,150,1.5,success,catalyst,claude,m,fhi\n"
+        "f,ai,False,1000,100,160,1.6,success,catalyst,claude,m,fhi\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("bench_graph_aggregate", AGGREGATE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    points = module.collect([tmp_path / "bench_fhi.csv"])
+    assert points["ai_catalyst"] == [("fhi/sql_one", 2.3), ("fhi/sql_two", 0.5)]
+    assert points["ai_java"] == [("fhi/java_one", 0.4)]
+    assert points["ai_catalyst_comet"] == [("fhi/sql_two", 9.0)]
+    assert points["transpiled"] == [] and points["vanilla"] == []
+    assert module.collect([tmp_path / "bench_fhi_arms.csv"])["ai_catalyst"] == [("fhi arms/f", 1.5)]

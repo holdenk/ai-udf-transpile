@@ -9,7 +9,8 @@
 #   examples/run_demos.sh --bench --rust-accel [--rust-accel-conf key=value]
 #   examples/run_demos.sh --bench-bytecode        # python vs static (AST) vs bytecode->SQL vs Java bytecode eval
 #   examples/run_demos.sh --bench-tpcds           # TPC-DS-inspired UDF patterns vs vanilla SQL
-#   examples/run_demos.sh --all-benches --csv out.csv  # every bench: micro (+comet if COMET_JAR), bytecode, tpcds, catalog; then the graphs
+#   examples/run_demos.sh --bench-fhi             # real pipeline text UDFs: python vs pinned naive/tuned rewrites vs the live AI
+#   examples/run_demos.sh --all-benches --csv out.csv  # every bench: micro (+comet if COMET_JAR), bytecode, tpcds, fhi, catalog; then the graphs
 #   examples/run_demos.sh --dump                  # + dump $AI_UDF_TRANSPILE_SQLITE to docs/EXAMPLES_TRANSPILED.md
 #   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 #
@@ -55,11 +56,13 @@ LIVE=0
 BENCH=0
 BENCH_BYTECODE=0
 BENCH_TPCDS=0
+BENCH_FHI=0
 BENCH_ALL=0
 ALL_BENCHES=0
 DUMP=0
 CSV=""
 TPCDS_CSV=""
+FHI_CSV=""
 CATALOG_CSV=""
 BYTECODE_CSV=""
 TRANSPILE_TIMING_CSV=""
@@ -72,6 +75,7 @@ while [ $# -gt 0 ]; do
     --bench) BENCH=1 ;;
     --bench-bytecode) BENCH_BYTECODE=1 ;;
     --bench-tpcds) BENCH_TPCDS=1 ;;
+    --bench-fhi) BENCH_FHI=1 ;;
     --bench-all) BENCH_ALL=1 ;;
     # Every bench and every transpiled arm (static, bytecode, ai, comet).
     --all-benches)
@@ -79,6 +83,7 @@ while [ $# -gt 0 ]; do
       BENCH=1
       BENCH_BYTECODE=1
       BENCH_TPCDS=1
+      BENCH_FHI=1
       BENCH_ALL=1
       ;;
     --dump) DUMP=1 ;;
@@ -87,6 +92,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "error: --csv needs a path" >&2; exit 2; }
       CSV="$2"
       TPCDS_CSV="${CSV%.csv}_tpcds.csv"
+      FHI_CSV="${CSV%.csv}_fhi.csv"
       CATALOG_CSV="${CSV%.csv}_catalog.csv"
       BYTECODE_CSV="${CSV%.csv}_bytecode.csv"
       BENCH=1
@@ -181,6 +187,18 @@ if [ "$BENCH_TPCDS" -eq 1 ]; then
   run_demo "tpcds udf bench" "${TPCDS_ARGS[@]}"
 fi
 
+# Before the catalog bench: its fills land in the same cache, so the coverage
+# bench picks these functions up too.
+if [ "$BENCH_FHI" -eq 1 ]; then
+  # --ai: the live arm, whose fills land in the cache; without it the bench
+  # only times its pinned naive/tuned rewrites.
+  FHI_ARGS=(examples/bench_fhi_udfs.py --ai)
+  if [ -n "$CSV" ]; then
+    FHI_ARGS+=(--csv "$FHI_CSV")
+  fi
+  run_demo "fhi udf bench" "${FHI_ARGS[@]}"
+fi
+
 if [ "$BENCH_ALL" -eq 1 ]; then
   [ -n "${AI_UDF_TRANSPILE_SQLITE:-}" ] || { echo "error: --bench-all needs AI_UDF_TRANSPILE_SQLITE" >&2; exit 2; }
   BCAT_ARGS=(examples/bench_catalog.py --sqlite "$AI_UDF_TRANSPILE_SQLITE")
@@ -200,11 +218,13 @@ if [ "$DUMP" -eq 1 ]; then
   [ -n "${AI_UDF_TRANSPILE_SQLITE:-}" ] || { echo "error: --dump needs AI_UDF_TRANSPILE_SQLITE" >&2; exit 2; }
   DUMP_ARGS=(examples/dump_results.py --sqlite "$AI_UDF_TRANSPILE_SQLITE" --out docs/EXAMPLES_TRANSPILED.md)
   if [ -n "$CSV" ]; then
-    # Catalog CSV first (widest coverage); micro/tpcds take over per function
-    # with their deeper arms. Later --perf-csv files win.
+    # Catalog CSV first (widest coverage); micro/tpcds/fhi take over per function
+    # with their deeper arms (fhi: domain-shaped rows instead of the catalog
+    # bench's one benign string). Later --perf-csv files win.
     [ -f "$CATALOG_CSV" ] && DUMP_ARGS+=(--perf-csv "$CATALOG_CSV")
     DUMP_ARGS+=(--perf-csv "$CSV")
     [ -f "$TPCDS_CSV" ] && DUMP_ARGS+=(--perf-csv "$TPCDS_CSV")
+    [ -f "$FHI_CSV" ] && DUMP_ARGS+=(--perf-csv "$FHI_CSV")
   fi
   run_demo "dump" "${DUMP_ARGS[@]}"
 fi

@@ -7,10 +7,10 @@
 # party on. Then dump the cache.
 #
 # The benches run in both passes and write
-# questionable_benchmark_results/examples_transpiled_bench{,_bytecode,_tpcds,_catalog}.csv;
+# questionable_benchmark_results/examples_transpiled_bench{,_bytecode,_tpcds,_fhi,_catalog}.csv;
 # the dump joins them into the doc: interpreted python rows/s at the top of
 # each section, each transpiled arm's rows/s at the end of its own line.
-# Pass 2 is --all-benches: every bench (micro, bytecode, tpcds, catalog) and the
+# Pass 2 is --all-benches: every bench (micro, bytecode, tpcds, fhi, catalog) and the
 # graphs; pass 1 only needs numbers good enough to smoke-test the fill. bench_catalog.py is the coverage bench -- every cached function gets
 # numbers or a loud skip; micro/tpcds add their deeper arms.
 #
@@ -33,6 +33,6 @@ rm -f "$AI_UDF_TRANSPILE_SQLITE"{,-wal,-shm}
 
 CSV="$REPO_ROOT/questionable_benchmark_results/examples_transpiled_bench.csv"
 echo "##### pass 1/2: filling $AI_UDF_TRANSPILE_SQLITE from $AI_UDF_TRANSPILE_BACKEND #####"
-"$REPO_ROOT/examples/run_demos.sh" --bench --bench-tpcds --bench-all --csv "$CSV" "$@" || echo "pass 1 had failures; pass 2 decides"
+"$REPO_ROOT/examples/run_demos.sh" --bench --bench-tpcds --bench-fhi --bench-all --csv "$CSV" "$@" || echo "pass 1 had failures; pass 2 decides"
 echo "##### pass 2/2: cache hits, then the dump #####"
 "$REPO_ROOT/examples/run_demos.sh" --all-benches --csv "$CSV" "$@" --dump

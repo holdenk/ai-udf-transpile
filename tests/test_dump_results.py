@@ -261,6 +261,38 @@ def test_perf_lines_unit(tmp_path):
         "static": "",
         "ai": "6.0M rows/s (3.0x vs python) · comet 9.0M rows/s (4.5x vs python)",
     }
+    # bench_fhi_udfs.py writes the same schema and names itself in a bench column
+    fhi = tmp_path / "fhi.csv"
+    fhi.write_text(
+        CATALOG_CSV.replace("status,target_kind,backend,model\n", "status,target_kind,backend,model,bench\n")
+        .replace("coco/auto\n", "coco/auto,fhi\n")
+        .replace("human,\n", "human,,fhi\n"),
+        encoding="utf-8",
+    )
+    assert _load_dump_module()._perf_lines([str(fhi)])["has_item"]["top"] == (
+        "- **perf (fhi bench)**: interpreted python 2.0M rows/s"
+    )
+    # ...and passed after the catalog CSV it takes over the function's line,
+    # but the comet number only the catalog bench measured stays, labeled.
+    fhi.write_text(fhi.read_text().replace("3.0,9000000,4.5,success", "3.0,,,success"), encoding="utf-8")
+    merged = _load_dump_module()._perf_lines([str(cat), str(fhi)])["has_item"]
+    assert merged["top"].startswith("- **perf (fhi bench)**")
+    assert merged["ai"] == (
+        "6.0M rows/s (3.0x vs python) · comet (catalog bench) 9.0M rows/s (4.5x vs python)"
+    )
+    # bench_fhi_udfs rows for its pinned arms and its non-null column are
+    # skipped: the doc's AI line is the live arm on the nullable column.
+    arms = tmp_path / "arms.csv"
+    arms.write_text(
+        "function,arm,column_nullable,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,status,target_kind,backend,model,bench\n"
+        "f,naive,True,1000,1000000,300000,0.3,success,catalyst,pinned,,fhi\n"
+        "f,ai,False,1000,1000000,9000000,9.0,success,catalyst,claude,m,fhi\n"
+        "f,ai,True,1000,1000000,1500000,1.5,success,catalyst,claude,m,fhi\n"
+        "f,tuned,True,1000,1000000,1900000,1.9,success,catalyst,pinned,,fhi\n",
+        encoding="utf-8",
+    )
+    assert _load_dump_module()._perf_lines([str(arms)])["f"]["ai"] == "1.5M rows/s (1.5x vs python)"
     # python-only row (no transpiled arm served) keeps the top, no ai suffix
     assert perf["plus_two"]["ai"] == ""
     assert perf["plus_two"]["top"].endswith("interpreted python 1.5M rows/s")

@@ -4,7 +4,8 @@
   python examples/bench_graph_aggregate.py questionable_benchmark_results/
 
 Reads every bench*.csv in the directory (bench_micro, bench_bytecode_vs_static,
-bench_tpcds_udfs), normalizes each arm to a speedup vs interpreted python, and
+bench_tpcds_udfs, bench_catalog, bench_fhi_udfs), normalizes each arm to a
+speedup vs interpreted python, and
 draws one horizontal strip per path: every point is one (benchmark, function)
 pair, so the honest picture includes the stragglers. Fallback rows (a declined
 pattern running python perf under the transpiled label) are excluded -- they
@@ -66,6 +67,33 @@ _SCHEMAS = {
 }
 
 
+# bench_catalog / bench_fhi_udfs rows say what was served: target_kind -> arm.
+_KIND_ARMS = {"catalyst": "ai_catalyst", "java_udf": "ai_java"}
+
+
+def _collect_by_kind(path: Path, rows: list[dict], points: dict[str, list[tuple[str, float]]]) -> None:
+    """One row per function, the served rewrite's kind in target_kind. These
+    are AI rewrites, so they belong on the AI arms -- not on the tpcds
+    `transpiled` strip the shared transpiled_rows_per_second column would
+    otherwise sniff them onto."""
+    bench = path.stem.replace("bench_", "").replace("_", " ")
+    for row in rows:
+        # bench_fhi_udfs: only the live AI arm on the nullable column is an
+        # AI rewrite as served; its pinned arms are exhibits, not output.
+        if row.get("arm", "ai") != "ai" or row.get("column_nullable", "True") != "True":
+            continue
+        arm = _KIND_ARMS.get(row.get("target_kind", ""))
+        if arm is None or row.get("status") != "success":
+            continue  # declined, failed, or verified but not served: no rewrite ran
+        label = f"{bench}/{row['function']}"
+        raw = row.get("transpiled_speedup_vs_python", "")
+        if raw and float(raw) > 0:
+            points[arm].append((label, float(raw)))
+        comet = row.get("comet_speedup_vs_python", "")
+        if comet and float(comet) > 0 and f"{arm}_comet" in ARMS:
+            points[f"{arm}_comet"].append((label, float(comet)))
+
+
 def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
     """arm -> [(benchmark, function), speedup]"""
     points: dict[str, list[tuple[str, float]]] = {arm: [] for arm in ARMS}
@@ -73,6 +101,9 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
         with open(path, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         if not rows:
+            continue
+        if "target_kind" in rows[0]:
+            _collect_by_kind(path, rows, points)
             continue
         specs = next((s for sig, s in _SCHEMAS.items() if sig in rows[0]), None)
         if specs is None:
