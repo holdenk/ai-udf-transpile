@@ -7,6 +7,7 @@ import re
 from typing import Any, Optional
 
 from ai_udf_transpile.catalog import (
+    AWAITING_APPROVAL,
     HIT,
     MISS,
     WAIT,
@@ -18,6 +19,7 @@ from ai_udf_transpile.catalog import (
     loads_dict,
     loads_list,
     provisional_visible,
+    rejection_error,
     retries_exhausted,
     tolerance_serves,
 )
@@ -101,6 +103,8 @@ def _row_from_spark(rec: Any) -> CacheRow:
         claimed_at=as_dict.get("claimed_at"),
         created_at=as_dict.get("created_at"),
         updated_at=as_dict.get("updated_at"),
+        reviewed_by=as_dict.get("reviewed_by"),
+        reviewed_at=as_dict.get("reviewed_at"),
     )
 
 
@@ -141,7 +145,9 @@ class DeltaCatalog:
                 failed_at STRING,
                 claimed_at STRING,
                 created_at STRING,
-                updated_at STRING
+                updated_at STRING,
+                reviewed_by STRING,
+                reviewed_at STRING
             ) USING delta
             """
         )
@@ -157,6 +163,9 @@ class DeltaCatalog:
             self.spark.sql(f"ALTER TABLE {self.table} ADD COLUMNS (model STRING)")
         if "tolerance" not in cols:
             self.spark.sql(f"ALTER TABLE {self.table} ADD COLUMNS (tolerance DOUBLE)")
+        for column in ("reviewed_by", "reviewed_at"):
+            if column not in cols:
+                self.spark.sql(f"ALTER TABLE {self.table} ADD COLUMNS ({column} STRING)")
 
     def _select(self, udf_key: str) -> Optional[CacheRow]:
         # insert_pending is select-then-insert and Delta has no PK, so
@@ -184,6 +193,11 @@ class DeltaCatalog:
         if row.reconstructable():
             session = spark if spark is not None else self.spark
             if tolerance_serves(row.tolerance, session):
+                from ai_udf_transpile.approval import blocks_serving
+
+                if blocks_serving(row, session):
+                    self._park_for_approval(udf_key, ("success",))
+                    return WAIT, self._select(udf_key)
                 return HIT, row
             now = iso_now()
             self.spark.sql(
@@ -308,6 +322,8 @@ class DeltaCatalog:
                 tolerance = {_sql_float(tolerance)},
                 error = NULL,
                 failed_at = NULL,
+                reviewed_by = NULL,
+                reviewed_at = NULL,
                 claimed_at = {claimed},
                 updated_at = {_sql_str(now)}
             WHERE udf_key = {_sql_str(udf_key)}
@@ -370,6 +386,8 @@ class DeltaCatalog:
         hypothesis_passed: Optional[bool],
         visible: bool = True,
         tolerance: Optional[float] = None,
+        reviewed_by: Optional[str] = None,
+        reviewed_at: Optional[str] = None,
     ) -> None:
         if not return_type or not input_types:
             raise ValueError("upsert_success requires known types")
@@ -402,6 +420,8 @@ class DeltaCatalog:
                 model = {_sql_str(result.model)},
                 hypothesis_passed = {hyp},
                 tolerance = {_sql_float(tolerance)},
+                reviewed_by = {_sql_str(reviewed_by)},
+                reviewed_at = {_sql_str(reviewed_at)},
                 error = NULL,
                 failed_at = NULL,
                 claimed_at = {claimed},
@@ -411,7 +431,7 @@ class DeltaCatalog:
                 return_type, spark_version, closure_fingerprint, captures_json,
                 status, target_kind, catalyst_sql, impl_source, impl_class,
                 impl_entry, impl_binary, origin, model, hypothesis_passed, tolerance,
-                attempt_count, claimed_at, created_at, updated_at
+                reviewed_by, reviewed_at, attempt_count, claimed_at, created_at, updated_at
             ) VALUES (
                 {_sql_str(udf_key)}, {_sql_str(source_text)}, {_sql_str(dumps(param_names))},
                 {_sql_str(dumps(input_types))}, {_sql_str(dumps(input_categories))},
@@ -421,11 +441,61 @@ class DeltaCatalog:
                 {_sql_str(result.java_source)}, {_sql_str(result.class_name)},
                 {_sql_str(result.entry)}, {_sql_blob_hex(result.binary)},
                 {_sql_str(origin)}, {_sql_str(result.model)}, {hyp}, {_sql_float(tolerance)},
-                0, {claimed},
+                {_sql_str(reviewed_by)}, {_sql_str(reviewed_at)}, 0, {claimed},
                 {_sql_str(now)}, {_sql_str(now)}
             )
             """
         )
+
+    # -- manual approval ---------------------------------------------------
+
+    def _park_for_approval(self, udf_key: str, from_statuses: tuple[str, ...]) -> None:
+        now = iso_now()
+        statuses = ", ".join(_sql_str(s) for s in from_statuses)
+        self.spark.sql(
+            f"""
+            UPDATE {self.table}
+            SET status = {_sql_str(AWAITING_APPROVAL)}, claimed_at = NULL, updated_at = {_sql_str(now)}
+            WHERE udf_key = {_sql_str(udf_key)} AND status IN ({statuses})
+            """
+        )
+
+    def mark_awaiting_approval(self, udf_key: str) -> None:
+        self._park_for_approval(udf_key, ("provisional", "success"))
+
+    def awaiting_approval(self) -> list[CacheRow]:
+        rows = self.spark.sql(
+            f"SELECT * FROM {self.table} WHERE status = {_sql_str(AWAITING_APPROVAL)} "
+            "ORDER BY updated_at ASC, udf_key ASC"
+        ).collect()
+        return [_row_from_spark(r) for r in rows]
+
+    def _review(self, udf_key: str, sets: str, reviewer: str) -> bool:
+        before = self._select(udf_key)
+        if before is None or before.status != AWAITING_APPROVAL:
+            return False
+        now = iso_now()
+        self.spark.sql(
+            f"""
+            UPDATE {self.table}
+            SET {sets}, reviewed_by = {_sql_str(reviewer)}, reviewed_at = {_sql_str(now)},
+                updated_at = {_sql_str(now)}
+            WHERE udf_key = {_sql_str(udf_key)} AND status = {_sql_str(AWAITING_APPROVAL)}
+            """
+        )
+        after = self._select(udf_key)
+        return after is not None and after.reviewed_by == reviewer and after.reviewed_at == now
+
+    def approve(self, udf_key: str, reviewer: str) -> bool:
+        return self._review(udf_key, "status = 'success', error = NULL", reviewer)
+
+    def reject(self, udf_key: str, reviewer: str, reason: str = "") -> bool:
+        now = iso_now()
+        sets = (
+            f"status = 'failed', error = {_sql_str(rejection_error(reviewer, reason))}, "
+            f"failed_at = {_sql_str(now)}"
+        )
+        return self._review(udf_key, sets, reviewer)
 
     def reclaim_stale(self, timeout_seconds: int, max_retries: int) -> int:
         from datetime import datetime, timedelta, timezone

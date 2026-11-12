@@ -7,6 +7,26 @@ evidence for a direction, not a promise about your cluster.
 
 ## Unreleased
 
+### Manual approval for hard-to-verify rewrites (2026-11-12)
+
+`spark.sql.experimental.aiUdfTranspile.requireApproval` (default `none`)
+parks AI rewrites in a new `awaiting_approval` status after they pass
+Hypothesis and the reconstruction smoke test, so a person signs off before
+they are served or written back. Gate everything (`all`) or only the cases
+Hypothesis is weakest on: `string` / `struct` / `map` / `array` / `binary` /
+`timestamp` types, `network` (the UDF imports or calls a network client),
+or `hard` (`string,struct,map,array,network`). Human (`register_impl`) and
+`bytecode` rows are exempt.
+
+`python -m ai_udf_transpile.approve` walks the queue, showing the Python,
+the rewrite, the flags it tripped and sampled inputs, and prompts
+`[y/n/skip]`; `--browse` is the same view read-only, and `--list` /
+`--approve` / `--reject` script it. `reviewed_by` / `reviewed_at` are
+recorded on the row (SQLite, Delta, and the write-back table) and cleared
+whenever the payload changes. Lookups enforce the policy too: unreviewed
+successes it covers park on their next lookup, and an unreviewed shared
+write-back row is copied locally for review instead of served.
+
 ### Real pipeline UDFs, and when a faithful rewrite is a regression (2026-11-11)
 
 Seven scalar text UDFs from Fight Health Insurance's training-data pipeline
