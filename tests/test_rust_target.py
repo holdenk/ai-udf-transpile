@@ -1181,6 +1181,11 @@ def test_local_sdk_identity_includes_its_build_script(tmp_path, monkeypatch):
     before = rustc.resolve_sdk().ident
     (crate / "build.rs").write_text('fn main() { println!("cargo:rustc-cfg=changed"); }\n', encoding="utf-8")
     assert rustc.resolve_sdk().ident != before
+    # A data file the build script reads, inside the crate, counts too.
+    (crate / "schema.txt").write_text("v1\n", encoding="utf-8")
+    before = rustc.resolve_sdk().ident
+    (crate / "schema.txt").write_text("v2\n", encoding="utf-8")
+    assert rustc.resolve_sdk().ident != before
     # Build output under target/ is not part of the SDK's identity.
     (crate / "target" / "debug").mkdir(parents=True)
     after = rustc.resolve_sdk().ident

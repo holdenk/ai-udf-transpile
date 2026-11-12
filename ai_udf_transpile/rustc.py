@@ -342,10 +342,19 @@ def _path_sdk(crate: Path) -> SdkSpec:
     Every lookup hit resolves the SDK, so the hash is memoized on the files'
     stat signature instead of re-read per UDF definition.
     """
-    # Every Rust file of the crate, not only src/: a build script (build.rs,
-    # or another path `build = ".."` names) changes what the SDK compiles to.
-    sources = (p for p in crate.glob("**/*.rs") if "target" not in p.relative_to(crate).parts)
-    files_ = sorted([crate / "Cargo.toml", *sources])
+
+    # Every file of the crate, not only src/**/*.rs: a build script (build.rs,
+    # or the path `build = ".."` names) and whatever it reads there change what
+    # the SDK compiles to. Build output (target/) and hidden directories are
+    # not the SDK. Inputs outside the crate (other files, environment) are not
+    # tracked: after changing those, clear rust.buildDir.
+    def _sdk_file(path: Path) -> bool:
+        parts = path.relative_to(crate).parts
+        return path.is_file() and "target" not in parts and not any(p.startswith(".") for p in parts)
+
+    files_ = sorted(p for p in crate.rglob("*") if _sdk_file(p))
+    if crate / "Cargo.toml" not in files_:
+        files_.insert(0, crate / "Cargo.toml")
     # The SDK takes its arrow version from the workspace manifest
     # (`arrow = { workspace = true }`): an in-place bump there is a new SDK.
     workspace = _workspace_manifest(crate)

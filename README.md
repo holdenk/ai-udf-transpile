@@ -277,7 +277,7 @@ All under `spark.sql.experimental.aiUdfTranspile.`:
 |---|---|---|
 | `targets` | `catalyst,java_udf` | add `rust` to opt in (the other two are always on) |
 | `rust.cometSdk` | empty | Comet checkout, SDK crate directory, or TOML inline table; empty = `$COMET_HOME`, else the jar's tag/commit |
-| `rust.buildDir` | `~/.cache/ai_udf_transpile/rust` | build and library cache |
+| `rust.buildDir` | `~/.cache/ai_udf_transpile/rust` | build and library cache. A local SDK is keyed by the bytes of every file in its crate; after changing anything its build reads from outside the crate, clear this directory |
 | `rust.cargo` | `cargo` | the cargo binary |
 | `rust.buildTimeoutSeconds` | `900` | per cargo invocation |
 | `rust.sharedBuildDir` | `false` | `true` = `rust.buildDir` is the same path on every executor; serve on non-local masters |
