@@ -108,6 +108,25 @@ def _table_tuple(row: CacheRow) -> tuple:
     )
 
 
+def _payload(row: CacheRow) -> tuple:
+    return (row.target_kind, row.catalyst_sql, row.impl_source, row.impl_class)
+
+
+def _rejected_here(local: Optional[CacheRow], remote: CacheRow) -> bool:
+    """The local row holds a reviewer's rejection of the same payload the remote row serves.
+
+    A rejected row keeps its candidate and its reviewed_* stamp (status failed,
+    or pending again after the cooldown); an approved row is a local success
+    and never reaches the remote fallthrough.
+    """
+    return (
+        local is not None
+        and local.status != "success"
+        and bool(local.reviewed_at)
+        and _payload(local) == _payload(remote)
+    )
+
+
 class WritebackCatalog:
     """Wraps a SqliteCatalog: staged successes flush to a shared table; reads fall through."""
 
@@ -245,6 +264,11 @@ class WritebackCatalog:
         remote = self._remote_success(udf_key)
         if remote is not None and remote.reconstructable() and tolerance_serves(remote.tolerance, spark):
             from ai_udf_transpile.approval import blocks_serving
+
+            if _rejected_here(row, remote):
+                # A reviewer here rejected this exact rewrite; another
+                # reader's approval of it does not override that.
+                return kind, row
 
             if blocks_serving(remote, spark):
                 # Published before this reader required approval (or by a

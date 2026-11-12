@@ -248,6 +248,34 @@ def test_writeback_reviewed_remote_is_served(tmp_path):
     assert reader._staging.get("k").reviewed_by == "alice"
 
 
+def test_writeback_local_rejection_beats_remote_approval(tmp_path):
+    # Reader parks an unreviewed shared rewrite and rejects it.
+    writer = SqliteCatalog(tmp_path / "w.sqlite")
+    _pending(writer, "k", greet, ["string"], "string")
+    unreviewed = _run(writer, "k")
+    conf.set_value(conf.REQUIRE_APPROVAL, "string")
+    reader = _bare_writeback(SqliteCatalog(tmp_path / "r.sqlite"), unreviewed)
+    assert reader.lookup("k")[0] == WAIT
+    assert reader.reject("k", "bob", "wrong on unicode")
+
+    # Another reader then approves and publishes the very same payload.
+    writer.mark_awaiting_approval("k")
+    assert writer.approve("k", "alice")
+    reader._remote_success = lambda key: writer.get(key)
+    kind, row = reader.lookup("k")
+    assert kind == WAIT and row.status == "failed", "local rejection must hold"
+
+    # Still held once the cooldown has expired and the row re-pends.
+    reader._staging._conn.execute("UPDATE cache SET status = 'pending' WHERE udf_key = 'k'")
+    assert reader.lookup("k")[0] == WAIT
+
+    # A different approved payload is a different candidate: served.
+    writer.mark_success("k", TranspileResult(kind="catalyst", sql="'hi ' || _udf_param_0"), "fake")
+    writer.mark_awaiting_approval("k")
+    assert writer.approve("k", "alice")
+    assert reader.lookup("k")[0] == HIT
+
+
 # -- the review script -------------------------------------------------------
 
 
