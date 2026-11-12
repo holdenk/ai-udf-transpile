@@ -80,6 +80,10 @@ def describe(row: CacheRow, catalog: Any = None, *, triggers: Any = None) -> str
     if row.target_kind == "java_udf":
         lines.append(f"rewrite (java_udf, class {row.impl_class or '?'}):")
         lines.append(_indent(row.impl_source or "(binary only, no source stored)"))
+    elif row.target_kind == "rust":
+        # Native code that runs in the driver and every executor: show all of it.
+        lines.append("rewrite (rust row function, a Comet native UDF; runs only under Comet):")
+        lines.append(_indent(row.impl_source or "(no source stored)"))
     else:
         lines.append("rewrite (catalyst sql; _udf_param_N is the Nth argument):")
         lines.append(_indent(row.catalyst_sql or ""))

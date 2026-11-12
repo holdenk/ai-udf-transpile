@@ -388,3 +388,23 @@ def test_browse_empty(tmp_path):
     out = io.StringIO()
     assert approve.browse(SqliteCatalog(tmp_path / "e.sqlite"), input_fn=lambda _: "q", out=out) == 0
     assert "nothing awaiting approval" in out.getvalue()
+
+
+def test_describe_shows_a_rust_rewrite():
+    """A parked Rust row is native code: the reviewer must see its source, not an empty SQL rewrite."""
+    from ai_udf_transpile.catalog import CacheRow
+
+    rs = "pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x.map(|v| v + 1)) }"
+    row = CacheRow(
+        udf_key="k",
+        source_text="def plus_one(x: int) -> int:\n    return x + 1\n",
+        param_names=["x"],
+        input_types=["bigint"],
+        return_type="bigint",
+        status=AWAITING_APPROVAL,
+        target_kind="rust",
+        impl_source=rs,
+    )
+    text = approve.describe(row)
+    assert "rust row function" in text and "Ok(x.map(|v| v + 1))" in text
+    assert "catalyst sql" not in text
