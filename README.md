@@ -320,13 +320,21 @@ fallback; until then this target trades the plugin's safety for speed.
 - `local` masters only, unless `rust.sharedBuildDir=true` promises that
   `rust.buildDir` is the same path on every executor (Comet does not
   distribute the library).
-- The catalog key does not include the target. A UDF whose verified rewrite
-  is Rust stays interpreted Python in a session without Comet, and that
-  session is not offered a SQL or Java rewrite for it.
+- A session that cannot run a cached Rust row (no Comet, `rust` not in its
+  targets, a non-local master) looks it up again under a `+no-rust` twin
+  key, which the worker fills with a SQL or Java rewrite only. Until that
+  twin is verified the UDF runs as interpreted Python there.
 - Generated native code runs in the driver and every executor. The source
   scan (no `unsafe`, `extern`, `std::fs`/`process`/`net`/`env`/`io`,
   `include!`, `#[path]`, ...) and the `unsafe` lint are a denylist, not a
   sandbox — the Java target's caveat, with native code's blast radius.
+- No recursion: a stack overflow aborts the process (the driver, in local
+  mode) instead of failing the query. The check is by name, so any mention
+  of a function inside something it can reach from itself is refused, a
+  same-named local included. Trait impls, `dyn`, `Any` and types that hold
+  a function are refused too, since they can call a function without
+  naming it. That catches accidental recursion; it is not a proof against
+  a rewrite written to evade it.
 - Functions must be pure: Comet plans every native UDF as immutable.
 
 `examples/demo_rust_udf.py` runs the whole path on three loop-shaped UDFs and

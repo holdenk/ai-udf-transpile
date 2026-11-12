@@ -387,62 +387,174 @@ def _rust_for_forbidden_scan(rust: str) -> str:
 
 
 _RUST_FN = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
+_RUST_IMPL = re.compile(r"\bimpl\b")
+_RUST_LOCAL_PATH_ROOT = re.compile(r"\b(?:struct|enum|union|mod|type)\s+([A-Za-z_]\w*)")
+# What carries a call without naming a function: trait dispatch (an operator,
+# `{}` formatting, `==`, `.next()` in a for loop all reach an impl's method
+# without its name), an erased closure (`dyn Fn`), `Any` (a fn pointer behind
+# a downcast), and a type that holds a function (a closure handed a struct
+# holding itself).
+_RUST_HIDDEN_CALL = re.compile(
+    r"\bimpl\b[^{;]*\bfor\b(?!\s*<)"
+    r"|\btrait\s+[A-Za-z_]"
+    r"|\bdyn\b"
+    r"|\bAny\b"
+)
+_RUST_FN_TYPE = re.compile(r"\bfn\s*\(|\bFn(?:Mut|Once)?\b")
 
 
-def _rust_fn_bodies(scanned: str) -> list[tuple[str, str]]:
-    """(name, body) for every ``fn`` with a body, in blanked source."""
+def _rust_block_end(scanned: str, start: int) -> int:
+    """Index of the ``}`` closing the ``{`` at ``start`` (or the text's end)."""
+    depth = 0
+    for i in range(start, len(scanned)):
+        if scanned[i] == "{":
+            depth += 1
+        elif scanned[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(scanned)
+
+
+def _rust_item_open(scanned: str, pos: int) -> Optional[int]:
+    """The ``{`` opening the item whose header starts at ``pos``; None at a ``;`` first.
+
+    ``;`` inside ``(..)``/``[..]`` is an array length (``[u8; 4]``), not the end.
+    """
+    i = _rust_item_stop(scanned, pos)
+    return i if i < len(scanned) and scanned[i] == "{" else None
+
+
+def _rust_item_stop(scanned: str, pos: int) -> int:
+    """The first ``{`` or ``;`` outside ``(..)``/``[..]`` from ``pos`` (or the end)."""
+    depth = 0
+    for i in range(pos, len(scanned)):
+        ch = scanned[i]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif depth <= 0 and ch in "{;":
+            return i
+    return len(scanned)
+
+
+def _rust_item_end(scanned: str, pos: int) -> int:
+    """Where the item whose header starts at ``pos`` ends: its ``;`` or closing ``}``."""
+    i = _rust_item_stop(scanned, pos)
+    return _rust_block_end(scanned, i) if i < len(scanned) and scanned[i] == "{" else i
+
+
+def _rust_fn_bodies(scanned: str) -> list[tuple[str, int, int, int]]:
+    """(name, fn_start, name_end, end) for every ``fn`` with a body, in blanked source.
+
+    ``fn_start..end`` runs from ``fn`` to the closing brace; ``name_end..end``
+    is the body proper, parameters included.
+    """
     out = []
     for match in _RUST_FN.finditer(scanned):
-        start = scanned.find("{", match.end())
-        if start < 0:
-            continue
-        depth, end = 0, start
-        while end < len(scanned):
-            if scanned[end] == "{":
-                depth += 1
-            elif scanned[end] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            end += 1
-        out.append((match.group(1), scanned[start:end]))
+        open_ = _rust_item_open(scanned, match.end())
+        if open_ is not None:
+            out.append((match.group(1), match.start(), match.end(), _rust_block_end(scanned, open_)))
     return out
 
 
-def _rust_recursive_fn(scanned: str) -> Optional[str]:
-    """A function that can reach itself, in blanked source, if any.
+def _rust_recursion(scanned: str) -> Optional[str]:
+    """Why the blanked source may recurse, if it may.
 
     A Rust stack overflow is not a panic: it aborts the process, and in
     local mode that process is the driver. Deep enough input reaches any
-    recursion depth, so recursion is refused -- direct, through a function
-    value (`let f = udf; f(x)`), or through a cycle of helpers. Any bare
-    mention of a function's name in a body is an edge, call or not: a
-    method (`s.trim()`) or a path (`str::trim`) names another item and is
-    not one. Runaway loops are the prompt's to prevent.
+    recursion depth, so a rewrite that can reach a function from itself is
+    refused -- directly, through a function value (``let f = udf; f(x)``,
+    a fn-pointer table), or through a cycle of helpers or methods.
+
+    The check is by name, not by scope: any mention of a function's name in
+    a body is an edge, a local of the same name included (a scope-aware
+    exception let ``let f = udf; { let udf = 0; } f(x)`` through), and a
+    name is every function with it (dynamic dispatch). A path reaches a free
+    function only through ``crate``/``self``/``super``/a local module; a
+    method also through ``.name`` and any ``Type::name``. Calls that name no
+    function -- trait dispatch, erased closures, ``Any`` -- are refused
+    outright, as is a function value outside every body (a ``static``).
+    Runaway loops are the prompt's to prevent.
     """
+    hidden = _RUST_HIDDEN_CALL.search(scanned)
+    if hidden:
+        return (
+            f"rust rewrite uses `{hidden.group(0).split()[0]}`: trait impls, `dyn`, and `Any` "
+            "can call a function without naming it, so recursion through them cannot be "
+            "ruled out; use plain functions and inherent methods"
+        )
+    for match in _RUST_LOCAL_PATH_ROOT.finditer(scanned):
+        kind = match.group(0).split()[0]
+        if kind == "mod":
+            continue
+        if _RUST_FN_TYPE.search(scanned[match.end() : _rust_item_end(scanned, match.end())]):
+            return (
+                f"rust rewrite defines a type holding a function ({match.group(1)}): a "
+                "closure handed such a value can call itself; pass functions as arguments"
+            )
+    impls = []
+    for match in _RUST_IMPL.finditer(scanned):
+        open_ = _rust_item_open(scanned, match.end())
+        if open_ is not None:
+            impls.append((open_, _rust_block_end(scanned, open_)))
     bodies = _rust_fn_bodies(scanned)
-    names = {name for name, _ in bodies}
+    names = {name for name, *_ in bodies}
+    if not names:
+        return None
+    methods = {name for name, start, *_ in bodies if any(a < start < b for a, b in impls)}
+    roots = {"crate", "self", "super", "Self"} | {m.group(1) for m in _RUST_LOCAL_PATH_ROOT.finditer(scanned)}
+    root = "|".join(re.escape(r) for r in sorted(roots))
+
+    def mention(name: str) -> re.Pattern:
+        word = re.escape(name)
+        alts = [
+            rf"(?<![.\w:']){word}\b(?!\s*!)",
+            rf"\b(?:{root})(?:\s*::\s*\w+)*\s*::\s*{word}\b",
+        ]
+        if name in methods:
+            alts.append(rf"(?:\.|::)\s*{word}\b(?!\s*!)")
+        return re.compile("|".join(alts))
+
+    patterns = {name: mention(name) for name in names}
+    # Outside every body; a `fn name` (with a body or without) declares, not mentions.
+    outside = list(scanned)
+    for _, start, _, end in bodies:
+        outside[start : end + 1] = " " * (end + 1 - start)
+    for m in _RUST_FN.finditer(scanned):
+        outside[m.start() : m.end()] = " " * (m.end() - m.start())
+    outside_text = "".join(outside)
+    for name, pattern in patterns.items():
+        if pattern.search(outside_text):
+            return (
+                f"rust rewrite uses the function {name} as a value outside a function "
+                "body (a static, const, or use): it can then be called from anywhere, "
+                "itself included"
+            )
     edges: dict[str, set[str]] = {name: set() for name in names}
-    for name, body in bodies:
-        for other in names:
-            word = re.escape(other)
-            # A body that binds the name itself (`let mut count = 0` inside
-            # `fn count`, a closure parameter) shadows the function: only a
-            # call then counts. Otherwise any mention is the function value.
-            shadowed = re.search(rf"\blet\s+(?:mut\s+)?{word}\b|\|[^|]*\b{word}\b[^|]*\|", body)
-            mention = rf"(?<![.\w:]){word}\s*\(" if shadowed else rf"(?<![.\w:]){word}\b(?!\s*!)"
-            if re.search(mention, body):
+    for name, _, name_end, end in bodies:
+        # From after `fn name`: the declaration itself is no self-edge
+        # (a nested `fn`'s text is part of the body and counts).
+        text = scanned[name_end:end]
+        for other, pattern in patterns.items():
+            if pattern.search(text):
                 edges[name].add(other)
-    for root in sorted(names):
+    for node in sorted(names):
         seen: set[str] = set()
-        stack = list(edges[root])
+        stack = list(edges[node])
         while stack:
-            node = stack.pop()
-            if node == root:
-                return root
-            if node not in seen:
-                seen.add(node)
-                stack.extend(edges.get(node, ()))
+            cur = stack.pop()
+            if cur == node:
+                return (
+                    f"rust rewrite is recursive ({node}): a stack overflow aborts the "
+                    "process instead of failing the query (any mention of a function's "
+                    "name counts as a call, a local or parameter of the same name "
+                    "included: rename it)"
+                )
+            if cur not in seen:
+                seen.add(cur)
+                stack.extend(edges.get(cur, ()))
     return None
 
 
@@ -455,13 +567,7 @@ def _rust_rejected(rust: str) -> Optional[str]:
             "rust rewrite uses a forbidden construct "
             "(unsafe/extern/fs/process/net/env/io/clock/include!/env!/macro_rules!/#[path]/arrow)"
         )
-    recursive = _rust_recursive_fn(scanned)
-    if recursive:
-        return (
-            f"rust rewrite is recursive ({recursive}): a stack overflow aborts the "
-            "process instead of failing the query"
-        )
-    return None
+    return _rust_recursion(scanned)
 
 
 def rejected_rewrite(result: Any) -> Optional[str]:

@@ -1061,15 +1061,89 @@ def test_scan_rejects_indirect_recursion(source):
     assert rejected and "recursive" in rejected
 
 
-def test_scan_allows_a_local_that_shadows_its_function():
+def test_scan_counts_a_local_that_shadows_its_function():
+    # By name, not by scope: a scope-aware exception for shadowing locals let
+    # a function value taken before an inner shadowing block through.
     source = (
         "fn count(s: &str) -> i64 { let mut count = 0; for _c in s.chars() { count += 1; } count }\n"
         "pub fn udf(x: Option<&str>) -> Result<Option<i64>, String> { Ok(x.map(count)) }\n"
     )
+    rejected = rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source))
+    assert "recursive (count)" in rejected and "rename it" in rejected
+    renamed = source.replace("count = 0", "n = 0").replace("{ count += 1; } count }", "{ n += 1; } n }")
+    assert rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=renamed)) is None
+
+
+# -- third CodeRabbit round -------------------------------------------------------
+
+
+def _udf(body: str) -> str:
+    return f"pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> {{ {body} }}\n"
+
+
+@pytest.mark.parametrize(
+    "source, reason",
+    [
+        # The function value is taken before an inner block shadows the name.
+        (_udf("let f = udf; { let udf = 0; let _ = udf; } f(x)"), "recursive (udf)"),
+        # A method calling itself through `self.` / `Self::`.
+        (
+            "struct S; impl S { fn go(&self, n: i64) -> i64 { if n > 0 { self.go(n - 1) } else { 0 } } }\n"
+            + _udf("Ok(x.map(|v| S.go(v)))"),
+            "recursive (go)",
+        ),
+        (
+            "struct S; impl S { fn go(n: i64) -> i64 { if n > 0 { Self::go(n - 1) } else { 0 } } }\n"
+            + _udf("Ok(x.map(S::go))"),
+            "recursive (go)",
+        ),
+        # A path through the crate root.
+        (_udf("if x == Some(0) { crate::udf(None) } else { Ok(x) }"), "recursive (udf)"),
+        (_udf("use self::udf as again; if x == Some(0) { again(None) } else { Ok(x) }"), "recursive (udf)"),
+        # A function value in a static, called from the body.
+        (
+            "static F: fn(Option<i64>) -> Result<Option<i64>, String> = udf;\n" + _udf("F(x)"),
+            "outside a function body",
+        ),
+        # Trait dispatch names no function: `{}` calls Display::fmt on self.
+        (
+            "struct W(i64);\n"
+            "impl std::fmt::Display for W {\n"
+            '    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "{}", self) }\n'
+            "}\n" + _udf("Ok(x)"),
+            "trait impls",
+        ),
+        # An erased closure, Any, a type holding a function: closure fixpoints.
+        (_udf("let f: &dyn Fn(i64) -> i64 = &|n| n; Ok(x.map(f))"), "trait impls"),
+        (_udf("let _a: Option<&std::any::Any> = None; Ok(x)"), "trait impls"),
+        ("struct S(Option<fn(&S, i64) -> i64>);\n" + _udf("Ok(x)"), "type holding a function (S)"),
+        ("struct S([u8; 4], fn(i64) -> i64);\n" + _udf("Ok(x)"), "type holding a function (S)"),
+    ],
+)
+def test_scan_rejects_recursion_that_names_no_bare_call(source, reason):
+    rejected = rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source))
+    assert rejected and reason in rejected
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "fn n(v: i64) -> i64 { v + 1 }\n" + _udf("Ok(x.map(n))"),  # `n` is also in `fn`
+        "fn a<'a>(s: &'a str) -> &'a str { s }\n" + _udf('let _ = a("x"); Ok(x)'),  # lifetime `'a`
+        "fn h(v: [u8; 4]) -> u8 { v[0] }\n" + _udf("let _ = h([1; 4]); Ok(x)"),
+        "struct P([u8; 4], i64);\n" + _udf("let _ = P([0; 4], 1); Ok(x)"),
+        "fn digits(n: i64) -> impl Iterator<Item = u32> {\n"
+        "    n.to_string().chars().filter_map(|c| c.to_digit(10)).collect::<Vec<_>>().into_iter()\n"
+        "}\n" + _udf("Ok(x.map(|v| digits(v).count() as i64))"),
+        "struct Acc { n: i64 }\n"
+        "impl Acc { fn add(&mut self, v: i64) { self.n += v; } fn total(&self) -> i64 { self.n } }\n"
+        + _udf("let mut a = Acc { n: 0 }; a.add(1); Ok(x.map(|v| v + a.total()))"),
+        "fn apply(f: impl Fn(i64) -> i64, v: i64) -> i64 { f(v) }\n"
+        + _udf("Ok(x.map(|v| apply(|n| n * 2, v)))"),
+    ],
+)
+def test_scan_allows_plain_functions_methods_and_closures(source):
     assert rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source)) is None
-    # Shadowed, but still called: that is recursion.
-    called = source.replace("count }\n", "count + count(s) }\n", 1)
-    assert "recursive (count)" in rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=called))
 
 
 def test_scan_allows_a_call_chain_without_a_cycle():

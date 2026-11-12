@@ -41,6 +41,13 @@ choice above to (still exactly one):
 - No recursion (a function that calls itself is rejected): a Rust stack
   overflow aborts the whole process instead of failing the query. Write the
   loop. Every loop must terminate on every input, NULL and empty included.
+  The check is by name: any mention of a function's name inside a function
+  that it can reach from itself counts as a call, so never name a local or a
+  parameter after a function. Also rejected, because they can call a
+  function without naming it: trait impls (`impl Trait for Type`) and
+  `trait` items, `dyn`, `Any`, a struct/enum/`type` holding a `fn(..)` or
+  `Fn`, and a function used as a value in a `static` or `const`. Use plain
+  functions, inherent methods (`impl Type { .. }`), and closures.
 - A panic fails the query, and integer overflow panics (overflow checks are
   on). Python ints never overflow: where an intermediate can leave `i64`
   while the result still fits, widen to `i128`; where the result itself
