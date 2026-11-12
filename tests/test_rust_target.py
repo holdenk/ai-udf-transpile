@@ -1485,3 +1485,27 @@ def test_build_dir_is_absolute(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setitem(conf._RUNTIME, conf.RUST_BUILD_DIR, "cache/rust")
     assert rustc.build_dir() == tmp_path / "cache" / "rust"
+
+
+@pytest.mark.parametrize(
+    "length, size",
+    [("1 << 20", 1 << 20), ("2 * (3 + 4)", 14), ("1_000", 1000), ("N * 2", 32), ("(((1)))", 1)],
+)
+def test_array_lengths_are_sized_without_eval(length, size):
+    from ai_udf_transpile.verify import _rust_const_value
+
+    assert _rust_const_value(length, {"N": "16"}) == size
+
+
+@pytest.mark.parametrize(
+    "length", ["9**9**9", "1 << 99999999", "10 / 0", "-1", "1e9", "1 << 64", "M", "f(3)"]
+)
+def test_unsizable_array_lengths_are_refused_at_once(length):
+    """No eval: `9**9**9` or a huge shift would stall the worker."""
+    import time
+
+    from ai_udf_transpile.verify import _rust_const_value
+
+    start = time.monotonic()
+    assert _rust_const_value(length, {}) == float("inf")
+    assert time.monotonic() - start < 1

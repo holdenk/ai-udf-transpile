@@ -641,13 +641,59 @@ def _rust_const_value(expr: str, consts: dict[str, str], depth: int = 0) -> floa
         return "@"  # unknown name: not sizable
 
     text = re.sub(r"\b[A-Za-z_]\w*\b", const, text)
-    if "@" in text or not re.fullmatch(r"[\d\s+\-*/%<>()e.]*", text):
+    if "@" in text:
         return _RUST_INFINITE
+    return _rust_int_expr(text)
+
+
+_RUST_INT_OPS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.FloorDiv: lambda a, b: a // b,
+    ast.Div: lambda a, b: a // b,
+    ast.Mod: lambda a, b: a % b,
+    ast.LShift: lambda a, b: a << b,
+    ast.RShift: lambda a, b: a >> b,
+}
+_RUST_INT_LIMIT = 1 << 64
+
+
+def _rust_int_expr(text: str) -> float:
+    """An integer expression of literals and + - * / % << >> ( ), or infinity.
+
+    No ``eval``: ``9**9**9`` or ``1 << 10**9`` would stall the worker. Any
+    value past 2**64 (or a shift past 64 bits) is infinite, i.e. not sizable.
+    """
     try:
-        value = eval(text.replace("/", "//"), {"__builtins__": {}}, {})  # noqa: S307 -- digits and operators only
-    except Exception:
+        tree = ast.parse(text.strip(), mode="eval")
+    except (SyntaxError, ValueError):
         return _RUST_INFINITE
-    return float(value) if value >= 0 else _RUST_INFINITE
+
+    def value(node: ast.AST) -> int:
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            result = node.value
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            inner = value(node.operand)
+            result = -inner if isinstance(node.op, ast.USub) else inner
+        elif isinstance(node, ast.BinOp) and type(node.op) in _RUST_INT_OPS:
+            left, right = value(node.left), value(node.right)
+            if isinstance(node.op, (ast.LShift, ast.RShift)) and not 0 <= right < 64:
+                raise OverflowError
+            if isinstance(node.op, (ast.FloorDiv, ast.Div, ast.Mod)) and right == 0:
+                raise ZeroDivisionError
+            result = _RUST_INT_OPS[type(node.op)](left, right)
+        else:
+            raise ValueError
+        if abs(result) >= _RUST_INT_LIMIT:
+            raise OverflowError
+        return result
+
+    try:
+        result = value(tree.body)
+    except (ValueError, OverflowError, ZeroDivisionError, RecursionError):
+        return _RUST_INFINITE
+    return float(result) if result >= 0 else _RUST_INFINITE
 
 
 def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Optional[str]:
