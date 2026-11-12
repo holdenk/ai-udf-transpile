@@ -20,6 +20,16 @@ Work this experiment leans on, borrows from, or is measured against.
   identity must be pinned: constraints every faithful rewrite here has to
   respect.
 
+## Apache DataFusion Comet
+
+- [Custom Rust UDFs](https://datafusion.apache.org/comet/user-guide/latest/rust_udfs.html)
+  — the experimental `comet-udf-sdk` / `CometNativeUDF` surface (Comet 1.2+)
+  the `rust` target builds on: a `cdylib` over the Arrow C Data Interface,
+  loaded by path and run inside Comet's native pipeline. Its limitations
+  section ("Spark cannot evaluate a call", the library must exist on every
+  executor, immutable functions only) is where this repo's rust caveats
+  come from.
+
 ## Talks
 
 - Oliphant, T., Lam, S. K., & Florisson, M. (2013). *Numba: A Dynamic

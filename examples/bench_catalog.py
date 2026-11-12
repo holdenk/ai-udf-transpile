@@ -16,7 +16,10 @@ When $AI_UDF_TRANSPILE_COMET_JAR (or $COMET_JAR) points at a Comet jar, a
 second session runs the served SQL under Comet's native acceleration too,
 writing comet_rows_per_second / comet_speedup_vs_python -- the doc's
 "comet" arm. A function whose plan falls back to Spark gets no comet
-number, said loudly.
+number, said loudly. Rust rewrites (target_kind=rust) run only inside
+Comet: the plain session never serves them, and the Comet session's
+number is their transpiled_rows_per_second (built first if this machine
+has no library for them yet; that needs cargo and comet-udf-sdk).
 """
 
 from __future__ import annotations
@@ -62,8 +65,9 @@ from pyspark.sql import SparkSession  # noqa: E402
 from pyspark.sql.types import _parse_datatype_string  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
-from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
+from ai_udf_transpile import conf, enable, rustc, shutdown  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
+from ai_udf_transpile.targets import NO_RUST_SUFFIX  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
@@ -210,11 +214,31 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
         spark.conf.set(TRANSPILE_CONF, "true")
         cats = sorted({c for r in rows for c in r.input_categories})
         conf.set_value(conf.INPUT_CATEGORIES, ",".join(cats), spark)
+        conf.set_value(conf.TARGETS, "catalyst,java_udf,rust", spark)
         for row in rows:
             entry = out.get(row.udf_key)
-            if entry is None or entry["status"] != "success" or not entry["transpiled_rows_per_second"]:
+            rust = row.target_kind == "rust"
+            if entry is None or entry["status"] != "success":
+                continue
+            if not (entry["transpiled_rows_per_second"] or rust):
                 continue
             name = entry["function"]
+            if row.spark_version.endswith(NO_RUST_SUFFIX):
+                # This session can run Rust, so the function's source resolves
+                # to its Rust row: timing it here would credit the twin with
+                # the Rust rewrite's number.
+                print(f"{name}: no-Rust twin -- this session serves the Rust row; not benched under Comet")
+                continue
+            if rust and _values_for(row.input_types) is None:
+                print(f"{name}: no sample for {row.input_types}; rust row not benched")
+                continue
+            if rust:
+                # A lookup never waits on cargo; the bench can.
+                try:
+                    rustc.compile_rust(spark, row.impl_source or "", row.input_types, row.return_type)
+                except Exception as exc:
+                    print(f"{name}: rust library did not build ({type(exc).__name__}: {exc})")
+                    continue
             values = _values_for(row.input_types)
             try:
                 func = _import_function(row.source_text, name)
@@ -238,12 +262,14 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
                 continue
             comet_secs = _time_arm(df, udf, args.rounds)
             if comet_secs:
-                entry["comet_rows_per_second"] = round(args.rows / comet_secs)
+                # A rust rewrite has no other arm: Comet's number IS its transpiled number.
+                prefix = "transpiled" if rust else "comet"
+                entry[f"{prefix}_rows_per_second"] = round(args.rows / comet_secs)
                 if row.udf_key in py_secs:
-                    entry["comet_speedup_vs_python"] = round(py_secs[row.udf_key] / comet_secs, 1)
+                    entry[f"{prefix}_speedup_vs_python"] = round(py_secs[row.udf_key] / comet_secs, 1)
                 print(
-                    f"{name:24} comet={entry['comet_rows_per_second']:>10}"
-                    f" ({entry['comet_speedup_vs_python'] or '-'}x vs python)"
+                    f"{name:24} {prefix}={entry[f'{prefix}_rows_per_second']:>10}"
+                    f" ({entry[f'{prefix}_speedup_vs_python'] or '-'}x vs python, Comet native)"
                 )
     finally:
         spark.conf.set(TRANSPILE_CONF, "false")
@@ -317,6 +343,9 @@ def main() -> int:
             "target_kind": row.target_kind or "",
             "backend": row.backend or "",
             "model": row.model or "",
+            # Two rows can share a function name (a rust row and the "+no-rust"
+            # twin a non-Comet session queued): the key tells them apart.
+            "udf_key": row.udf_key,
         }
         out[row.udf_key] = entry
         if values is None or func is None:
@@ -334,7 +363,11 @@ def main() -> int:
         spark.conf.set(TRANSPILE_CONF, "true")
         if row.status == "success":
             udf = UserDefinedFunction(func, rtype)
-            if not udf.transpiled:
+            if row.target_kind == "rust":
+                # Never served here: what this session serves for the function
+                # is its no-Rust twin (if one is filled), whose number is the twin's.
+                print(f"{name}: rust rewrite -- runs only under Comet; benched in the comet phase")
+            elif not udf.transpiled:
                 print(f"{name}: transpiled arm not served (no hit) -- python only")
             elif _plans_python(df, udf):
                 print(f"{name}: rewrite verified, but Spark still plans the python UDF -- python only")

@@ -12,7 +12,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
 
 from ai_udf_transpile import conf
-from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileJob, TranspileResult
+from ai_udf_transpile.targets import (
+    KIND_CATALYST,
+    KIND_JAVA_UDF,
+    KIND_RUST,
+    TranspileJob,
+    TranspileResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +136,24 @@ class CacheRow:
             return True
         if self.target_kind == KIND_JAVA_UDF and (self.impl_class or self.impl_source or self.impl_binary):
             return True
+        if self.target_kind == KIND_RUST and self.impl_source:
+            return True
         return False
+
+    def as_result(self) -> TranspileResult:
+        """The stored payload as a result (``impl_source`` is Rust or Java by kind)."""
+        kind = self.target_kind or KIND_CATALYST
+        rust = kind == KIND_RUST
+        return TranspileResult(
+            kind=kind,
+            sql=self.catalyst_sql,
+            java_source=None if rust else self.impl_source,
+            rust_source=self.impl_source if rust else None,
+            class_name=self.impl_class,
+            binary=self.impl_binary,
+            entry=self.impl_entry,
+            model=self.model,
+        )
 
     def as_job(self) -> TranspileJob:
         return TranspileJob(

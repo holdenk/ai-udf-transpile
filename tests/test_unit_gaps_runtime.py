@@ -354,8 +354,27 @@ def test_register_impl_rejects_unknown_kind():
     def f(x: int) -> int:
         return x + 1
 
-    with pytest.raises(ValueError, match="catalyst or java_udf"):
+    with pytest.raises(ValueError, match="catalyst, java_udf or rust"):
+        register_impl(None, f, return_type="bigint", kind="gpu_kernel", catalyst_sql="_udf_param_0 + 1")
+
+
+def test_register_impl_rust_needs_a_row_function_and_a_comet_session():
+    set_catalog(object())
+
+    def f(x: int) -> int:
+        return x + 1
+
+    # SQL is not a rust payload...
+    with pytest.raises(ValueError, match="rust impl_source"):
         register_impl(None, f, return_type="bigint", kind="rust", catalyst_sql="_udf_param_0 + 1")
+    # ...and a row function is refused where nothing could run it, with the
+    # signature it would have to have.
+    source = "pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x) }"
+    with pytest.raises(ValueError, match="cannot run in this session") as excinfo:
+        register_impl(None, f, return_type="bigint", kind="rust", impl_source=source)
+    assert "pub fn udf(arg0: Option<i64>) -> Result<Option<i64>, String>" in str(excinfo.value)
+    with pytest.raises(ValueError, match=r"does not support \(bigint\) -> array<string>"):
+        register_impl(None, f, return_type="array<string>", kind="rust", impl_source=source)
 
 
 def test_register_impl_requires_reconstructable_payload():

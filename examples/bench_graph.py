@@ -40,7 +40,7 @@ class _Schema:
 
 
 def _micro_declined(row: dict[str, str], arm: str) -> bool:
-    return arm != "regular" and row[f"transpile_succeeded_{arm}"] == "False"
+    return arm != "regular" and row.get(f"transpile_succeeded_{arm}") == "False"
 
 
 def _never_declined(_row: dict[str, str], _arm: str) -> bool:
@@ -56,6 +56,7 @@ MICRO_SCHEMA = _Schema(
         ("static", "transpiled (static)", "tab:blue"),
         ("ai_catalyst", "transpiled (AI: Catalyst SQL)", "tab:orange"),
         ("ai_java", "transpiled (AI: Java UDF)", "tab:red"),
+        ("ai_rust", "transpiled (AI: Rust UDF, Comet)", "tab:green"),
     ],
     value_column=lambda arm: (
         "regular_rows_per_second" if arm == "regular" else f"transpiled_{arm}_rows_per_second"
@@ -76,6 +77,22 @@ BYTECODE_SCHEMA = _Schema(
     declined=_never_declined,
     title="Bytecode transpile paths",
 )
+
+
+OPTIONAL_ARMS = frozenset({"ai_rust"})
+
+
+def arms_for(rows: list[dict[str, str]], schema: _Schema) -> list[tuple[str, str, str]]:
+    """The schema's arms, minus an optional one no row measured.
+
+    An arm only some runs have (rust: --rust-accel under Comet) is drawn
+    where the CSV measured it, not as an empty slot in every other chart.
+    """
+    return [
+        arm
+        for arm in schema.arms
+        if arm[0] not in OPTIONAL_ARMS or any(r.get(schema.value_column(arm[0])) for r in rows)
+    ]
 
 
 def log_png_path(png_path: str) -> Path:
@@ -102,13 +119,16 @@ def render(rows: list[dict[str, str]], png_path: str, *, log_scale: bool, schema
 
     functions = [r["function"] for r in rows]
     n = len(functions)
+    schema = _Schema(
+        schema.sniff_column, arms_for(rows, schema), schema.value_column, schema.declined, schema.title
+    )
     width = 0.8 / len(schema.arms)
     fig, ax = plt.subplots(figsize=(10.5, 4.2), dpi=150)
     any_declined = False
     for i, (arm, label, color) in enumerate(schema.arms):
         column = schema.value_column(arm)
         xs = np.arange(n) + (i - (len(schema.arms) - 1) / 2) * width
-        ys = [float(r[column]) if r[column] != "" else np.nan for r in rows]
+        ys = [float(r[column]) if r.get(column, "") != "" else np.nan for r in rows]
         declined = [schema.declined(r, arm) for r in rows]
         any_declined = any_declined or any(d and y == y for d, y in zip(declined, ys))
         ax.bar(
@@ -178,7 +198,9 @@ def main() -> int:
         parser.error(f"{args.csv_path} has no data rows")
     schema = schema_for(header)
     for _arm, _label, _color in schema.arms:
-        if schema.value_column(_arm) not in header:
+        # Optional arms are absent from CSVs written before them (or runs
+        # without them); arms_for() drops them from the chart.
+        if _arm not in OPTIONAL_ARMS and schema.value_column(_arm) not in header:
             parser.error(f"{args.csv_path} is missing the {schema.value_column(_arm)} column")
 
     render(rows, args.png_path, log_scale=False, schema=schema)

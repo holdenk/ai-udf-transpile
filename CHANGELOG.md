@@ -7,6 +7,57 @@ evidence for a direction, not a promise about your cluster.
 
 ## Unreleased
 
+### Rust target: Comet native UDFs, opt-in (2026-11-12)
+
+A new rewrite kind, `rust`, for Apache DataFusion Comet 1.2+'s experimental
+native UDFs (`comet-udf-sdk` / `CometNativeUDF`). Turn it on with
+`spark.sql.experimental.aiUdfTranspile.targets=catalyst,java_udf,rust` in a
+session where Comet is live. SQL is still the first choice; Rust is offered
+before Java for UDFs with no SQL form.
+
+**The model writes one row function**, `pub fn udf(Option<..>, ..) ->
+Result<Option<..>, String>`, with the signature fixed by the UDF's declared
+types. `ai_udf_transpile/rustc.py` generates the Arrow glue, builds a cdylib
+with cargo against the Comet SDK of the session's jar (or `$COMET_HOME`),
+caches it by content, and registers it. Verification runs the built library
+through Comet on the same Hypothesis inputs as the other targets. A scan
+refuses `unsafe`, FFI, filesystem/process/network/env access, include
+macros, `#[path]`, and `use` aliases that hide those.
+
+**A stack overflow aborts the process** (the driver, in local mode), so the
+scan also refuses whatever can overflow the stack. That covers recursion by
+name through helpers, methods, paths, aliases and function values; trait
+impls, `dyn` and `std::any`; recursive types; and more than 256 KB of
+arrays. Three adversarial rounds shaped those rules. A bypass counted only
+if rustc compiled it and the binary really overflowed its stack: 6, then 4,
+then 35 variants of 3 more shapes, all now tests in `tests/test_rust_target.py`.
+59 realistic non-recursive rewrites written by the attackers pass, except
+methods named after a std method they call on a parameter (`fn parse`
+calling `p.parse()`), which the error message asks the model to rename.
+
+**Verification has a deadline** (`verifyQueryTimeoutSeconds`, 300): a
+Java or Rust candidate whose loop never ends fails verification instead of
+hanging the worker. The task thread cannot be stopped mid-row, so in local
+mode it keeps one core busy (native batches run in one partition so it is
+one).
+
+**Numbers.** From `examples/demo_rust_udf.py` (2M rows, native range, Comet
+1.2.0): `collatz_steps` 20.5x and `is_prime` 16.8x over the interpreted UDF,
+both served as Rust. `longest_digit_run` was answered as SQL. The catalog
+bench (smaller cached samples) measures the same two Rust rewrites at 4.1x
+and 3.6x. In the micro bench every `*_rust` twin was answered as SQL
+(`reverse`, `levenshtein`, ...), so those rows time SQL, not Rust.
+
+**Not fail-open.** Spark cannot evaluate a Comet native UDF: a query whose
+operator Comet does not take fails instead of falling back to Python. That
+includes a Rust UDF beside a still-interpreted Python UDF in the same
+`select`, scans over `createDataFrame`/`spark.range`/cached frames without
+the matching Comet conversion confs, and a global sort keyed on the call.
+A session that cannot run Rust gets a separate `+no-rust` cache row with its
+own SQL/Java rewrite instead of a Rust one it would fail on. Atomic types
+only; `local` masters only unless `rust.sharedBuildDir` says the build
+directory is cluster-visible. See the README's Rust target section.
+
 ### Manual approval for hard-to-verify rewrites (2026-11-12)
 
 `spark.sql.experimental.aiUdfTranspile.requireApproval` (default `none`)

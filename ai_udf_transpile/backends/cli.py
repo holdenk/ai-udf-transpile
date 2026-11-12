@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared CLI backend: write sandbox, exec argv, parse OUT.sql / OUT.java / stdout."""
+"""Shared CLI backend: write sandbox, exec argv, parse OUT.sql / OUT.rs / OUT.java / stdout."""
 
 from __future__ import annotations
 
@@ -15,14 +15,28 @@ from typing import Any, Callable, Optional
 from ai_udf_transpile import conf
 from ai_udf_transpile.backends.base import BackendDecline, BackendError
 from ai_udf_transpile.javac import extract_java_class
-from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileJob, TranspileResult
+from ai_udf_transpile.targets import (
+    KIND_CATALYST,
+    KIND_JAVA_UDF,
+    KIND_RUST,
+    TranspileJob,
+    TranspileResult,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def parse_sandbox(sandbox: Path, stdout: str = "") -> TranspileResult:
+def parse_sandbox(sandbox: Path, stdout: str = "", targets: Optional[list[str]] = None) -> TranspileResult:
+    """The backend's answer. ``targets`` is what the job accepted (None: all).
+
+    Rust is read only when the job accepted it: a stray OUT.rs (or Rust on
+    stdout) from a job that was never shown the Rust rules must not shadow a
+    Java answer, or become a refused row in a session that cannot run it.
+    """
     sql_path = sandbox / "OUT.sql"
+    rust_path = sandbox / "OUT.rs"
     java_path = sandbox / "OUT.java"
+    rust_ok = targets is None or KIND_RUST in targets
     # DECLINE is cheap and final (prompt.md): a DECLINE file never falls
     # through to leftovers in the other file or stdout.
     if sql_path.exists():
@@ -31,6 +45,14 @@ def parse_sandbox(sandbox: Path, stdout: str = "") -> TranspileResult:
             raise BackendDecline("OUT.sql: DECLINE")
         if sql:
             return TranspileResult(kind=KIND_CATALYST, sql=sql)
+    # Same order the prompt gives: SQL, then Rust (only ever asked for when
+    # the job accepts it), then Java.
+    if rust_ok and rust_path.exists():
+        source = rust_path.read_text(encoding="utf-8").strip()
+        if source and source.upper() == "DECLINE":
+            raise BackendDecline("OUT.rs: DECLINE")
+        if source:
+            return TranspileResult(kind=KIND_RUST, rust_source=source)
     if java_path.exists():
         source = java_path.read_text(encoding="utf-8").strip()
         if source and source.upper() == "DECLINE":
@@ -46,10 +68,15 @@ def parse_sandbox(sandbox: Path, stdout: str = "") -> TranspileResult:
         # No files, no stdout: the CLI itself failed (crash, auth, rate limit).
         # An explicit DECLINE is the model deciding; silence is an error, and
         # errors get retried instead of cooling down like a decline.
-        raise BackendError("empty CLI output (no OUT.sql, OUT.java, or stdout)")
+        if not rust_ok and rust_path.exists():
+            raise BackendDecline("only OUT.rs, and this job does not accept Rust")
+        raise BackendError("empty CLI output (no OUT.sql, OUT.rs, OUT.java, or stdout)")
     if text.upper().startswith("DECLINE"):
         raise BackendDecline(text)
     first, _, rest = text.partition("\n")
+    if rust_ok and (first.strip().lower().endswith(".rs") or _RUST_DECL_RE.search(text)):
+        source = rest.strip() if first.strip().lower().endswith(".rs") else text
+        return TranspileResult(kind=KIND_RUST, rust_source=source)
     if first.strip().lower().endswith(".java") or _JAVA_DECL_RE.search(text):
         return TranspileResult(
             kind=KIND_JAVA_UDF,
@@ -63,6 +90,9 @@ def parse_sandbox(sandbox: Path, stdout: str = "") -> TranspileResult:
 # A real class declaration is followed by a body/extends/implements; bare
 # `class ` in prose ("this class of input") is not Java.
 _JAVA_DECL_RE = re.compile(r"\bclass\s+\w+\s*(?:\{|extends\b|implements\b)")
+# The one function a Rust rewrite must define; nothing else on stdout is Rust.
+# At the start of a line: `concat(_udf_param_0, 'pub fn udf(')` is SQL.
+_RUST_DECL_RE = re.compile(r"^\s*pub\s+fn\s+udf\s*\(", re.MULTILINE)
 
 
 ArgvBuilder = Callable[[str, Path, str], list[str]]
@@ -264,7 +294,6 @@ class CliBackend:
         return argv
 
     def run(self, job: TranspileJob, sandbox: Path) -> TranspileResult:
-        del job
         prompt_path = sandbox / "PROMPT.md"
         prompt_text = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
         argv = self.build_argv(sandbox, prompt_text)
@@ -295,7 +324,8 @@ class CliBackend:
             detected, stdout = self.spec.json_parser(stdout)
             model = model or detected
         try:
-            result = parse_sandbox(sandbox, stdout)
+            targets = list(job.targets) if job is not None else None
+            result = parse_sandbox(sandbox, stdout, targets=targets)
         except BackendDecline as exc:
             if model:
                 exc.model = model  # the worker records it on the declined row

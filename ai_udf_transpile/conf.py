@@ -52,6 +52,23 @@ WRITEBACK_THRESHOLD = PREFIX + "writebackThreshold"
 # (python -m ai_udf_transpile.approve). none | all | comma list of
 # string,struct,map,array,binary,timestamp,network | hard. See approval.py.
 REQUIRE_APPROVAL = PREFIX + "requireApproval"
+# Rewrite kinds a backend may be asked for and a lookup may serve. `rust`
+# (a Comet native UDF) is opt-in: Spark cannot evaluate it, so a query whose
+# operator Comet does not take FAILS instead of falling back to Python.
+TARGETS = PREFIX + "targets"
+RUST_CARGO = PREFIX + "rust.cargo"
+# Where UDF libraries are built and cached. Default ~/.cache/ai_udf_transpile/rust.
+RUST_BUILD_DIR = PREFIX + "rust.buildDir"
+# comet-udf-sdk source: a Comet checkout, the crate directory, or a TOML
+# inline table. Empty: $COMET_HOME, else the tag/commit of the Comet jar.
+RUST_COMET_SDK = PREFIX + "rust.cometSdk"
+RUST_BUILD_TIMEOUT = PREFIX + "rust.buildTimeoutSeconds"
+# Promise that rust.buildDir is the same path on every executor (shared
+# filesystem). Without it Rust rewrites are served on local masters only.
+RUST_SHARED_BUILD_DIR = PREFIX + "rust.sharedBuildDir"
+# Each verification query is cancelled after this long: a candidate whose loop
+# never ends (a Java or Rust rewrite) fails verification instead of hanging it.
+VERIFY_QUERY_TIMEOUT = PREFIX + "verifyQueryTimeoutSeconds"
 
 DEFAULTS: dict[str, str] = {
     CATALOG: "sqlite",
@@ -84,6 +101,14 @@ DEFAULTS: dict[str, str] = {
     WRITEBACK_FORMAT: "parquet",
     WRITEBACK_THRESHOLD: "32",
     REQUIRE_APPROVAL: "none",
+    TARGETS: "catalyst,java_udf",
+    RUST_CARGO: "cargo",
+    RUST_BUILD_DIR: "",
+    RUST_COMET_SDK: "",
+    # The first build against an SDK compiles arrow.
+    RUST_BUILD_TIMEOUT: "900",
+    RUST_SHARED_BUILD_DIR: "false",
+    VERIFY_QUERY_TIMEOUT: "300",
 }
 
 # Side channel so tests and the worker thread can read values even if the JVM

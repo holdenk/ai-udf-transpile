@@ -15,6 +15,11 @@ Up to four arms per function on one local SparkSession:
                 picks its own target. Slower per row than Catalyst SQL
                 for cheap ops, but it is a target for every convertible
                 benched UDF.
+  ai rust udf   --rust-accel (comet preset) only: the rust target switched
+                on, filled through *_rust twins the same way. A Rust UDF
+                runs only inside Comet, so the arm exists only where Comet
+                is live; a twin the backend served as SQL or Java is not a
+                rust arm (the transpile_succeeded_ai_rust column says so).
 
 The wide CSV (--csv; CI uploads it for slides) is one row per function with
 perf for each arm, speedup vs regular, and transpile_succeeded booleans for
@@ -44,6 +49,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -56,7 +62,7 @@ from pyspark.sql import functions as F  # noqa: E402
 from pyspark.sql.types import LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
-from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
+from ai_udf_transpile import conf, enable, rustc, shutdown  # noqa: E402
 from ai_udf_transpile.backends import ai_backend  # noqa: E402
 from ai_udf_transpile.backends.fake import (  # noqa: E402
     always_decline,
@@ -80,6 +86,10 @@ RUST_COMET_CONFS = {
     "spark.comet.shuffle.enabled": "false",
     # spark.range(...) is every bench frame's leaf scan.
     "spark.comet.exec.range.enabled": "true",
+    # The frames are .cache()d: without a native cache scan Comet leaves the
+    # projection above them to Spark, and the rust arm (which Spark cannot
+    # evaluate) fails instead of falling back.
+    "spark.comet.exec.inMemoryCache.enabled": "true",
     "spark.comet.explain.fallback.enabled": "true",
     "spark.memory.offHeap.enabled": "true",
     "spark.memory.offHeap.size": "2g",
@@ -128,6 +138,55 @@ JAVA_TWINS = {
     "zfill3": zfill3_java,
     "edit_distance": edit_distance_java,
 }
+
+
+# Rust twins: same bodies, another catalog key each, filled with the rust
+# target on (--rust-accel, comet preset). The backend still prefers SQL.
+def plus_one_rust(x: int) -> int:
+    return x + 1
+
+
+def backwards_rust(name: str) -> str:
+    if name is None:
+        return None
+    return name[::-1]
+
+
+def zfill3_rust(s: str) -> str:
+    return s.zfill(3)
+
+
+def edit_distance_rust(a: str, b: str) -> int:
+    if a is None or b is None:
+        return -1
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[len(b)]
+
+
+RUST_TWINS = {
+    "plus_one": plus_one_rust,
+    "backwards": backwards_rust,
+    "zfill3": zfill3_rust,
+    "edit_distance": edit_distance_rust,
+}
+
+
+_NATIVE_DIR: list[str] = []
+
+
+def _native(spark, sample):
+    """``sample`` as a parquet scan, which Comet reads natively (one dir per run, removed at exit)."""
+    if not _NATIVE_DIR:
+        _NATIVE_DIR.append(tempfile.mkdtemp(prefix="ai-udf-bench-rust-"))
+    path = tempfile.mkdtemp(dir=_NATIVE_DIR[0])
+    sample.coalesce(1).write.mode("overwrite").parquet(path)
+    return spark.read.parquet(path)
 
 
 def noop_seconds(df) -> float:
@@ -355,12 +414,22 @@ def main() -> int:
     # zfill/backwards/edit_distance take text, and zfill raises on NULL.
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
     conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
+    rust_on = args.rust_accel and rust_preset == "comet"
+    if rust_on:
+        conf.set_value(conf.TARGETS, "catalyst,java_udf,rust", spark)
+        reason = rustc.rust_unservable(spark)
+        if not reason and not rustc.rust_offered(spark, ["bigint"], "bigint"):
+            reason = "no cargo or no comet-udf-sdk to build against"
+        if reason:
+            print(f"warning: no rust arm: {reason}", file=sys.stderr)
+            rust_on = False
+    twins = {"java": JAVA_TWINS, "rust": RUST_TWINS if rust_on else {}}
     fills: dict[tuple[str, str], float] = {}
     made_by: dict[tuple[str, str], tuple[str | None, str | None]] = {}
     target_kinds: dict[tuple[str, str], str | None] = {}
     decline_error: str | None = None
     for name, fn, rtype, _df, _cols, _sample in functions:
-        for kind, target in (("catalyst", fn), ("java", JAVA_TWINS.get(name))):
+        for kind, target in (("catalyst", fn), *((k, t.get(name)) for k, t in twins.items())):
             if target is None:
                 continue
             start = time.perf_counter()
@@ -380,24 +449,40 @@ def main() -> int:
                 assert status == "success", f"{backend} did not fill {name} ({kind}): {error!r}"
     ai_udfs = {}
     java_udfs = {}
+    rust_udfs = {}
     for name, fn, rtype, df, cols, sample in functions:
         if name == "always_decline":
             ai_udfs[name] = UserDefinedFunction(fn, rtype)
             assert not ai_udfs[name].transpiled, "declined UDF unexpectedly became a hit"
             continue
         # Twins share a body, so py_expect (from the original) vets both kinds.
-        for label, udf_fn in (("ai", fn), ("java", JAVA_TWINS[name])):
+        by_label = {"ai": ai_udfs, "java": java_udfs, "rust": rust_udfs}
+        for label, udf_fn in (("ai", fn), *((k, t[name]) for k, t in twins.items() if name in t)):
             udf = UserDefinedFunction(udf_fn, rtype)
             assert udf.transpiled, f"{label} fill did not hit for {name}"
-            got = [r[0] for r in sample.select(udf(*cols)).collect()]
+            # A Rust UDF runs only inside Comet: its sample is a parquet scan
+            # (a local relation is evaluated by Spark itself). Any fill may come
+            # back as Rust under the rust preset, the original and the java
+            # twin included, so go by what was served, not by the label.
+            served = target_kinds[(name, "catalyst" if label == "ai" else label)]
+            check = _native(spark, sample) if served == "rust" else sample
+            got = [r[0] for r in check.select(udf(*cols)).collect()]
             assert got == py_expect[name], f"{label} {name} rewrote wrongly"
             assert "EvalPython" not in df.select(udf(*cols))._jdf.queryExecution().toString()
-            (ai_udfs if label == "ai" else java_udfs)[name] = udf
-    ai_ok = {name: bool(u.transpiled) for name, u in ai_udfs.items()}
+            by_label[label][name] = udf
+    # The catalyst column is SQL (or Java) only: an original served as Rust
+    # under the rust preset is not a catalyst number.
+    ai_ok = {
+        name: bool(u.transpiled) and target_kinds.get((name, "catalyst")) != "rust"
+        for name, u in ai_udfs.items()
+    }
     # A real backend picks its own target; only an actual Java UDF is a java arm.
     java_ok = {
         name: bool(u.transpiled) and target_kinds[(name, "java")] == "java_udf"
         for name, u in java_udfs.items()
+    }
+    rust_ok = {
+        name: bool(u.transpiled) and target_kinds[(name, "rust")] == "rust" for name, u in rust_udfs.items()
     }
     fallback_df = ints.select(ai_udfs["always_decline"]("x"))
     assert "BatchEvalPython" in fallback_df._jdf.queryExecution().toString()
@@ -416,6 +501,8 @@ def main() -> int:
             arms.append((f"ai {name}", df.select(ai_udfs[name](*cols)), f"python {name}"))
             if java_ok[name]:
                 arms.append((f"java {name}", df.select(java_udfs[name](*cols)), f"python {name}"))
+            if rust_ok.get(name):
+                arms.append((f"rust {name}", df.select(rust_udfs[name](*cols)), f"python {name}"))
     for _name, arm_df, _ in arms:  # warmup round for everyone
         noop_seconds(arm_df)
     secs: dict[str, float] = {}
@@ -435,12 +522,15 @@ def main() -> int:
         "transpiled_static_rows_per_second",
         "transpiled_ai_catalyst_rows_per_second",
         "transpiled_ai_java_rows_per_second",
+        "transpiled_ai_rust_rows_per_second",
         "static_speedup_vs_regular",
         "ai_catalyst_speedup_vs_regular",
         "ai_java_speedup_vs_regular",
+        "ai_rust_speedup_vs_regular",
         "transpile_succeeded_static",
         "transpile_succeeded_ai_catalyst",
         "transpile_succeeded_ai_java",
+        "transpile_succeeded_ai_rust",
         "ai_backend",
         "ai_model",
     ]
@@ -450,6 +540,7 @@ def main() -> int:
         static_arm = f"static {name}" if static_ok[name] else None
         ai_arm = f"ai {name}" if ai_ok[name] else None
         java_arm = f"java {name}" if java_ok.get(name) else None
+        rust_arm = f"rust {name}" if rust_ok.get(name) else None
         # always_decline's catalyst column is the fallback perf (the pipeline
         # outcome); the java column stays empty (no twin, nothing attempted).
         if name == "always_decline":
@@ -457,7 +548,15 @@ def main() -> int:
         # "+", not ",": the stdout row is comma-joined. Kinds come from the
         # success booleans, not arm presence, so a declined UDF reads "declined".
         kinds = (
-            "+".join(k for k, ok in (("catalyst", ai_ok[name]), ("java", java_ok.get(name, False))) if ok)
+            "+".join(
+                k
+                for k, ok in (
+                    ("catalyst", ai_ok[name]),
+                    ("java", java_ok.get(name, False)),
+                    ("rust", rust_ok.get(name, False)),
+                )
+                if ok
+            )
             or "declined"
         )
         wide.append(
@@ -468,12 +567,15 @@ def main() -> int:
                 round(rows / secs[static_arm]) if static_arm else "",
                 round(rows / secs[ai_arm]) if ai_arm else "",
                 round(rows / secs[java_arm]) if java_arm else "",
+                round(rows / secs[rust_arm]) if rust_arm else "",
                 round(secs[regular_arm] / secs[static_arm], 1) if static_arm else "",
                 round(secs[regular_arm] / secs[ai_arm], 1) if ai_arm else "",
                 round(secs[regular_arm] / secs[java_arm], 1) if java_arm else "",
+                round(secs[regular_arm] / secs[rust_arm], 1) if rust_arm else "",
                 static_ok[name],
                 ai_ok[name],
                 java_ok.get(name, False),
+                rust_ok.get(name, False),
                 *made_by[(name, "catalyst")],
             ]
         )
@@ -517,9 +619,11 @@ def main() -> int:
     lookup_targets = []
     for name, fn, rtype, _df, _cols, _sample in functions:
         lookup_targets.append((name, "catalyst", fn, rtype, ai_ok[name]))
-        twin = JAVA_TWINS.get(name)
-        if twin is not None:
-            lookup_targets.append((name, "java", twin, rtype, name in java_udfs))
+        for kind, table in twins.items():
+            twin = table.get(name)
+            if twin is not None:
+                served = java_udfs if kind == "java" else rust_udfs
+                lookup_targets.append((name, kind, twin, rtype, name in served))
     for mode, transpile_on in (("plain", False), ("ai", True)):
         spark.conf.set(TRANSPILE_CONF, "true" if transpile_on else "false")
         if transpile_on:
@@ -553,6 +657,8 @@ def main() -> int:
 
     shutdown()
     spark.stop()
+    if _NATIVE_DIR:
+        shutil.rmtree(_NATIVE_DIR[0], ignore_errors=True)
 
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:

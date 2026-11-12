@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import contextvars
 import logging
 import weakref
 from typing import Any, List, Optional
@@ -17,6 +19,7 @@ from ai_udf_transpile.keys import (
     func_from_spark_stack,
     udf_key,
 )
+from ai_udf_transpile.targets import NO_RUST_SUFFIX
 from ai_udf_transpile.types import (
     input_categories,
     input_spark_types,
@@ -94,7 +97,69 @@ def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
         if row.impl_source:
             logger.debug("java_udf impl_source without impl_class; cannot reconstruct")
             return None
+    if row.target_kind == "rust":
+        return _reconstruct_rust(row, return_type, spark)
     return None
+
+
+def _reconstruct_rust(row: Any, return_type: Any, spark: Any) -> Any:
+    """A Rust rewrite, or None wherever attaching it could fail the query.
+
+    Spark cannot evaluate a Comet native UDF, so "not sure" means the Python
+    UDF: target switched off, Comet not live, a master whose executors may
+    not see the library. A library that is not built yet (a row from the
+    shared table, a wiped cache) starts a background build and keeps Python
+    for now -- UDF definition never waits on cargo.
+    """
+    from ai_udf_transpile import rustc
+
+    if not row.impl_source or not rustc.supports_types(row.input_types, row.return_type):
+        return None
+    # A row from the shared table was verified by whoever wrote it, not here.
+    # SQL and jars are served as-is; source about to become native code in
+    # this process gets the scan again first.
+    from ai_udf_transpile.verify import rejected_rewrite
+
+    if rejected_rewrite(row.as_result()):
+        logger.debug("rust rewrite for %s not served: forbidden construct", row.udf_key[:12])
+        return None
+    reason = rustc.rust_unservable(spark)
+    if reason:
+        logger.debug("rust rewrite for %s not served: %s", row.udf_key[:12], reason)
+        return None
+    compiled = rustc.cached_library(spark, row.impl_source, row.input_types, row.return_type)
+    if compiled is None:
+        rustc.compile_in_background(spark, row.impl_source, row.input_types, row.return_type)
+        return None
+    import pyspark.sql.functions as F
+
+    rustc.register_rust_udf(spark, compiled, row.input_types, row.return_type)
+    return F.expr(rustc.call_expr(compiled.name, row.input_types)).cast(return_type)
+
+
+_NO_RUST_ROUTING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ai_udf_no_rust_routing", default=False
+)
+
+
+@contextlib.contextmanager
+def no_rust_routing():
+    """Resolve UDFs to their no-Rust twin key inside the block (the worker's
+    smoke test of a twin row must reconstruct that row, not the Rust one)."""
+    token = _NO_RUST_ROUTING.set(True)
+    try:
+        yield
+    finally:
+        _NO_RUST_ROUTING.reset(token)
+
+
+def _rust_elsewhere(row: Any, spark: Any) -> bool:
+    """A served Rust row this session could never attach (no target, no Comet)."""
+    if row.target_kind != "rust":
+        return False
+    from ai_udf_transpile.rustc import rust_unservable
+
+    return rust_unservable(spark) is not None
 
 
 def _spark_version(spark: Any) -> str:
@@ -175,6 +240,15 @@ def get_transpiler_class() -> type:
                 catalog = get_catalog()
                 if catalog is None:
                     return None
+                # A Rust row this session cannot run (no Comet, no target) gets
+                # a twin key with its own SQL/Java rewrite rather than pin the
+                # UDF to Python here. Decided on a side-effect-free read, before
+                # lookup: lookup may park the row for approval or re-queue it,
+                # and a session that never serves the row must not change it.
+                peek = catalog.get(key)
+                if _NO_RUST_ROUTING.get() or (peek is not None and _rust_elsewhere(peek, spark)):
+                    version += NO_RUST_SUFFIX
+                    key = udf_key(source, params, in_types, out_type, version, fingerprint)
                 kind, row = catalog.lookup(key, spark=spark)
                 if kind == HIT and row is not None:
                     try:

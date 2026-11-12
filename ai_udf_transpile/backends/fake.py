@@ -3,12 +3,19 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.keys import canonical_source_from_func, canonical_source_text
-from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileJob, TranspileResult
+from ai_udf_transpile.targets import (
+    KIND_CATALYST,
+    KIND_JAVA_UDF,
+    KIND_RUST,
+    TranspileJob,
+    TranspileResult,
+)
 
 
 def plus_one(x: int) -> int:
@@ -546,8 +553,63 @@ def edit_distance_java(a: str, b: str) -> int:
     return prev[len(b)]
 
 
+# Rust twins, same idea: a distinct def name is a distinct catalog key, so
+# the same computation can be served as SQL, Java and Rust side by side.
+def plus_one_rust(x: int) -> int:
+    return x + 1
+
+
+def backwards_rust(name: str) -> str:
+    if name is None:
+        return None
+    return name[::-1]
+
+
+def collatz_steps(n: int) -> int:
+    # A data-dependent loop: no Spark SQL form, the case Rust (or Java) is for.
+    if n is None or n < 1:
+        return None
+    steps = 0
+    while n != 1:
+        n = n // 2 if n % 2 == 0 else 3 * n + 1
+        steps += 1
+    return steps
+
+
 def _result(sql: str) -> TranspileResult:
     return TranspileResult(kind=KIND_CATALYST, sql=sql)
+
+
+# Row functions for the Comet native UDF target (rustc.py generates the
+# Arrow glue). `None + 1` raises in Python; the differential check allows
+# any result there, and NULL is what the SQL fixture for plus_one gives.
+PLUS_ONE_RS = """pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> {
+    match x {
+        Some(v) => v.checked_add(1).map(Some).ok_or_else(|| "bigint overflow".to_string()),
+        None => Ok(None),
+    }
+}
+"""
+
+BACKWARDS_RS = """pub fn udf(name: Option<&str>) -> Result<Option<String>, String> {
+    Ok(name.map(|s| s.chars().rev().collect()))
+}
+"""
+
+COLLATZ_STEPS_RS = """pub fn udf(n: Option<i64>) -> Result<Option<i64>, String> {
+    // i128: 3n + 1 can leave i64 on the way to a result that fits.
+    let mut n = match n {
+        Some(v) if v >= 1 => v as i128,
+        _ => return Ok(None),
+    };
+    let mut steps: i64 = 0;
+    while n != 1 {
+        n = if n % 2 == 0 { n / 2 } else { 3 * n + 1 };
+        steps += 1;
+    }
+    Ok(Some(steps))
+}
+"""
 
 
 BACKWARDS_JAVA = """package ai_udf;
@@ -723,6 +785,9 @@ FIXTURES: dict[str, TranspileResult] = {
         java_source=BACKWARDS_JAVA,
         class_name="ai_udf.Backwards",
     ),
+    canonical_source_from_func(plus_one_rust): TranspileResult(kind=KIND_RUST, rust_source=PLUS_ONE_RS),
+    canonical_source_from_func(backwards_rust): TranspileResult(kind=KIND_RUST, rust_source=BACKWARDS_RS),
+    canonical_source_from_func(collatz_steps): TranspileResult(kind=KIND_RUST, rust_source=COLLATZ_STEPS_RS),
     canonical_source_from_func(plus_one_java): TranspileResult(
         kind=KIND_JAVA_UDF,
         java_source=PLUS_ONE_JAVA,
@@ -900,6 +965,14 @@ class FakeBackend:
         result = FIXTURES.get(key)
         if result is None:
             raise BackendDecline(f"no fake fixture for source {key!r}")
+        if result.kind not in job.targets:
+            # Rust is only on offer where the session can build and run it; a
+            # real model is not shown the Rust rules otherwise either.
+            raise BackendDecline(f"fake fixture is {result.kind}, which this job does not accept")
+        # A fresh object per run: verification stamps build outputs on it.
+        result = replace(result)
+        if result.rust_source:
+            (sandbox / "OUT.rs").write_text(result.rust_source, encoding="utf-8")
         if result.sql:
             (sandbox / "OUT.sql").write_text(result.sql + "\n", encoding="utf-8")
         if result.java_source:

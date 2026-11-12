@@ -42,7 +42,7 @@ from ai_udf_transpile.backends.bytecode import BytecodeBackend  # noqa: E402
 from ai_udf_transpile.catalog import CacheRow  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
 from ai_udf_transpile.sandbox import make_sandbox  # noqa: E402
-from ai_udf_transpile.targets import KIND_JAVA_UDF  # noqa: E402
+from ai_udf_transpile.targets import KIND_JAVA_UDF, KIND_RUST, NO_RUST_SUFFIX  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
@@ -110,12 +110,24 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
         if not rows:
             continue
         if "target_kind" in rows[0]:  # bench_catalog / bench_fhi_udfs CSV
-            for r in rows:
-                # bench_fhi_udfs also times its pinned naive/tuned rewrites and a
-                # non-nullable column; the doc's AI line is the live arm on the
-                # ordinary (nullable) column.
-                if r.get("arm", "ai") != "ai" or r.get("column_nullable", "True") != "True":
-                    continue
+            # bench_fhi_udfs also times its pinned naive/tuned rewrites and a
+            # non-nullable column; the doc's AI line is the live arm on the
+            # ordinary (nullable) column.
+            live = [
+                r for r in rows if r.get("arm", "ai") == "ai" and r.get("column_nullable", "True") == "True"
+            ]
+            # A name two catalog rows share (a rust row and its "+no-rust"
+            # twin) is keyed by udf_key as well, so each section gets its own
+            # row's numbers rather than whichever came last.
+            names = Counter(r["function"] for r in live)
+            for r in live:
+                key = r.get("udf_key") or ""
+                # By udf_key whenever the CSV has one; by name only for a
+                # name no other catalog row in this CSV shares. dump() checks
+                # the key too, so a name entry never lands on another row.
+                keys = [key] if key else []
+                if names[r["function"]] == 1 or not key:
+                    keys.append(r["function"])
                 py_rate = r.get("python_rows_per_second")
                 tx_rate = r.get("transpiled_rows_per_second")
                 if not py_rate and not tx_rate:
@@ -123,11 +135,13 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                 if not py_rate:
                     # Interpreted arm could not run on the sample; the
                     # transpiled rate is still a real measurement.
-                    perf[r["function"]] = {
-                        "top": "",
-                        "static": "",
-                        "ai": f"{_fmt_rate(tx_rate)} rows/s (no python baseline)",
-                    }
+                    for k in keys:
+                        perf[k] = {
+                            "top": "",
+                            "static": "",
+                            "ai": f"{_fmt_rate(tx_rate)} rows/s (no python baseline)",
+                            **({"udf_key": key} if key else {}),
+                        }
                     continue
                 # Same schema, different bench: bench_fhi_udfs.py names itself.
                 bench = r.get("bench") or "catalog"
@@ -137,8 +151,10 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     "ai": "",
                 }
                 if tx_rate and r["status"] == "success":
+                    # A rust rewrite's only arm is Comet's: say where it ran.
+                    where = ", Comet native" if r.get("target_kind") == "rust" else ""
                     arms["ai"] = (
-                        f"{_fmt_rate(tx_rate)} rows/s ({r['transpiled_speedup_vs_python']}x vs python)"
+                        f"{_fmt_rate(tx_rate)} rows/s ({r['transpiled_speedup_vs_python']}x vs python{where})"
                     )
                 comet = r.get("comet_rows_per_second")
                 if comet and arms["ai"] and r.get("comet_speedup_vs_python"):
@@ -152,7 +168,10 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     # keep the catalog bench's, labeled, since its speedup is
                     # against that bench's own python baseline.
                     arms["ai"] += " · comet (catalog bench) " + prev_ai.split(" · comet ", 1)[1]
-                perf[r["function"]] = arms
+                if key:
+                    arms["udf_key"] = key
+                for k in keys:
+                    perf[k] = dict(arms)
         elif "kinds" in rows[0]:  # bench_micro wide CSV
             for r in rows:
                 py = _fmt_rate(r["regular_rows_per_second"])
@@ -176,6 +195,16 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                         "static": "",
                         "ai": f"{_fmt_rate(java)} rows/s ({r['ai_java_speedup_vs_regular']}x vs python)",
                     }
+                rust = r.get("transpiled_ai_rust_rows_per_second")
+                if rust:
+                    perf[r["function"] + "_rust"] = {
+                        "top": top,
+                        "static": "",
+                        "ai": (
+                            f"{_fmt_rate(rust)} rows/s"
+                            f" ({r['ai_rust_speedup_vs_regular']}x vs python, Comet native)"
+                        ),
+                    }
         elif "declined" in rows[0]:  # bench_tpcds CSV
             for r in rows:
                 top = (
@@ -191,6 +220,20 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     )
                 perf[r["function"]] = {"top": top, "static": "", "ai": ai}
     return perf
+
+
+def _perf_for(perf: dict[str, dict[str, str]], name: str, udf_key: str) -> dict[str, str]:
+    """The perf bullets for one catalog row.
+
+    By name first: later --perf-csv files (micro/tpcds/fhi, deeper arms)
+    override per function by name. A name entry that carries another catalog
+    row's udf_key (a Rust row's, for its "+no-rust" twin) is not this row's;
+    then only this row's own keyed entry, if any, applies.
+    """
+    p = perf.get(name) or {}
+    if not p or (p.get("udf_key") and p["udf_key"] != udf_key):
+        p = perf.get(udf_key) or {}
+    return p
 
 
 def _builtin_result(row: CacheRow) -> str:
@@ -224,12 +267,17 @@ def _ai_section(row: CacheRow) -> list[str]:
     if row.status == "success":
         if row.target_kind == KIND_JAVA_UDF:
             return [f"- **AI ({label})**: java UDF:{tail}", "", "```java", row.impl_source or "", "```"]
+        if row.target_kind == KIND_RUST:
+            head = f"- **AI ({label})**: rust UDF (Comet native):{tail}"
+            return [head, "", "```rust", row.impl_source or "", "```"]
         return [f"- **AI ({label})**: `{row.catalyst_sql}`{tail}"]
     if row.status == "failed":
         lines = [f"- **AI ({label})**: failed: {row.error}{tail}"]
         # The rejected candidate is half the story: show it when the row kept it.
         if row.target_kind == KIND_JAVA_UDF and row.impl_source:
             return lines + ["", "```java", row.impl_source, "```"]
+        if row.target_kind == KIND_RUST and row.impl_source:
+            return lines + ["", "```rust", row.impl_source, "```"]
         if row.catalyst_sql:
             lines.append(f"- **rejected rewrite**: `{row.catalyst_sql}`")
         return lines
@@ -254,17 +302,24 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
         "and each transpiled arm's rows/s at the end of its own line -- with a",
         "comet arm when the catalog bench ran against a Comet build; no perf",
         "= not benched or the interpreted arm raises on the bench sample.",
+        "Rust rewrites (the opt-in `rust` target) run only inside Comet, so",
+        "their one number is Comet's and says so.",
         "",
     ]
     try:
         for row in rows:
             name = _function_name(row.source_text) or row.udf_key[:12]
-            p = perf.get(name) or {}
+            p = _perf_for(perf, name, row.udf_key)
+            title = name
+            if (row.spark_version or "").endswith(NO_RUST_SUFFIX):
+                # The rewrite a session that cannot run Rust got for a UDF
+                # whose main row is Rust: same source, its own key.
+                title = f"{name} (no-Rust twin)"
             head = [f"- **types**: {', '.join(row.input_types)} -> {row.return_type}"]
             if p.get("top"):
                 head.append(p["top"])
             lines += [
-                f"## {name}",
+                f"## {title}",
                 "",
                 "```python",
                 row.source_text,

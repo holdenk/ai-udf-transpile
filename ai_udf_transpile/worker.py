@@ -8,6 +8,7 @@ SQLite/Delta. Do not deploy a broker.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import threading
@@ -20,7 +21,7 @@ from ai_udf_transpile.backends import get_backend
 from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.catalog import Catalog, configured_tolerance, open_catalog, publish_verified
 from ai_udf_transpile.sandbox import make_sandbox
-from ai_udf_transpile.targets import TranspileResult
+from ai_udf_transpile.targets import KIND_RUST, NO_RUST_SUFFIX, TranspileResult
 from ai_udf_transpile.verify import (
     hypothesis_check,
     rejected_rewrite,
@@ -57,6 +58,37 @@ def _reported_model(backend: Any) -> Optional[str]:
         return None
 
 
+def _no_rust_row(row: Any) -> bool:
+    return (getattr(row, "spark_version", "") or "").endswith(NO_RUST_SUFFIX)
+
+
+def _rust_offered(spark: Any, input_types: list[str], return_type: str) -> bool:
+    """Ask for Rust only where this session could build, verify and serve it."""
+    if spark is None:
+        return False
+    try:
+        from ai_udf_transpile.rustc import rust_offered
+
+        return rust_offered(spark, input_types, return_type)
+    except Exception:
+        logger.debug("rust target probe failed; not offering rust", exc_info=True)
+        return False
+
+
+def _rust_refusal(spark: Any, result: TranspileResult, row: Any) -> Optional[str]:
+    """Why a Rust rewrite cannot be taken here (never asked for, or not runnable)."""
+    if result.kind != KIND_RUST:
+        return None
+    if _no_rust_row(row):
+        return "rust rewrite for a row that exists because its session cannot run Rust"
+    from ai_udf_transpile.rustc import rust_unservable, supports_types
+
+    if not supports_types(row.input_types, row.return_type):
+        return f"rust target does not support ({', '.join(row.input_types)}) -> {row.return_type}"
+    reason = rust_unservable(spark)
+    return f"rust rewrite cannot run in this session: {reason}" if reason else None
+
+
 def process_row(
     catalog: Catalog,
     row: Any,
@@ -80,21 +112,17 @@ def process_row(
             # hypothesis_passed=False means this payload was already rejected;
             # re-verifying it would burn every retry on the same failure, so
             # let the row go to the backend instead.
-            result = TranspileResult(
-                kind=row.target_kind or "catalyst",
-                sql=row.catalyst_sql,
-                java_source=row.impl_source,
-                class_name=row.impl_class,
-                binary=row.impl_binary,
-                entry=row.impl_entry,
-            )
+            result = row.as_result()
+            result.model = None
             origin = "human"
         else:
             job = row.as_job()
+            if not _no_rust_row(row) and _rust_offered(spark, job.input_types, job.return_type):
+                job.targets = [*job.targets, KIND_RUST]
             with make_sandbox(job, inputs=conf.get_value(conf.AI_REPRESENTATION, spark)) as sandbox:
                 result = backend.run(job, sandbox)
         model = result.model
-        rejected = rejected_rewrite(result)
+        rejected = rejected_rewrite(result) or _rust_refusal(spark, result, row)
         if rejected:
             catalog.mark_failed(
                 key, rejected, origin=origin, model=model or _reported_model(backend), result=result
@@ -160,13 +188,18 @@ def process_row(
                     set_catalog(catalog)
                     if spark is not None:
                         set_session(spark)
-            smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
-                spark,
-                source_text=row.source_text,
-                captures=row.captures,
-                input_types=row.input_types,
-                return_type=row.return_type,
-            )
+            from ai_udf_transpile.transpiler import no_rust_routing
+
+            # A twin row is reached through its twin key; without forcing it,
+            # a session that can run Rust would smoke-test the Rust row instead.
+            with no_rust_routing() if _no_rust_row(row) else contextlib.nullcontext():
+                smoke_err = sql_reconstruction_error(result) or smoke_test_reconstruction(
+                    spark,
+                    source_text=row.source_text,
+                    captures=row.captures,
+                    input_types=row.input_types,
+                    return_type=row.return_type,
+                )
             if smoke_err:
                 catalog.mark_failed(key, smoke_err, origin=origin, model=model)
                 logger.info("transpile failed (reconstruction) key=%s: %s", key[:12], smoke_err)
