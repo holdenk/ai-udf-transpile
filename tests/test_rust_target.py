@@ -1514,6 +1514,7 @@ def test_unsizable_array_lengths_are_refused_at_once(length):
 # -- review of the requireApproval x Rust integration ------------------------------
 
 
+@pytest.mark.spark  # the transpiler hook imports pyspark (no JVM started)
 def test_a_session_that_cannot_run_rust_never_parks_the_rust_row(tmp_path):
     """requireApproval: lookup parks a gated row. A session that never serves the Rust row
     must route to its twin before lookup, not park the row and wait on a review."""
@@ -1551,6 +1552,7 @@ def test_a_session_that_cannot_run_rust_never_parks_the_rust_row(tmp_path):
         T._SESSION_REF = prior_session
 
 
+@pytest.mark.spark  # the transpiler hook imports pyspark (no JVM started)
 def test_no_rust_routing_forces_the_twin_key(tmp_path):
     """The worker's smoke test of a twin row must reconstruct that row, even where Rust runs."""
     import ast
