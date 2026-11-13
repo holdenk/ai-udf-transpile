@@ -93,6 +93,11 @@ def test_all_benches_preserves_plain_and_comet_micro_results(tmp_path):
 
 
 def test_comet_output_path_collision_is_rejected(tmp_path):
+    spark_home = tmp_path / "spark"
+    (spark_home / "python" / "pyspark" / "sql").mkdir(parents=True)
+    (spark_home / "python" / "pyspark" / "sql" / "transpile.py").write_text("")
+    (spark_home / "python" / "lib").mkdir()
+    (spark_home / "python" / "lib" / "py4j-test-src.zip").write_bytes(b"")
     proc = subprocess.run(
         [
             str(EXAMPLES / "run_demos.sh"), "--all-benches", "--rust-accel",
@@ -100,7 +105,7 @@ def test_comet_output_path_collision_is_rejected(tmp_path):
             "--transpilation-timing-csv", str(tmp_path / "out.csv"),
         ],
         capture_output=True, text=True, timeout=60,
-        env={**os.environ, "SPARK_HOME": str(tmp_path)},
+        env={**os.environ, "SPARK_HOME": str(spark_home)},
     )
     assert proc.returncode == 2
     assert "collision" in proc.stderr
