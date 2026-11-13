@@ -3,8 +3,10 @@
 
   python examples/bench_graph_aggregate.py questionable_benchmark_results/
 
-Reads every bench*.csv in the directory (bench_micro, bench_bytecode_vs_static,
-bench_tpcds_udfs), normalizes each arm to a speedup vs interpreted python, and
+Reads every *bench*.csv in the directory (bench_micro, bench_bytecode_vs_static,
+bench_tpcds_udfs, bench_catalog, bench_fhi_udfs -- also under
+regen_examples_doc.sh's examples_transpiled_bench*.csv names), normalizes
+each arm to a speedup vs interpreted python, and
 draws one horizontal strip per path: every point is one (benchmark, function)
 pair, so the honest picture includes the stragglers. Fallback rows (a declined
 pattern running python perf under the transpiled label) are excluded -- they
@@ -41,7 +43,10 @@ ARMS = {
     "static_comet": ("static (built-in AST, Comet)", "tab:blue"),
     "ai_catalyst_comet": ("AI: Catalyst SQL, Comet", "tab:purple"),
     "ai_java_comet": ("AI: Java UDF, Comet", "tab:green"),
+    # Only ever measured under Comet: one row, whatever the CSV is called.
+    "ai_rust": ("AI: Rust UDF (Comet native)", "tab:olive"),
 }
+COMET_ONLY_ARMS = frozenset({"ai_rust"})
 
 # csv signature column -> [(arm, speedup column, (fallback flag col, skip value))]
 _SCHEMAS = {
@@ -53,6 +58,7 @@ _SCHEMAS = {
             ("transpile_succeeded_ai_catalyst", "False"),
         ),
         ("ai_java", "ai_java_speedup_vs_regular", ("transpile_succeeded_ai_java", "False")),
+        ("ai_rust", "ai_rust_speedup_vs_regular", ("transpile_succeeded_ai_rust", "False")),
     ],
     "java_eval_rows_per_second": [
         ("static", "static_speedup_vs_python", None),
@@ -66,6 +72,34 @@ _SCHEMAS = {
 }
 
 
+# bench_catalog / bench_fhi_udfs rows say what was served: target_kind -> arm.
+# A rust row's transpiled number is already Comet's (ai_rust is Comet-only).
+_KIND_ARMS = {"catalyst": "ai_catalyst", "java_udf": "ai_java", "rust": "ai_rust"}
+
+
+def _collect_by_kind(path: Path, rows: list[dict], points: dict[str, list[tuple[str, float]]]) -> None:
+    """One row per function, the served rewrite's kind in target_kind. These
+    are AI rewrites, so they belong on the AI arms -- not on the tpcds
+    `transpiled` strip the shared transpiled_rows_per_second column would
+    otherwise sniff them onto."""
+    bench = path.stem.replace("bench_", "").replace("_", " ")
+    for row in rows:
+        # bench_fhi_udfs: only the live AI arm on the nullable column is an
+        # AI rewrite as served; its pinned arms are exhibits, not output.
+        if row.get("arm", "ai") != "ai" or row.get("column_nullable", "True") != "True":
+            continue
+        arm = _KIND_ARMS.get(row.get("target_kind", ""))
+        if arm is None or row.get("status") != "success":
+            continue  # declined, failed, or verified but not served: no rewrite ran
+        label = f"{bench}/{row['function']}"
+        raw = row.get("transpiled_speedup_vs_python", "")
+        if raw and float(raw) > 0:
+            points[arm].append((label, float(raw)))
+        comet = row.get("comet_speedup_vs_python", "")
+        if comet and float(comet) > 0 and f"{arm}_comet" in ARMS:
+            points[f"{arm}_comet"].append((label, float(comet)))
+
+
 def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
     """arm -> [(benchmark, function), speedup]"""
     points: dict[str, list[tuple[str, float]]] = {arm: [] for arm in ARMS}
@@ -73,6 +107,9 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
         with open(path, newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         if not rows:
+            continue
+        if "target_kind" in rows[0]:  # before the tpcds sniff: both carry transpiled_rows_per_second
+            _collect_by_kind(path, rows, points)
             continue
         specs = next((s for sig, s in _SCHEMAS.items() if sig in rows[0]), None)
         if specs is None:
@@ -87,7 +124,7 @@ def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:
                     continue  # declined/failed arm: no number, no point
                 if guard and row.get(guard[0]) == guard[1]:
                     continue  # python fallback perf, not a rewrite
-                if comet:
+                if comet and arm not in COMET_ONLY_ARMS:
                     variant = f"{arm}_comet"
                     if variant not in ARMS:
                         # Folding a rust-accelerated point into the plain
@@ -136,14 +173,15 @@ def render(points: dict[str, list[tuple[str, float]]], png_path: str, *, log_sca
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("results", help="directory of bench*.csv CSVs (or a single CSV)")
+    parser.add_argument("results", help="directory of *bench*.csv CSVs (or a single CSV)")
     parser.add_argument("--png", help="output PNG (default: <results>/bench_aggregate.png)")
     args = parser.parse_args()
 
     root = Path(args.results)
-    paths = sorted(root.glob("bench*.csv")) if root.is_dir() else [root]
+    # regen_examples_doc.sh writes examples_transpiled_bench*.csv, not bench*.csv.
+    paths = sorted(root.glob("*bench*.csv")) if root.is_dir() else [root]
     if not paths:
-        parser.error(f"no bench*.csv under {args.results}")
+        parser.error(f"no *bench*.csv under {args.results}")
     points = collect(paths)
     live = {a: pts for a, pts in points.items() if pts}
     if not live:

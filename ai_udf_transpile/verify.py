@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import functools
 import importlib
 import inspect
 import linecache
 import logging
+import math
 import re
 import textwrap
+import threading
+from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -50,20 +55,58 @@ _SENTINEL_RAISED = object()
 # extend it when a rewrite legitimately needs one of these and re-review.
 # \s* around dots: valid Java allows whitespace/comments between tokens of
 # a qualified name (`Runtime . getRuntime()` compiles fine).
-_FORBIDDEN_SQL = re.compile(r"\b(?:reflect|java_method)\s*\(", re.IGNORECASE)
+# try_reflect is reflect with the exception swallowed: the same arbitrary
+# static call (`try_reflect('java.lang.System', 'getenv', 'X')` reads the
+# driver's environment into a column), and `\breflect` does not see it.
+# The Java list is still a denylist and still leaks at the edges; the
+# entries past io/net are the ones a rewrite reached without naming either
+# (files and sockets through java.nio, TLS through javax.net, the process
+# environment, and the getDeclared* spellings of reflection).
+_FORBIDDEN_SQL = re.compile(r"\b(?:try_)?(?:reflect|java_method)\s*\(", re.IGNORECASE)
 _FORBIDDEN_JAVA = re.compile(
     r"\b(?:"
     r"Runtime\s*\.\s*getRuntime"
-    r"|System\s*\.\s*(?:load|loadLibrary|exit)"
+    r"|System\s*\.\s*(?:load|loadLibrary|exit|getenv|getProperty|getProperties|setProperty)"
+    r"|getenv\s*\("
     r"|ProcessBuilder"
     r"|Class\s*\.\s*forName"
     r"|loadClass\s*\("
-    r"|getMethod\s*\("
+    r"|(?:get\w*)?ClassLoader"
+    r"|get(?:Declared)?(?:Method|Constructor|Field)s?\s*\("
     r"|MethodHandles"
     r"|exec\s*\("
     r"|java\s*\.\s*(?:io|net)\s*\."
-    r"|javax\s*\.\s*script"
+    r"|java\s*\.\s*nio\s*\.\s*(?:file|channels)"
+    r"|javax\s*\.\s*(?:script|net)"
     r")"
+)
+# A Rust row function is pure computation over its arguments. `unsafe` is
+# also a compile error (the generated glue forbids it for the module); the
+# rest is what safe Rust can still reach: the filesystem, processes, sockets
+# and the environment through std, files read at COMPILE time through
+# include!/env!/#[path], and FFI through extern. arrow and the SDK are the
+# glue's business -- a row function never needs them. A module is named
+# either as a path segment (`fs::read`, `std::fs`) or in a `use`. A `use`
+# can also rename the crate root or glob it (`use std as s; use s::fs as q`,
+# `use std::*; use fs as q`), after which the module is never followed by
+# `::`: so a forbidden module anywhere in a `use`, a renamed crate root, and
+# a crate-root glob are refused outright. Denylist, not a sandbox: the same
+# caveat as the Java scan.
+_RUST_MODULES = r"(?:fs|process|net|env|os|ffi|ptr|thread|io|path|arch|intrinsics)"
+_FORBIDDEN_RUST = re.compile(
+    r"\b(?:unsafe|extern)\b"
+    r"|\b" + _RUST_MODULES + r"\s*::"
+    r"|\b(?:std|core|alloc)\s*::\s*" + _RUST_MODULES + r"\b"
+    r"|\buse\b[^;]*\b" + _RUST_MODULES + r"\b"
+    r"|\b(?:std|core|alloc)\s+as\b"
+    r"|\buse\b[^;]*\b(?:std|core|alloc)\s*::\s*(?:\*|\{[^;]*\*)"
+    r"|\b(?:arrow\w*|comet_udf_sdk|libc)\s*::"
+    r"|\b(?:SystemTime|Instant)\b"  # the clock: Comet plans the call as immutable
+    # A macro can paste a module name into a path (`std::$m::read`), which
+    # no token scan sees; a row function has no use for defining one.
+    r"|\bmacro_rules\b"
+    r"|\b(?:include|include_str|include_bytes|env|option_env|asm|global_asm|concat_idents)\s*!(?!=)"
+    r"|#\s*!?\s*\[\s*(?:path|link\w*|no_mangle|export_name|used|global_allocator|cfg_attr|proc_macro\w*)\b"
 )
 _PLACEHOLDER = re.compile(r"_udf_param_\d+")
 
@@ -262,6 +305,773 @@ def _java_for_forbidden_scan(java: str) -> str:
     return _JAVA_SKIP.sub(_blank_skippable, _translate_java_unicode_escapes(java))
 
 
+# Comments and literals, blanked before the Rust scan. A lexer, not a regex:
+# Rust block comments NEST, and a regex that stops at the first `*/` treats
+# the rest of an outer comment as code -- `/* /* */ " */ exit(0); // "`
+# then reads as a string covering the call. Raw strings (`r#"..."#`) have no
+# escapes, and `'a` is a lifetime unless a closing quote follows one char.
+_RUST_CHAR = re.compile(r"b?'(?:[^'\\\n]|\\(?:u\{[^}\n]*\}|x[0-9a-fA-F]{2}|.))'")
+# Raw strings: r"", byte br"", and C cr"" (stable since Rust 1.77). A
+# backslash in any of them is a plain character, so a raw string read as an
+# escaped one would run on past its closing quote and hide the code after it.
+_RUST_RAW_START = re.compile(r'[bc]?r(#*)"')
+
+
+def _rust_blank_literals(rust: str) -> str:
+    """Blank comments and literals (keeping newlines) the way rustc lexes them.
+
+    An unterminated comment or literal blanks to the end: rustc rejects that
+    source anyway, so treating the tail as inert can only reject less of
+    something that will never compile.
+    """
+    out = list(rust)
+    n = len(rust)
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    i = 0
+    while i < n:
+        ch = rust[i]
+        if rust.startswith("//", i):
+            j = rust.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+            continue
+        if rust.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if rust.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif rust.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+            continue
+        ident_before = i > 0 and (rust[i - 1].isalnum() or rust[i - 1] == "_")
+        raw = None if ident_before else _RUST_RAW_START.match(rust, i)
+        if raw:
+            close = '"' + raw.group(1)
+            j = rust.find(close, raw.end())
+            j = n if j < 0 else j + len(close)
+            blank(i, j)
+            i = j
+            continue
+        if ch == '"' or (ch == "b" and not ident_before and rust.startswith('b"', i)):
+            j = i + (2 if ch == "b" else 1)
+            while j < n and rust[j] != '"':
+                j += 2 if rust[j] == "\\" else 1
+            blank(i, j + 1)
+            i = j + 1
+            continue
+        if ch == "'" or (ch == "b" and not ident_before and rust.startswith("b'", i)):
+            lit = _RUST_CHAR.match(rust, i)
+            if lit:
+                blank(i, lit.end())
+                i = lit.end()
+                continue
+        i += 1
+    return "".join(out)
+
+
+# `r#fs` is the identifier `fs`: drop the raw prefix so `std::r#fs` reads as
+# what it names. (Raw strings also start `r#`, but those are already blank.)
+_RUST_RAW_IDENT = re.compile(r"\br#(?=[A-Za-z_])")
+
+
+def _rust_for_forbidden_scan(rust: str) -> str:
+    return _RUST_RAW_IDENT.sub("", _rust_blank_literals(rust))
+
+
+_RUST_FN = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
+_RUST_IMPL = re.compile(r"\bimpl\b")
+_RUST_TYPE_ITEM = re.compile(r"\b(struct|enum|union|mod|type)\s+([A-Za-z_]\w*)")
+# `static`/`const` items -- not `const fn`, not `'static`, not `*const T`,
+# not a `<const N: usize>` generic parameter (checked by the caller).
+_RUST_STATIC = re.compile(r"(?<![\w'*])(?:static|const)\b(?!\s+(?:fn|unsafe|async|extern)\b)")
+_RUST_USE = re.compile(r"\buse\b[^;]*;")
+_RUST_AS = re.compile(r"\bas\s+([A-Za-z_]\w*)")
+_RUST_TRAIT_IMPL_HEADER = re.compile(r"\bfor\b(?!\s*<)")
+# What carries a call without naming a function: `trait` items, an erased
+# closure or value (`dyn`), and `std::any` (a fn pointer behind a downcast).
+# Trait impls (`impl X for Y`) are found by `_rust_recursion` from each
+# `impl` header, since a header can hold `;` (`impl From<[i64; 2]> for D`).
+_RUST_HIDDEN_CALL = re.compile(
+    r"\btrait\s+[A-Za-z_]"
+    r"|\bdyn\b"
+    r"|\b(?:std|core|alloc)\s*::\s*(?:any\b|\{[^;]*\bany\b)"
+)
+_RUST_FN_TYPE = re.compile(r"\bfn\s*\(|\bFn(?:Mut|Once)?\b")
+# A field whose type is built only from these is a std value: a `.name(..)`
+# call on `self.field` reaches std's method, never one of the rewrite's own.
+# A local type, a type parameter, or anything else leaves the call an edge.
+_RUST_STD_FIELD_WORDS = frozenset(
+    "i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64 bool char str "
+    "String Vec VecDeque HashMap HashSet BTreeMap BTreeSet BinaryHeap Option Box Rc "
+    "Cell RefCell Reverse Ordering Peekable Chars CharIndices Bytes Rev Range "
+    "std core alloc collections iter string vec cell rc cmp mut pub".split()
+)
+# Real row functions are a few KB; the scan below is quadratic in the worst
+# case, so a bound keeps a pathological reply from stalling the worker.
+_RUST_MAX_SOURCE = 20_000
+
+
+_RUST_BRACES = re.compile(r"[{}]")
+_RUST_HEADER_PUNCT = re.compile(r"[()\[\]<>{;]")
+
+
+def _rust_block_end(scanned: str, start: int) -> int:
+    """Index of the ``}`` closing the ``{`` at ``start`` (or the text's end)."""
+    depth = 0
+    for m in _RUST_BRACES.finditer(scanned, start):
+        depth += 1 if m.group(0) == "{" else -1
+        if depth == 0:
+            return m.start()
+    return len(scanned)
+
+
+def _rust_item_stop(scanned: str, pos: int) -> int:
+    """The ``{`` opening, or ``;`` ending, the item whose header starts at ``pos``.
+
+    Generic arguments are skipped: ``;`` inside ``(..)``/``[..]``/``<..>`` is an
+    array length (``impl From<[i64; 2]>``), and a ``{..}`` inside ``<..>`` is a
+    const-generic argument (``impl W<{ 1 + 1 }>``), not the body. ``->`` and
+    ``=>`` close nothing, and ``<``/``>`` inside ``(..)``/``[..]`` are operators
+    (``[u8; 1 << 2]``), not generics.
+    """
+    depth = angle = 0
+    n = len(scanned)
+    hit = _RUST_HEADER_PUNCT.search(scanned, pos)
+    while hit:
+        i, ch = hit.start(), hit.group(0)
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "<" and depth <= 0:  # inside (..)/[..] it may be `1 << 2`
+            angle += 1
+        elif ch == ">" and depth <= 0 and (i == 0 or scanned[i - 1] not in "-="):
+            angle -= 1
+        elif ch == "{":
+            if depth > 0 or angle > 0:
+                hit = _RUST_HEADER_PUNCT.search(scanned, _rust_block_end(scanned, i) + 1)
+                continue
+            return i
+        elif ch == ";" and depth <= 0 and angle <= 0:
+            return i
+        hit = _RUST_HEADER_PUNCT.search(scanned, i + 1)
+    return n
+
+
+def _rust_item_open(scanned: str, pos: int) -> Optional[int]:
+    """The ``{`` opening the item whose header starts at ``pos``; None at a ``;`` first."""
+    i = _rust_item_stop(scanned, pos)
+    return i if i < len(scanned) and scanned[i] == "{" else None
+
+
+def _rust_item_end(scanned: str, pos: int) -> int:
+    """Where the item whose header starts at ``pos`` ends: its ``;`` or closing ``}``."""
+    i = _rust_item_stop(scanned, pos)
+    return _rust_block_end(scanned, i) if i < len(scanned) and scanned[i] == "{" else i
+
+
+def _rust_stmt_end(scanned: str, pos: int) -> int:
+    """The ``;`` ending a ``static``/``const`` item (initializer expressions included)."""
+    depth = 0
+    for i in range(pos, len(scanned)):
+        ch = scanned[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return i
+        elif ch == ";" and depth == 0:
+            return i
+    return len(scanned)
+
+
+def _rust_fn_bodies(scanned: str) -> list[tuple[str, int, int, int]]:
+    """(name, fn_start, name_end, end) for every ``fn`` with a body, in blanked source.
+
+    ``fn_start..end`` runs from ``fn`` to the closing brace; ``name_end..end``
+    is the body proper, parameters included.
+    """
+    out = []
+    for match in _RUST_FN.finditer(scanned):
+        open_ = _rust_item_open(scanned, match.end())
+        if open_ is not None:
+            out.append((match.group(1), match.start(), match.end(), _rust_block_end(scanned, open_)))
+    return out
+
+
+def _rust_split_top(text: str) -> list[str]:
+    """``text`` split at commas outside any bracket."""
+    parts, depth, last = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>" and not (ch == ">" and i and text[i - 1] in "-="):
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[last:i])
+            last = i + 1
+    parts.append(text[last:])
+    return [p for p in parts if p.strip()]
+
+
+def _rust_std_fields(scanned: str, type_name: str) -> set[str]:
+    """Fields of the one struct ``type_name`` whose types are std values only.
+
+    A word the rewrite defines itself (``struct Range``, ``use S as Vec``)
+    is never std, whatever its name.
+    """
+    local = {m.group(2) for m in _RUST_TYPE_ITEM.finditer(scanned)}
+    for use in _RUST_USE.finditer(scanned):
+        local |= set(_RUST_AS.findall(use.group(0)))
+    std_words = _RUST_STD_FIELD_WORDS - local
+    defs = [m for m in _RUST_TYPE_ITEM.finditer(scanned) if m.group(2) == type_name]
+    if len(defs) != 1 or defs[0].group(1) != "struct":
+        return set()
+    stop = _rust_item_stop(scanned, defs[0].end())
+    head = scanned[defs[0].end() : stop]
+    params = head.split("(")[0]
+    if "<" in params and re.sub(r"'\w+|[\s<>,:+]", "", params):
+        return set()  # a type parameter: a field may be any type (lifetimes are fine)
+    if stop < len(scanned) and scanned[stop] == "{":
+        fields = []
+        for part in _rust_split_top(scanned[stop + 1 : _rust_block_end(scanned, stop)]):
+            m = re.match(r"\s*(?:pub(?:\s*\([^)]*\))?\s+)?([A-Za-z_]\w*)\s*:(?!:)(.*)", part, re.S)
+            if not m:
+                return set()
+            fields.append((m.group(1), m.group(2)))
+    else:
+        open_ = head.find("(")
+        if open_ < 0:
+            return set()
+        close = _rust_stmt_end(scanned, defs[0].end() + open_ + 1)
+        inner = scanned[defs[0].end() + open_ + 1 : close]
+        fields = [(str(i), part) for i, part in enumerate(_rust_split_top(inner))]
+    return {
+        name
+        for name, typ in fields
+        if all(w in std_words for w in re.findall(r"[A-Za-z_]\w*", re.sub(r"'\w+", "", typ)))
+    }
+
+
+_RUST_CHAIN_CALL = re.compile(r"\s*\.\s*[A-Za-z_]\w*\s*(?:::\s*<([^;{}()|]*)>\s*)?\(")
+
+
+def _rust_std_receiver(before: str, fields: set[str]) -> bool:
+    """``before`` ends in ``self.<std field>`` plus std calls that keep it std.
+
+    Each call in the chain must take no identifiers (``.iter()``, ``.get(0)``,
+    ``.split(',')`` with the literal blanked): a closure, a variable or a fn
+    item could hand a user type in (``.and(Some(s)).unwrap().go()``), and a
+    turbofish may only name std types.
+    """
+    found = list(re.finditer(r"(?<![\w.])self\s*\.\s*(\w+)", before))
+    if not found or found[-1].group(1) not in fields:
+        return False
+    tail, i = before[found[-1].end() :], 0
+    while True:
+        call = _RUST_CHAIN_CALL.match(tail, i)
+        if not call:
+            break
+        if call.group(1) and not all(
+            w in _RUST_STD_FIELD_WORDS for w in re.findall(r"[A-Za-z_]\w*", call.group(1))
+        ):
+            return False
+        depth, k = 1, call.end()
+        while k < len(tail) and depth:
+            depth += {"(": 1, ")": -1}.get(tail[k], 0)
+            k += 1
+        if depth or re.search(r"[A-Za-z_|]", tail[call.end() : k - 1]):
+            return False
+        i = k
+    return not tail[i:].strip()
+
+
+def _rust_alias_resolver(scanned: str):
+    """A function mapping a ``use .. as`` alias (chains included) to the name it renames."""
+    aliases = {}
+    for use in _RUST_USE.finditer(scanned):
+        for target, alias in re.findall(r"([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)", use.group(0)):
+            aliases[alias] = target
+
+    def resolve(name: str) -> str:
+        for _ in range(len(aliases) + 1):
+            if name not in aliases or aliases[name] == name:
+                return name
+            name = aliases[name]
+        return name
+
+    return resolve
+
+
+_RUST_PRIM_SIZE = {
+    "i8": 1, "u8": 1, "bool": 1, "i16": 2, "u16": 2, "i32": 4, "u32": 4, "f32": 4, "char": 4,
+    "i64": 8, "u64": 8, "f64": 8, "isize": 8, "usize": 8, "i128": 16, "u128": 16,
+}  # fmt: skip
+# Anything else (String, Vec, Box, Option<..> of those, references) is a few
+# words on the stack; its contents live on the heap.
+_RUST_OTHER_SIZE = 24
+# What one rewrite may put on the stack, all arrays and local values together.
+# Executor task threads often get 1 MB; a lookup table is a few KB.
+_RUST_STACK_BUDGET = 256 * 1024
+_RUST_INFINITE = float("inf")
+
+
+def _rust_const_value(
+    expr: str, consts: dict[str, str], depth: int = 0, memo: Optional[dict[str, float]] = None
+) -> float:
+    """An array length as a number: literals, + - * / % << >> ( ), and consts.
+
+    Each const is evaluated once (``memo``): `const B: usize = A + A + A;`
+    chains would otherwise re-evaluate exponentially.
+    """
+    memo = {} if memo is None else memo
+    if depth > 64 or len(expr) > 512:
+        return _RUST_INFINITE
+    text = re.sub(r"(?<=\d)_(?=\d)", "", expr)
+    text = re.sub(r"\b(\d+)(?:usize|u\d+|i\d+|isize)\b", r"\1", text)
+
+    def const(m: re.Match) -> str:
+        name = m.group(0)
+        if name in consts:
+            if name not in memo:
+                memo[name] = _RUST_INFINITE  # a cycle reads as unsizable
+                memo[name] = _rust_const_value(consts[name], consts, depth + 1, memo)
+            value = memo[name]
+            return "1e30" if value == _RUST_INFINITE else str(int(value))
+        return "@"  # unknown name: not sizable
+
+    text = re.sub(r"\b[A-Za-z_]\w*\b", const, text)
+    if "@" in text:
+        return _RUST_INFINITE
+    return _rust_int_expr(text)
+
+
+_RUST_INT_OPS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.FloorDiv: lambda a, b: a // b,
+    ast.Div: lambda a, b: a // b,
+    ast.Mod: lambda a, b: a % b,
+    ast.LShift: lambda a, b: a << b,
+    ast.RShift: lambda a, b: a >> b,
+}
+_RUST_INT_LIMIT = 1 << 64
+
+
+def _rust_int_expr(text: str) -> float:
+    """An integer expression of literals and + - * / % << >> ( ), or infinity.
+
+    No ``eval``: ``9**9**9`` or ``1 << 10**9`` would stall the worker. Any
+    value past 2**64 (or a shift past 64 bits) is infinite, i.e. not sizable.
+    """
+    try:
+        tree = ast.parse(text.strip(), mode="eval")
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return _RUST_INFINITE
+
+    def value(node: ast.AST) -> int:
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            result = node.value
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            inner = value(node.operand)
+            result = -inner if isinstance(node.op, ast.USub) else inner
+        elif isinstance(node, ast.BinOp) and type(node.op) in _RUST_INT_OPS:
+            left, right = value(node.left), value(node.right)
+            if isinstance(node.op, (ast.LShift, ast.RShift)) and not 0 <= right < 64:
+                raise OverflowError
+            if isinstance(node.op, (ast.FloorDiv, ast.Div, ast.Mod)) and right == 0:
+                raise ZeroDivisionError
+            result = _RUST_INT_OPS[type(node.op)](left, right)
+        else:
+            raise ValueError
+        if abs(result) >= _RUST_INT_LIMIT:
+            raise OverflowError
+        return result
+
+    try:
+        result = value(tree.body)
+    except (ValueError, OverflowError, ZeroDivisionError, RecursionError):
+        return _RUST_INFINITE
+    return float(result) if result >= 0 else _RUST_INFINITE
+
+
+def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Optional[str]:
+    """Why the source may need more stack than ``_RUST_STACK_BUDGET``, if it may.
+
+    Counts every array type or repeat expression (``[T; N]``, ``[x; N]``,
+    nested ones multiplied) and every mention of a local type in a function
+    body at its size. Over-counts on purpose: a type definition and its uses
+    both count.
+    """
+    consts = {
+        m.group(1): m.group(2)
+        for m in re.finditer(r"\bconst\s+([A-Za-z_]\w*)\s*:[^=;]*=\s*([^;]*);", scanned)
+    }
+    sizes: dict[str, float] = {}
+    const_memo: dict[str, float] = {}
+
+    def type_size(text: str, seen: frozenset = frozenset()) -> float:
+        text = text.strip()
+        if not text:
+            return 0
+        if text.startswith(("&", "*", "fn")):
+            return 8
+        if text.startswith("["):
+            return bracket_size(text[1 : _rust_close(text, 0)], seen)
+        if text.startswith("("):
+            return sum(type_size(p, seen) for p in _rust_split_top(text[1 : _rust_close(text, 0)]))
+        m = re.match(r"(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)", text)
+        name = resolve(m.group(1)) if m else ""
+        if name in _RUST_PRIM_SIZE:
+            return _RUST_PRIM_SIZE[name]
+        if name in types and name not in seen:
+            return local_size(name, seen | {name})
+        return _RUST_OTHER_SIZE
+
+    def local_size(name: str, seen: frozenset) -> float:
+        if name not in sizes:
+            body = types[name]
+            fields = [
+                re.sub(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?[A-Za-z_]\w*\s*:(?!:)", "", f, count=1)
+                for f in _rust_split_top(_rust_inner(body))
+            ]
+            # A struct is the sum of its fields; an enum is at least its largest
+            # variant, which the sum bounds from above.
+            sizes[name] = sum(type_size(f, seen) for f in fields) or _RUST_OTHER_SIZE
+        return sizes[name]
+
+    def bracket_size(inner: str, seen: frozenset = frozenset()) -> float:
+        parts = _rust_split_semicolon(inner)
+        if len(parts) != 2:
+            return 0  # a slice type, an index, or an array literal: no repeat
+        elem, length = parts
+        n = _rust_const_value(length, consts, memo=const_memo)
+        if n == _RUST_INFINITE:
+            return _RUST_INFINITE
+        nested = [bracket_size(elem[i + 1 : _rust_close(elem, i)], seen) for i in _rust_top_brackets(elem)]
+        if nested:
+            each = max(nested)
+        else:
+            words = [resolve(w) for w in re.findall(r"[A-Za-z_]\w*", elem)]
+            local = [w for w in words if w in types]
+            prim = [_RUST_PRIM_SIZE[w] for w in words if w in _RUST_PRIM_SIZE]
+            each = max([local_size(w, seen | {w}) for w in local] + prim or [8])
+        if each == _RUST_INFINITE:
+            return _RUST_INFINITE  # an unsizable element stays unsizable, even times 0
+        return n * each
+
+    def occurrences(text: str):
+        """Every array to count: ``vec![x; n]`` is heap, but an array inside it is not."""
+        for i in _rust_top_brackets(text):
+            inner = text[i + 1 : _rust_close(text, i)]
+            if re.search(r"\bvec\s*!\s*$", text[:i]):
+                yield from occurrences(inner)
+            else:
+                yield inner
+
+    total = 0.0
+    for inner in occurrences(scanned):
+        total += bracket_size(inner)
+        if total == _RUST_INFINITE:
+            return (
+                "rust rewrite has an array whose length this check cannot size (use "
+                "integer literals or consts): a large array on the stack overflows it"
+            )
+    for name, _, name_end, end in _rust_fn_bodies(scanned):
+        for word in re.findall(r"[A-Za-z_]\w*", scanned[name_end:end]):
+            if resolve(word) in types:
+                total += local_size(resolve(word), frozenset({resolve(word)}))
+    if math.isnan(total) or total > _RUST_STACK_BUDGET:
+        return (
+            f"rust rewrite may put about {int(total) // 1024} KB on the stack (arrays and "
+            f"local values; at most {_RUST_STACK_BUDGET // 1024} KB): a stack overflow aborts "
+            "the process; put large buffers in a Vec"
+        )
+    return None
+
+
+def _rust_close(text: str, i: int) -> int:
+    """Index of the bracket closing the ``[``/``(`` at ``i`` (or the end)."""
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] in "([{":
+            depth += 1
+        elif text[j] in ")]}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(text)
+
+
+def _rust_top_brackets(text: str) -> list[int]:
+    """Start of every outermost ``[..]`` in ``text`` (nested ones are their contents)."""
+    out, i = [], 0
+    while True:
+        i = text.find("[", i)
+        if i < 0:
+            return out
+        out.append(i)
+        i = _rust_close(text, i) + 1
+
+
+def _rust_split_semicolon(text: str) -> list[str]:
+    """``text`` split at ``;`` outside any bracket."""
+    parts, depth, last = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            parts.append(text[last:i])
+            last = i + 1
+    parts.append(text[last:])
+    return parts
+
+
+def _rust_inner(body: str) -> str:
+    """The text inside the first ``{..}`` or ``(..)`` of a type definition."""
+    for i, ch in enumerate(body):
+        if ch in "{(":
+            return body[i + 1 : _rust_close(body, i)]
+        if ch == ";":
+            break
+    return body
+
+
+def _rust_impl_target(header: str) -> Optional[str]:
+    """``S`` from an inherent ``impl<..> S<..>`` header (after the keyword)."""
+    text = header.lstrip()
+    if text.startswith("<"):
+        depth = 0
+        for i, ch in enumerate(text):
+            depth += ch == "<"
+            depth -= ch == ">" and (i == 0 or text[i - 1] not in "-=")
+            if depth == 0:
+                text = text[i + 1 :]
+                break
+    m = re.match(r"\s*([A-Za-z_]\w*)", text)
+    return m.group(1) if m else None
+
+
+def _rust_recursion(scanned: str) -> Optional[str]:
+    """Why the blanked source may recurse, if it may.
+
+    A Rust stack overflow is not a panic: it aborts the process, and in
+    local mode that process is the driver. Deep enough input reaches any
+    recursion depth, so a rewrite that can reach a function from itself is
+    refused -- directly, through a function value (``let f = udf; f(x)``,
+    a fn-pointer table), or through a cycle of helpers or methods.
+
+    The check is by name, not by scope: any mention of a function's name in
+    a body is an edge, a local of the same name included (a scope-aware
+    exception let ``let f = udf; { let udf = 0; } f(x)`` through), and a
+    name is every function with it (dynamic dispatch). A path reaches a free
+    function only through ``crate``/``self``/``super``/``Self``/a local type,
+    module or ``use .. as`` alias; a method also through ``.name``, except
+    ``self.field.name(..)`` on a field whose type is std values only
+    (``self.items.push(c)`` inside ``fn push``).
+
+    Calls that name no function are refused outright: trait impls (an
+    operator, ``{}``, ``.into()`` reach an impl's method by trait), ``trait``,
+    ``dyn``, ``std::any``, a type, ``static`` or ``const`` holding a function,
+    and a function value outside every body. A call in a ``const``/``static``
+    initializer is compile-time evaluation and is allowed.
+    Runaway loops are the prompt's to prevent.
+    """
+    hidden = _RUST_HIDDEN_CALL.search(scanned)
+    if hidden:
+        return (
+            f"rust rewrite uses `{hidden.group(0).split()[0]}`: `trait`, `dyn` and `std::any` "
+            "can call a function without naming it, so recursion through them cannot be "
+            "ruled out; use plain functions and inherent methods"
+        )
+    impls = []  # (target, open, end) of every `impl` with a body
+    for match in _RUST_IMPL.finditer(scanned):
+        stop = _rust_item_stop(scanned, match.end())
+        header = scanned[match.end() : stop]
+        if _RUST_TRAIT_IMPL_HEADER.search(header):
+            return (
+                "rust rewrite implements a trait (`impl .. for ..`): an operator, `{}`, "
+                "`.into()` or a for loop reaches the impl's method without naming it, so "
+                "recursion through it cannot be ruled out; use plain functions and "
+                "inherent methods (`impl Type { .. }`)"
+            )
+        if stop < len(scanned) and scanned[stop] == "{":
+            impls.append((_rust_impl_target(header), stop, _rust_block_end(scanned, stop)))
+    for match in _RUST_TYPE_ITEM.finditer(scanned):
+        if match.group(1) == "mod":
+            continue
+        if _RUST_FN_TYPE.search(scanned[match.end() : _rust_item_end(scanned, match.end())]):
+            return (
+                f"rust rewrite defines a type holding a function ({match.group(2)}): a "
+                "closure handed such a value can call itself; pass functions as arguments"
+            )
+    # A recursive type (`struct Node { next: Option<Box<Node>> }`) recurses
+    # with no function at all: dropping, cloning or comparing a long chain
+    # overflows inside std's glue. `Self` and `use .. as` aliases name it too.
+    types = {
+        m.group(2): scanned[m.end() : _rust_item_end(scanned, m.end())]
+        for m in _RUST_TYPE_ITEM.finditer(scanned)
+        if m.group(1) != "mod"
+    }
+    resolve = _rust_alias_resolver(scanned)
+    type_edges = {
+        name: {resolve(w) for w in re.findall(r"[A-Za-z_]\w*", text) if resolve(w) in types}
+        | ({name} if re.search(r"\bSelf\b", text) else set())
+        for name, text in types.items()
+    }
+    for node in sorted(types):
+        seen: set[str] = set()
+        stack = list(type_edges[node])
+        while stack:
+            cur = stack.pop()
+            if cur == node:
+                return (
+                    f"rust rewrite defines a recursive type ({node}): dropping, cloning or "
+                    "comparing a deep value recurses and can overflow the stack; use a Vec "
+                    "with indices instead"
+                )
+            if cur not in seen:
+                seen.add(cur)
+                stack.extend(type_edges.get(cur, ()))
+    # No recursion is needed to overflow: one big array on the stack does it
+    # (`let mut counts = [0u32; 1 << 20];` is 4 MB, the stack 1-8 MB).
+    big = _rust_stack_estimate(scanned, types, resolve)
+    if big:
+        return big
+    statics = []  # (start, end) of every static/const item
+    for match in _RUST_STATIC.finditer(scanned):
+        before = scanned[: match.start()].rstrip()
+        if before.endswith(("<", ",")):  # `<const N: usize>`: a generic parameter
+            continue
+        end = _rust_stmt_end(scanned, match.end())
+        if _RUST_FN_TYPE.search(scanned[match.end() : end]):
+            return (
+                "rust rewrite has a static or const holding a function: whatever "
+                "stores a function there can be called back from anywhere, itself included"
+            )
+        statics.append((match.start(), end))
+    bodies = _rust_fn_bodies(scanned)
+    names = {name for name, *_ in bodies}
+    if not names:
+        return None
+    methods = {name for name, start, *_ in bodies if any(a < start < b for _, a, b in impls)}
+    roots = {"crate", "self", "super", "Self"} | {m.group(2) for m in _RUST_TYPE_ITEM.finditer(scanned)}
+    for use in _RUST_USE.finditer(scanned):
+        roots |= set(_RUST_AS.findall(use.group(0)))
+    root = "|".join(re.escape(r) for r in sorted(roots))
+    std_fields = {t: _rust_std_fields(scanned, t) for t, _, _ in impls if t}
+
+    def patterns(name: str) -> tuple[re.Pattern, Optional[re.Pattern]]:
+        """(any-mention pattern, method-call pattern) for ``name``."""
+        word = re.escape(name)
+        # Bare: not after one `.` (a field or method) or `::` (a path), but
+        # after `..` (a range) or one `:` (a field init) it is the value.
+        alts = [
+            rf"(?<![\w'])(?<![^.]\.)(?<!::){word}\b(?!\s*!)",
+            rf"\b(?:{root})(?:\s*::\s*\w+)*\s*::\s*{word}\b",
+        ]
+        if name not in methods:
+            return re.compile("|".join(alts)), None
+        alts.append(rf">\s*::\s*{word}\b")  # `<S>::go`, `<S as X>::go`, `S::<T>::go`
+        # `.name` reaches a method only as a call (`x.go(..)`, `x.go::<T>(..)`);
+        # without one it is a field (`self.consonants` in `fn consonants`).
+        return re.compile("|".join(alts)), re.compile(rf"\.\s*{word}\s*(?:\(|::)")
+
+    compiled = {name: patterns(name) for name in names}
+
+    def mentions(text: str, name: str, fields: set[str]) -> bool:
+        plain, method = compiled[name]
+        if plain.search(text):
+            return True
+        if method is None:
+            return False
+        for hit in method.finditer(text):
+            if not _rust_std_receiver(text[: hit.start()], fields):
+                return True
+        return False
+
+    # Outside every body only a static/const initializer or a `use` can hold a
+    # function value (type definitions with function types are refused above).
+    # A call in an initializer is compile-time evaluation: blank its callee.
+    outside = [" "] * len(scanned)
+    for start, end in statics:
+        text = re.sub(r"\b[A-Za-z_]\w*(?=\s*\()", lambda m: " " * len(m.group(0)), scanned[start:end])
+        outside[start:end] = text
+    for use in _RUST_USE.finditer(scanned):
+        outside[use.start() : use.end()] = use.group(0)
+    for _, start, _, end in bodies:
+        outside[start : end + 1] = " " * (end + 1 - start)
+    outside_text = "".join(outside)
+    for name in sorted(names):
+        if mentions(outside_text, name, set()):
+            return (
+                f"rust rewrite uses the function {name} as a value outside a function "
+                "body (a static, const, or use): it can then be called from anywhere, "
+                "itself included"
+            )
+    edges: dict[str, set[str]] = {name: set() for name in names}
+    for name, fn_start, name_end, end in bodies:
+        # From after `fn name`: the declaration itself is no self-edge
+        # (a nested `fn`'s text is part of the body and counts).
+        text = scanned[name_end:end]
+        owner = [t for t, a, b in impls if a < fn_start < b]
+        fields = std_fields.get(owner[-1], set()) if owner and owner[-1] else set()
+        for other in names:
+            if mentions(text, other, fields):
+                edges[name].add(other)
+    for node in sorted(names):
+        seen: set[str] = set()
+        stack = list(edges[node])
+        while stack:
+            cur = stack.pop()
+            if cur == node:
+                return (
+                    f"rust rewrite is recursive ({node}): a stack overflow aborts the "
+                    "process instead of failing the query (the check is by name: a local, "
+                    "a parameter, or a method named like a std method it calls on anything "
+                    "but a std-typed field of self counts too: rename it)"
+                )
+            if cur not in seen:
+                seen.add(cur)
+                stack.extend(edges.get(cur, ()))
+    return None
+
+
+@functools.lru_cache(maxsize=256)
+def _rust_rejected(rust: str) -> Optional[str]:
+    """Scan verdict for one Rust source; memoized, since every lookup re-checks a served row."""
+    if len(rust) > _RUST_MAX_SOURCE:
+        return f"rust rewrite is too long ({len(rust)} chars, at most {_RUST_MAX_SOURCE}): keep it small"
+    scanned = _rust_for_forbidden_scan(rust)
+    if not scanned.isascii():
+        # Comments and literals are blank by now: this is an identifier, which
+        # the ASCII-only name patterns below would not see.
+        return "rust rewrite uses a non-ASCII identifier: use ASCII names"
+    if _FORBIDDEN_RUST.search(scanned):
+        return (
+            "rust rewrite uses a forbidden construct "
+            "(unsafe/extern/fs/process/net/env/io/clock/include!/env!/macro_rules!/#[path]/arrow)"
+        )
+    try:
+        return _rust_recursion(scanned)
+    except (RecursionError, MemoryError):
+        return "rust rewrite is nested too deeply to check: flatten it"
+
+
 def rejected_rewrite(result: Any) -> Optional[str]:
     """Return an error if the rewrite must not be compiled or executed.
 
@@ -271,10 +1081,13 @@ def rejected_rewrite(result: Any) -> Optional[str]:
     """
     sql = getattr(result, "sql", None) or ""
     java = getattr(result, "java_source", None) or ""
+    rust = getattr(result, "rust_source", None) or ""
     if _FORBIDDEN_SQL.search(_sql_for_forbidden_scan(sql)):
         return "rewrite invokes reflect or java_method"
     if _FORBIDDEN_JAVA.search(_java_for_forbidden_scan(java)):
         return "java rewrite uses a forbidden API (Runtime/ProcessBuilder/reflection/exec/io/net/script)"
+    if rust:
+        return _rust_rejected(rust)
     return None
 
 
@@ -554,12 +1367,112 @@ def _row_values(args: tuple) -> dict[str, Any]:
     return {f"_udf_param_{i}": args[i] for i in range(len(args))}
 
 
-def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_type: str):
+_COMET_RDD_CONVERT = "spark.comet.convert.rdd.enabled"
+_NATIVE_ROWS_LOCK = threading.Lock()
+# Per SparkSession (conf is per session): id -> {"depth": n, "prior": value}.
+_NATIVE_ROWS: dict[int, dict[str, Any]] = {}
+
+
+@contextmanager
+def _comet_native_rows(spark: Any, native: bool):
+    """Let Comet take the operator above an in-memory DataFrame.
+
+    A Rust UDF runs only inside Comet's native execution, and the verifier's
+    rows come from ``createDataFrame`` (an RDD scan Comet leaves to Spark
+    unless asked to convert it). Session-wide for the duration, like the
+    untyped-UDF switch in javac: harmless to a concurrent query, which at
+    worst gets its own RDD scans converted to Arrow.
+    """
+    if not native:
+        yield
+        return
+    # Refcounted: overlapping verifications (the inline worker and a
+    # register_impl call) must restore the value from before the FIRST one,
+    # not whatever the other had set.
+    # Keyed by session: the spark object is held for the whole scope, so its
+    # id cannot be reused by another session while the entry exists.
+    session = id(spark)
+    with _NATIVE_ROWS_LOCK:
+        state = _NATIVE_ROWS.get(session)
+        if state is None:
+            state = _NATIVE_ROWS[session] = {"depth": 0, "prior": spark.conf.get(_COMET_RDD_CONVERT, None)}
+            spark.conf.set(_COMET_RDD_CONVERT, "true")
+        state["depth"] += 1
+    try:
+        yield
+    finally:
+        with _NATIVE_ROWS_LOCK:
+            state["depth"] -= 1
+            if state["depth"] == 0:
+                del _NATIVE_ROWS[session]
+                if state["prior"] is None:
+                    spark.conf.unset(_COMET_RDD_CONVERT)
+                else:
+                    spark.conf.set(_COMET_RDD_CONVERT, state["prior"])
+
+
+class VerifyQueryTimeout(RuntimeError):
+    """A verification query ran past ``verifyQueryTimeoutSeconds`` and was cancelled."""
+
+
+@contextlib.contextmanager
+def _query_deadline(spark: Any):
+    """Cancel the Spark jobs started inside after ``verifyQueryTimeoutSeconds``.
+
+    A candidate whose loop never ends (Java or Rust; SQL cannot loop) would
+    otherwise hold verification, and the worker, forever. Cancelling the job
+    group fails the driver's ``collect()`` at once. The task thread itself
+    cannot be stopped mid-row -- a JVM loop ignores the interrupt until it
+    returns, native code never sees it -- so in local mode it keeps one core
+    busy until the process exits. That costs a core; a hang costs the worker.
+    """
+    import threading
+    import uuid
+
+    from ai_udf_transpile import conf
+
+    seconds = conf.get_float(conf.VERIFY_QUERY_TIMEOUT, spark, 300.0)
+    sc = getattr(spark, "sparkContext", None)
+    if seconds <= 0 or sc is None:
+        yield
+        return
+    keys = ("spark.jobGroup.id", "spark.job.description", "spark.job.interruptOnCancel")
+    prior = {k: sc.getLocalProperty(k) for k in keys}
+    group = f"ai-udf-verify-{uuid.uuid4().hex}"
+    fired = threading.Event()
+
+    def cancel() -> None:
+        fired.set()
+        sc.cancelJobGroup(group)
+
+    sc.setJobGroup(group, "ai_udf_transpile verification", interruptOnCancel=True)
+    timer = threading.Timer(seconds, cancel)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    except Exception as exc:
+        if fired.is_set():
+            raise VerifyQueryTimeout(
+                f"verification query ran longer than {seconds:g}s and was cancelled "
+                "(a loop that does not terminate on this input?)"
+            ) from exc
+        raise
+    finally:
+        timer.cancel()
+        for key, value in prior.items():
+            sc.setLocalProperty(key, value)
+
+
+def _eval_sql(
+    spark: Any, sql: str, args: tuple, input_types: list[str], return_type: str, native: bool = False
+):
     from pyspark.sql import Row
     from pyspark.sql.types import StructType
 
     df = spark.createDataFrame([Row(**_row_values(args))], StructType(_param_fields(input_types)))
-    value = df.selectExpr(f"({sql}) AS result").collect()[0][0]
+    with _comet_native_rows(spark, native), _query_deadline(spark):
+        value = df.selectExpr(f"({sql}) AS result").collect()[0][0]
     if not _representable(value, return_type):
         # Production always casts the result; verify did not. A value that
         # fits the tolerance but not the return type passed verification and
@@ -568,8 +1481,15 @@ def _eval_sql(spark: Any, sql: str, args: tuple, input_types: list[str], return_
     return value
 
 
-def _eval_sql_batch(spark: Any, sql: str, rows: list[tuple], input_types: list[str]) -> list:
-    """Evaluate ``sql`` on many argument tuples in one job. Order matches ``rows``."""
+def _eval_sql_batch(
+    spark: Any, sql: str, rows: list[tuple], input_types: list[str], native: bool = False
+) -> list:
+    """Evaluate ``sql`` on many argument tuples in one job. Order matches ``rows``.
+
+    ``native`` keeps the projection directly above the scan: a global sort
+    puts a Spark exchange under it, and a Rust UDF above a Spark operator is
+    a query error. Rows are matched back by id either way.
+    """
     from pyspark.sql import Row
     from pyspark.sql.types import IntegerType, StructField, StructType
 
@@ -579,8 +1499,15 @@ def _eval_sql_batch(spark: Any, sql: str, rows: list[tuple], input_types: list[s
         values = {"_batch_id": idx}
         values.update(_row_values(args))
         data.append(Row(**values))
-    df = spark.createDataFrame(data, StructType(fields))
-    collected = df.orderBy("_batch_id").selectExpr("_batch_id", f"({sql}) AS result").collect()
+    if native:
+        # One partition: a candidate that never terminates spins one task
+        # thread per partition it runs in, and a cancelled native task cannot
+        # be stopped -- one core lost per runaway candidate, not all of them.
+        df = spark.createDataFrame(spark.sparkContext.parallelize(data, 1), StructType(fields))
+    else:
+        df = spark.createDataFrame(data, StructType(fields)).orderBy("_batch_id")
+    with _comet_native_rows(spark, native), _query_deadline(spark):
+        collected = df.selectExpr("_batch_id", f"({sql}) AS result").collect()
     by_id = {int(record[0]): record[1] for record in collected}
     return [by_id[i] for i in range(len(rows))]
 
@@ -700,6 +1627,28 @@ def _java_udf_expr(
     return f"{fname}({args})"
 
 
+def _rust_udf_expr(
+    spark: Any,
+    result: Any,
+    input_types: list[str],
+    return_type: str,
+) -> str:
+    """Build (if needed) and register the Rust UDF; the SQL that calls it.
+
+    Blocks on cargo: this is the worker, not UDF definition. The build lands
+    in the same content-addressed cache a later lookup serves from.
+    """
+    from ai_udf_transpile import rustc
+
+    reason = rustc.comet_unavailable(spark)
+    if reason:
+        raise VerifyFailed(f"a rust rewrite can only be verified under Comet: {reason}")
+    compiled = rustc.compile_rust(spark, result.rust_source or "", input_types, return_type)
+    rustc.register_rust_udf(spark, compiled, input_types, return_type)
+    result.entry = compiled.name
+    return rustc.call_expr(compiled.name, input_types)
+
+
 _INT_RETURN_RANGES = {
     "int": (-(2**31), 2**31 - 1),
     "bigint": (-(2**63), 2**63 - 1),
@@ -783,11 +1732,20 @@ def hypothesis_check(
             return False, f"java_udf verify setup failed: {exc}"
         if eval_expr is None:
             return False, "java_udf result has no class/binary to verify"
+    elif kind == "rust":
+        if spark is None:
+            return False, "rust verify requires Spark"
+        try:
+            eval_expr = _rust_udf_expr(spark, result, input_types, return_type)
+        except Exception as exc:
+            return False, f"rust verify setup failed: {exc}"
     else:
         return False, f"verify of target_kind={kind} is not implemented"
 
     if spark is None:
         return False, "hypothesis_check requires a SparkSession"
+    # A Rust UDF is evaluated by Comet or not at all.
+    native = kind == "rust"
 
     import time
 
@@ -832,13 +1790,21 @@ def hypothesis_check(
         sql_batches += 1
         args_list = [item[0] for item in batch]
         try:
-            sql_values = _eval_sql_batch(spark, eval_expr, args_list, input_types)
+            sql_values = _eval_sql_batch(spark, eval_expr, args_list, input_types, native)
+        except VerifyQueryTimeout as exc:
+            # Not a per-row error to retry: each retry would leave one more
+            # task thread spinning and wait out the deadline again.
+            mismatch.append(str(exc))
+            return
         except Exception:
             logger.debug("sql batch of %d failed; retrying per row", len(batch), exc_info=True)
             for args, py_value, py_exc in batch:
                 try:
-                    sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type)
+                    sql_value = _eval_sql(spark, eval_expr, args, input_types, return_type, native)
                     _judge(args, py_value, py_exc, sql_value, None)
+                except VerifyQueryTimeout as exc:
+                    mismatch.append(f"{exc} on {args!r}")
+                    return
                 except Exception as exc:
                     _judge(args, py_value, py_exc, _SENTINEL_RAISED, exc)
             return

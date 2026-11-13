@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Build Apache DataFusion Comet from source for the local Spark checkout and
-# print the env exports needed by bench_micro's --rust-accel comet preset.
+# print the env exports needed by bench_micro's --rust-accel comet preset and
+# by the rust transpilation target (COMET_HOME: the checkout whose
+# native/comet-udf-sdk the generated UDF libraries build against -- it has
+# to be the same Comet the jar came from).
 #
 # Typical use:
 #   examples/setup_comet.sh --write-env-file .comet-env
@@ -19,7 +22,7 @@ Options:
   --ref REF                Comet git ref to checkout (default: main)
   --profile PROFILE        Override Comet Spark profile (spark-3.4|spark-3.5|spark-4.0|spark-4.1|spark-4.2)
   --scala-binary VERSION   Override scala binary version (2.12 or 2.13)
-  --write-env-file PATH    Write COMET_JAR exports to PATH for `source PATH`
+  --write-env-file PATH    Write COMET_JAR / COMET_HOME exports to PATH for `source PATH`
   --skip-build             Skip `make release`; only resolve jar path from existing build output
   --dry-run                Skip build and stop after showing detected settings
   -h, --help               Show this help
@@ -266,11 +269,18 @@ if ! git -C "$COMET_HOME_ARG" diff --quiet || ! git -C "$COMET_HOME_ARG" diff --
   error "comet checkout has local changes: $COMET_HOME_ARG (clean it first)"
 fi
 
-echo "updating Comet checkout at $COMET_HOME_ARG"
-git -C "$COMET_HOME_ARG" fetch --tags origin
-git -C "$COMET_HOME_ARG" checkout "$COMET_REF"
-if git -C "$COMET_HOME_ARG" show-ref --verify --quiet "refs/remotes/origin/$COMET_REF"; then
-  git -C "$COMET_HOME_ARG" pull --ff-only origin "$COMET_REF"
+# --skip-build reuses the jar already built in this checkout, so the
+# checkout must stay on the ref that jar came from: COMET_HOME (exported
+# below) is the SDK the rust target builds against, and it has to match.
+if [ "$SKIP_BUILD" -eq 1 ]; then
+  echo "skip-build: keeping the Comet checkout at $COMET_HOME_ARG as is (--ref not applied)"
+else
+  echo "updating Comet checkout at $COMET_HOME_ARG"
+  git -C "$COMET_HOME_ARG" fetch --tags origin
+  git -C "$COMET_HOME_ARG" checkout "$COMET_REF"
+  if git -C "$COMET_HOME_ARG" show-ref --verify --quiet "refs/remotes/origin/$COMET_REF"; then
+    git -C "$COMET_HOME_ARG" pull --ff-only origin "$COMET_REF"
+  fi
 fi
 
 echo "Spark detected: $SPARK_MINOR (scala $SPARK_SCALA)"
@@ -291,10 +301,13 @@ if ! COMET_JAR_PATH="$(resolve_latest_jar "$PROFILE_MINOR" "$SCALA_BIN" "$COMET_
   error "no built jar found for spark-$PROFILE_MINOR scala-$SCALA_BIN in $COMET_HOME_ARG/spark/target"
 fi
 
+COMET_HOME_ABS="$(cd "$COMET_HOME_ARG" && pwd)"
+
 if [ -n "$WRITE_ENV_FILE" ]; then
   cat >"$WRITE_ENV_FILE" <<EOF
 export COMET_JAR="$COMET_JAR_PATH"
 export AI_UDF_TRANSPILE_COMET_JAR="$COMET_JAR_PATH"
+export COMET_HOME="$COMET_HOME_ABS"
 EOF
   echo "wrote env file: $WRITE_ENV_FILE"
 fi
@@ -307,7 +320,9 @@ Comet jar resolved:
 Export in your shell:
   export COMET_JAR="$COMET_JAR_PATH"
   export AI_UDF_TRANSPILE_COMET_JAR="$COMET_JAR_PATH"
+  export COMET_HOME="$COMET_HOME_ABS"
 
 Then run:
   python examples/bench_micro.py --rust-accel --rust-accel-preset comet
+  python examples/demo_rust_udf.py      # Python UDFs rewritten to Rust, run natively by Comet
 EOF

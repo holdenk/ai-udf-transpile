@@ -12,7 +12,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
 
 from ai_udf_transpile import conf
-from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileJob, TranspileResult
+from ai_udf_transpile.targets import (
+    KIND_CATALYST,
+    KIND_JAVA_UDF,
+    KIND_RUST,
+    TranspileJob,
+    TranspileResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +123,11 @@ class CacheRow:
     # Local SQLite staging flag: set once this success row has been appended
     # to the configured write-back table. Not a shared-table column.
     written_back_at: Optional[str] = None
+    # Manual approval (requireApproval). Set when a person approved the
+    # current payload, or rejected it (then status is failed). Cleared
+    # whenever a new payload is written: a fresh rewrite needs a fresh review.
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[str] = None
 
     def reconstructable(self) -> bool:
         if self.status != "success":
@@ -125,7 +136,24 @@ class CacheRow:
             return True
         if self.target_kind == KIND_JAVA_UDF and (self.impl_class or self.impl_source or self.impl_binary):
             return True
+        if self.target_kind == KIND_RUST and self.impl_source:
+            return True
         return False
+
+    def as_result(self) -> TranspileResult:
+        """The stored payload as a result (``impl_source`` is Rust or Java by kind)."""
+        kind = self.target_kind or KIND_CATALYST
+        rust = kind == KIND_RUST
+        return TranspileResult(
+            kind=kind,
+            sql=self.catalyst_sql,
+            java_source=None if rust else self.impl_source,
+            rust_source=self.impl_source if rust else None,
+            class_name=self.impl_class,
+            binary=self.impl_binary,
+            entry=self.impl_entry,
+            model=self.model,
+        )
 
     def as_job(self) -> TranspileJob:
         return TranspileJob(
@@ -202,7 +230,17 @@ class Catalog(Protocol):
         hypothesis_passed: Optional[bool],
         visible: bool = True,
         tolerance: Optional[float] = None,
+        reviewed_by: Optional[str] = None,
+        reviewed_at: Optional[str] = None,
     ) -> None: ...
+
+    def mark_awaiting_approval(self, udf_key: str) -> None: ...
+
+    def awaiting_approval(self) -> list[CacheRow]: ...
+
+    def approve(self, udf_key: str, reviewer: str) -> bool: ...
+
+    def reject(self, udf_key: str, reviewer: str, reason: str = "") -> bool: ...
 
     def reclaim_stale(self, timeout_seconds: int, max_retries: int) -> int: ...
 
@@ -245,6 +283,16 @@ def tolerance_serves(tested: Optional[float], spark: Any = None) -> bool:
     if tested is None:
         tested = 0.0
     return tested <= allowed
+
+
+# Status for a rewrite that passed every automated check but waits on a
+# person (requireApproval). Never served, never published, never reclaimed.
+AWAITING_APPROVAL = "awaiting_approval"
+
+
+def rejection_error(reviewer: str, reason: str = "") -> str:
+    text = f"rejected by reviewer {reviewer}"
+    return f"{text}: {reason}" if reason else text
 
 
 def cooldown_active(row: CacheRow, spark: Any = None) -> bool:

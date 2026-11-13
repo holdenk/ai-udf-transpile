@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -93,6 +94,33 @@ def test_aggregate_collects_and_excludes_fallbacks(tmp_path):
     assert "best 20.0x" in proc.stdout
 
 
+def test_aggregate_rust_arm_is_comet_native_whatever_the_file_is_called(tmp_path):
+    header = [
+        "function",
+        "kinds",
+        "regular_rows_per_second",
+        "transpiled_ai_rust_rows_per_second",
+        "ai_rust_speedup_vs_regular",
+        "transpile_succeeded_ai_rust",
+    ]
+    for name, speedup in (("bench_micro.csv", 30.0), ("bench_micro_comet.csv", 40.0)):
+        with open(tmp_path / name, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerow(["ok", "rust", 1_000_000, 30_000_000, speedup, True])
+            # The twin was served as SQL, not Rust: no rust point.
+            w.writerow(["sql", "catalyst", 1_000_000, 9_000_000, 9.0, False])
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), str(tmp_path), "--png", str(tmp_path / "agg.png")],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "AI: Rust UDF (Comet native)" in proc.stdout
+    assert "2 points, best 40.0x" in proc.stdout
+    assert "no ai_rust_comet arm" not in proc.stderr
+
+
 def test_aggregate_rejects_unrecognized_csv(tmp_path):
     (tmp_path / "bench_nonsense.csv").write_text("a,b\n1,2\n", encoding="utf-8")
     proc = subprocess.run(
@@ -101,3 +129,78 @@ def test_aggregate_rejects_unrecognized_csv(tmp_path):
         text=True,
     )
     assert proc.returncode != 0
+
+
+def test_aggregate_routes_kind_labeled_rows_to_the_ai_arms(tmp_path):
+    # bench_catalog / bench_fhi_udfs share transpiled_rows_per_second with the
+    # tpcds CSV, but their rows are AI rewrites and say which kind was served.
+    (tmp_path / "bench_fhi.csv").write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,bench,string_gate\n"
+        "sql_one,1000,100,230,2.3,,,success,catalyst,claude,m,fhi,party\n"
+        "sql_two,1000,100,50,0.5,900,9.0,success,catalyst,claude,m,fhi,party\n"
+        "java_one,1000,100,40,0.4,,,success,java_udf,claude,m,fhi,party\n"
+        # verified but Spark planned the python UDF: no rewrite ran, no point
+        "dropped,1000,100,,,,,not_served,catalyst,claude,m,fhi,party\n"
+        "declined,1000,100,,,,,failed,,claude,m,fhi,party\n",
+        encoding="utf-8",
+    )
+    # With an arm column, only the live AI arm on the nullable column counts:
+    # the pinned naive/tuned rewrites and the non-null column are exhibits.
+    (tmp_path / "bench_fhi_arms.csv").write_text(
+        "function,arm,column_nullable,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,status,target_kind,backend,model,bench\n"
+        "f,naive,True,1000,100,30,0.3,success,catalyst,pinned,,fhi\n"
+        "f,tuned,True,1000,100,190,1.9,success,catalyst,pinned,,fhi\n"
+        "f,ai,True,1000,100,150,1.5,success,catalyst,claude,m,fhi\n"
+        "f,ai,False,1000,100,160,1.6,success,catalyst,claude,m,fhi\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location("bench_graph_aggregate", AGGREGATE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    points = module.collect([tmp_path / "bench_fhi.csv"])
+    assert points["ai_catalyst"] == [("fhi/sql_one", 2.3), ("fhi/sql_two", 0.5)]
+    assert points["ai_java"] == [("fhi/java_one", 0.4)]
+    assert points["ai_catalyst_comet"] == [("fhi/sql_two", 9.0)]
+    assert points["transpiled"] == [] and points["vanilla"] == []
+    assert module.collect([tmp_path / "bench_fhi_arms.csv"])["ai_catalyst"] == [("fhi arms/f", 1.5)]
+
+
+def test_aggregate_reads_the_regen_names_and_the_catalog_bench(tmp_path):
+    # regen_examples_doc.sh names its CSVs examples_transpiled_bench*.csv, and
+    # its widest one is bench_catalog's: one arm per row, by target_kind.
+    with open(tmp_path / "examples_transpiled_bench_catalog.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "function",
+                "rows",
+                "python_rows_per_second",
+                "transpiled_rows_per_second",
+                "transpiled_speedup_vs_python",
+                "comet_rows_per_second",
+                "comet_speedup_vs_python",
+                "status",
+                "target_kind",
+                "backend",
+                "model",
+            ]
+        )
+        w.writerow(["sql_fn", 1000, 1, 3, 3.0, 6, 6.0, "success", "catalyst", "claude", "m"])
+        w.writerow(["java_fn", 1000, 1, 2, 2.0, "", "", "success", "java_udf", "claude", "m"])
+        w.writerow(["rust_fn", 1000, 1, 20, 20.0, "", "", "success", "rust", "claude", "m"])
+        w.writerow(["declined", 1000, 1, "", "", "", "", "failed", "", "claude", "m"])
+    proc = subprocess.run(
+        [sys.executable, str(AGGREGATE), str(tmp_path), "--png", str(tmp_path / "agg.png")],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = {line.split("  ")[0]: line for line in proc.stdout.splitlines()}
+    assert "1 points, best 3.0x" in lines["AI: Catalyst SQL"]
+    assert "1 points, best 6.0x" in lines["AI: Catalyst SQL, Comet"]
+    assert "1 points, best 2.0x" in lines["AI: Java UDF"]
+    assert "1 points, best 20.0x" in lines["AI: Rust UDF (Comet native)"]
+    assert "transpiled (tpcds patterns)" not in proc.stdout  # not misread as the tpcds schema

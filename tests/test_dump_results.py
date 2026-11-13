@@ -261,6 +261,38 @@ def test_perf_lines_unit(tmp_path):
         "static": "",
         "ai": "6.0M rows/s (3.0x vs python) · comet 9.0M rows/s (4.5x vs python)",
     }
+    # bench_fhi_udfs.py writes the same schema and names itself in a bench column
+    fhi = tmp_path / "fhi.csv"
+    fhi.write_text(
+        CATALOG_CSV.replace("status,target_kind,backend,model\n", "status,target_kind,backend,model,bench\n")
+        .replace("coco/auto\n", "coco/auto,fhi\n")
+        .replace("human,\n", "human,,fhi\n"),
+        encoding="utf-8",
+    )
+    assert _load_dump_module()._perf_lines([str(fhi)])["has_item"]["top"] == (
+        "- **perf (fhi bench)**: interpreted python 2.0M rows/s"
+    )
+    # ...and passed after the catalog CSV it takes over the function's line,
+    # but the comet number only the catalog bench measured stays, labeled.
+    fhi.write_text(fhi.read_text().replace("3.0,9000000,4.5,success", "3.0,,,success"), encoding="utf-8")
+    merged = _load_dump_module()._perf_lines([str(cat), str(fhi)])["has_item"]
+    assert merged["top"].startswith("- **perf (fhi bench)**")
+    assert merged["ai"] == (
+        "6.0M rows/s (3.0x vs python) · comet (catalog bench) 9.0M rows/s (4.5x vs python)"
+    )
+    # bench_fhi_udfs rows for its pinned arms and its non-null column are
+    # skipped: the doc's AI line is the live arm on the nullable column.
+    arms = tmp_path / "arms.csv"
+    arms.write_text(
+        "function,arm,column_nullable,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,status,target_kind,backend,model,bench\n"
+        "f,naive,True,1000,1000000,300000,0.3,success,catalyst,pinned,,fhi\n"
+        "f,ai,False,1000,1000000,9000000,9.0,success,catalyst,claude,m,fhi\n"
+        "f,ai,True,1000,1000000,1500000,1.5,success,catalyst,claude,m,fhi\n"
+        "f,tuned,True,1000,1000000,1900000,1.9,success,catalyst,pinned,,fhi\n",
+        encoding="utf-8",
+    )
+    assert _load_dump_module()._perf_lines([str(arms)])["f"]["ai"] == "1.5M rows/s (1.5x vs python)"
     # python-only row (no transpiled arm served) keeps the top, no ai suffix
     assert perf["plus_two"]["ai"] == ""
     assert perf["plus_two"]["top"].endswith("interpreted python 1.5M rows/s")
@@ -280,6 +312,71 @@ def test_perf_lines_unit(tmp_path):
         "static": "",
         "ai": "885k rows/s (no python baseline)",
     }
+    # a rust rewrite's number is Comet's, labeled as such, with no comet suffix
+    rust_cat = tmp_path / "rust_catalog.csv"
+    rust_cat.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model\n"
+        "collatz_steps,1000,300000,6000000,20.0,,,success,rust,claude,m\n",
+        encoding="utf-8",
+    )
+    perf = _load_dump_module()._perf_lines([str(rust_cat)])
+    assert perf["collatz_steps"]["ai"] == "6.0M rows/s (20.0x vs python, Comet native)"
+    # A rust row and its no-rust twin share a name: each keeps its own numbers by udf_key.
+    twins = tmp_path / "twins.csv"
+    twins.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,udf_key\n"
+        "collatz_steps,1000,300000,600000,2.0,,,success,java_udf,claude,m,kjava\n"
+        "collatz_steps,1000,300000,6000000,20.0,,,success,rust,claude,m,krust\n",
+        encoding="utf-8",
+    )
+    perf = _load_dump_module()._perf_lines([str(twins)])
+    assert perf["kjava"]["ai"] == "600k rows/s (2.0x vs python)"
+    assert perf["krust"]["ai"] == "6.0M rows/s (20.0x vs python, Comet native)"
+    # Only the Rust row was measured: its numbers are still bound to its key,
+    # so the dump does not put them (and "Comet native") on the twin.
+    only_rust = tmp_path / "only_rust.csv"
+    only_rust.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,udf_key\n"
+        "collatz_steps,1000,300000,6000000,20.0,,,success,rust,claude,m,krust\n",
+        encoding="utf-8",
+    )
+    dump = _load_dump_module()
+    perf = dump._perf_lines([str(only_rust)])
+    assert perf["collatz_steps"]["udf_key"] == "krust"
+    assert dump._perf_for(perf, "collatz_steps", "krust")["ai"].endswith("Comet native)")
+    assert dump._perf_for(perf, "collatz_steps", "kjava") == {}  # never on the twin
+    # A keyed catalog entry does not shadow a later, deeper micro row by name.
+    keyed = tmp_path / "keyed_catalog.csv"
+    keyed.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,udf_key\n"
+        "plus_one,1000,1000000,1500000,1.5,,,success,catalyst,claude,m,kplus\n",
+        encoding="utf-8",
+    )
+    perf = dump._perf_lines([str(keyed), str(micro)])
+    assert dump._perf_for(perf, "plus_one", "kplus")["static"] == "3.0M rows/s (1.5x vs python)"  # micro won
+    # micro: a rust twin gets its own section key, like the java twin
+    rust_micro = tmp_path / "rust_micro.csv"
+    rust_micro.write_text(
+        "function,kinds,regular_rows_per_second,transpiled_static_rows_per_second,"
+        "transpiled_ai_catalyst_rows_per_second,transpiled_ai_java_rows_per_second,"
+        "transpiled_ai_rust_rows_per_second,static_speedup_vs_regular,ai_catalyst_speedup_vs_regular,"
+        "ai_java_speedup_vs_regular,ai_rust_speedup_vs_regular,transpile_succeeded_static,"
+        "transpile_succeeded_ai_catalyst,transpile_succeeded_ai_java,transpile_succeeded_ai_rust,"
+        "ai_backend,ai_model\n"
+        "edit_distance,catalyst+rust,100000,,9000000,,2000000,,90.0,,20.0,False,True,False,True,claude,m\n",
+        encoding="utf-8",
+    )
+    perf = _load_dump_module()._perf_lines([str(rust_micro)])
+    assert perf["edit_distance_rust"]["ai"] == "2.0M rows/s (20.0x vs python, Comet native)"
+    assert "edit_distance_java" not in perf
     # merge precedence: later files take over per function with their deeper arms
     perf = _load_dump_module()._perf_lines([str(cat), str(micro)])
     assert perf["has_item"]["top"].endswith("interpreted python 2.0M rows/s")  # catalog-only

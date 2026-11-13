@@ -25,7 +25,7 @@ from ai_udf_transpile.keys import (
     udf_function_ast,
     udf_key,
 )
-from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, TranspileResult
+from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, KIND_RUST, TranspileResult
 from ai_udf_transpile.types import (
     categories_for_spark_types,
     input_categories,
@@ -188,6 +188,11 @@ def register_impl(
 ) -> Any:
     """Write a human-provided rewrite into the catalog (origin='human').
 
+    ``kind="rust"`` takes the row function as ``impl_source`` (see
+    ``ai_udf_transpile.rustc``) and needs the ``rust`` target enabled under
+    Comet; the first registration against a Comet SDK blocks while cargo
+    compiles arrow.
+
     With ``verify=False`` the rewrite is staged unverified: it is served only
     after a worker re-verifies it (origin='human' rows are verified without a
     backend run), and it is not published to the shared writeback table until
@@ -225,15 +230,29 @@ def register_impl(
     result = TranspileResult(
         kind=kind,
         sql=catalyst_sql,
-        java_source=impl_source,
+        java_source=None if kind == KIND_RUST else impl_source,
+        rust_source=impl_source if kind == KIND_RUST else None,
         class_name=impl_class,
         binary=impl_binary,
         entry=impl_entry,
     )
-    if kind not in {KIND_CATALYST, KIND_JAVA_UDF}:
-        raise ValueError(f"v1 register_impl kind must be catalyst or java_udf, not {kind}")
+    if kind not in {KIND_CATALYST, KIND_JAVA_UDF, KIND_RUST}:
+        raise ValueError(f"register_impl kind must be catalyst, java_udf or rust, not {kind}")
     if not result.reconstructable():
-        raise ValueError("register_impl needs catalyst_sql or a java_udf payload")
+        raise ValueError("register_impl needs catalyst_sql, a java_udf payload, or rust impl_source")
+    if kind == KIND_RUST:
+        # A Rust UDF that Comet cannot run fails the query; refuse up front
+        # rather than store a row no lookup here would serve.
+        from ai_udf_transpile.rustc import rust_signature, rust_unservable, supports_types
+
+        if not supports_types(in_types, out_type):
+            raise ValueError(f"rust target does not support ({', '.join(in_types)}) -> {out_type}")
+        reason = rust_unservable(spark)
+        if reason:
+            raise ValueError(
+                f"register_impl kind=rust cannot run in this session: {reason}. "
+                f"impl_source must define: {rust_signature(in_types, out_type)}"
+            )
 
     hyp: Optional[bool] = None
     tolerance = configured_tolerance(spark) if verify else UNCHECKED_TOLERANCE

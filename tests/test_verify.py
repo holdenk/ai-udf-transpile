@@ -132,6 +132,43 @@ def test_reflect_and_process_builder_rejected_without_spark():
     assert not ok
     assert "forbidden API" in (err or "")
 
+    # try_reflect is reflect with the exception swallowed -- the same
+    # arbitrary static call, and it exists in Spark 4.3.
+    assert rejected_rewrite(
+        TranspileResult(kind="catalyst", sql="try_reflect('java.lang.System', 'getenv', 'HOME')")
+    )
+    # A column or alias that merely contains the word is not a call.
+    assert not rejected_rewrite(TranspileResult(kind="catalyst", sql="upper(reflect_col)"))
+
+    # Files, sockets, TLS and the environment are reachable without naming
+    # java.io or java.net; so is reflection without naming getMethod.
+    for body in (
+        'return System.getenv("HOME");',
+        'return java.nio.file.Files.exists(java.nio.file.Path.of("/etc/passwd"));',
+        "return java.nio.channels.SocketChannel.class;",
+        "return javax.net.ssl.SSLContext.class;",
+        'return x.getClass().getDeclaredMethod("m");',
+        "return x.getClass().getClassLoader();",
+    ):
+        assert rejected_rewrite(
+            TranspileResult(
+                kind="java_udf",
+                java_source=f"class T {{ Object call(Object x) throws Exception {{ {body} }} }}",
+                class_name="T",
+            )
+        ), body
+    # ...while the charset constants a string rewrite does need still pass.
+    assert not rejected_rewrite(
+        TranspileResult(
+            kind="java_udf",
+            java_source=(
+                "class T { Object call(Object x) { return "
+                "((String) x).getBytes(java.nio.charset.StandardCharsets.UTF_8).length; } }"
+            ),
+            class_name="T",
+        )
+    )
+
     # Plain whitespace around the dot evades a literal match just as well.
     assert rejected_rewrite(
         TranspileResult(

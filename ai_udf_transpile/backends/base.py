@@ -20,4 +20,7 @@ class Backend(Protocol):
     name: str
 
     def run(self, job: TranspileJob, sandbox: Any) -> TranspileResult:
-        """kind=catalyst|java_udf plus payloads. Raise BackendDecline or BackendError."""
+        """kind=catalyst|java_udf|rust plus payloads (rust only when job.targets has it).
+
+        Raise BackendDecline or BackendError.
+        """

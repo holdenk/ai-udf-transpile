@@ -19,10 +19,10 @@ import logging
 import threading
 from typing import Any, Optional
 
-from ai_udf_transpile.catalog import HIT, CacheRow, dumps, tolerance_serves
+from ai_udf_transpile.catalog import HIT, WAIT, CacheRow, dumps, tolerance_serves
 from ai_udf_transpile.catalog.delta import _ident, _row_from_spark, _sql_str
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog
-from ai_udf_transpile.targets import KIND_CATALYST, TranspileResult
+from ai_udf_transpile.targets import TranspileResult
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,8 @@ _COLUMNS = [
     "claimed_at",
     "created_at",
     "updated_at",
+    "reviewed_by",
+    "reviewed_at",
 ]
 
 _DDL = """
@@ -67,7 +69,8 @@ _DDL = """
     impl_entry STRING, impl_binary BINARY, origin STRING, backend STRING,
     model STRING, error STRING, hypothesis_passed BOOLEAN, tolerance DOUBLE,
     attempt_count INT,
-    failed_at STRING, claimed_at STRING, created_at STRING, updated_at STRING
+    failed_at STRING, claimed_at STRING, created_at STRING, updated_at STRING,
+    reviewed_by STRING, reviewed_at STRING
 """
 
 
@@ -100,6 +103,27 @@ def _table_tuple(row: CacheRow) -> tuple:
         row.claimed_at,
         row.created_at,
         row.updated_at,
+        row.reviewed_by,
+        row.reviewed_at,
+    )
+
+
+def _payload(row: CacheRow) -> tuple:
+    return (row.target_kind, row.catalyst_sql, row.impl_source, row.impl_class)
+
+
+def _rejected_here(local: Optional[CacheRow], remote: CacheRow) -> bool:
+    """The local row holds a reviewer's rejection of the same payload the remote row serves.
+
+    A rejected row keeps its candidate and its reviewed_* stamp (status failed,
+    or pending again after the cooldown); an approved row is a local success
+    and never reaches the remote fallthrough.
+    """
+    return (
+        local is not None
+        and local.status != "success"
+        and bool(local.reviewed_at)
+        and _payload(local) == _payload(remote)
     )
 
 
@@ -118,10 +142,15 @@ class WritebackCatalog:
         self._available = False
         try:
             self._spark.sql(f"CREATE TABLE IF NOT EXISTS {self._table} ({_DDL}) USING {self._format}")
-            try:
-                self._spark.sql(f"ALTER TABLE {self._table} ADD COLUMN tolerance DOUBLE")
-            except Exception:
-                logger.debug("writeback tolerance column already present", exc_info=True)
+            for column, ddl_type in (
+                ("tolerance", "DOUBLE"),
+                ("reviewed_by", "STRING"),
+                ("reviewed_at", "STRING"),
+            ):
+                try:
+                    self._spark.sql(f"ALTER TABLE {self._table} ADD COLUMN {column} {ddl_type}")
+                except Exception:
+                    logger.debug("writeback %s column already present", column, exc_info=True)
             self._available = True
         except Exception:
             # e.g. USING iceberg without the iceberg runtime/catalog configured.
@@ -213,15 +242,7 @@ class WritebackCatalog:
 
     def _backfill(self, remote: CacheRow) -> None:
         """Warm the local cache with a remote success; marked written-back so it never echoes."""
-        result = TranspileResult(
-            kind=remote.target_kind or KIND_CATALYST,
-            sql=remote.catalyst_sql,
-            java_source=remote.impl_source,
-            class_name=remote.impl_class,
-            binary=remote.impl_binary,
-            entry=remote.impl_entry,
-            model=remote.model,
-        )
+        result = remote.as_result()
         self._staging.upsert_success(
             udf_key=remote.udf_key,
             source_text=remote.source_text,
@@ -236,6 +257,8 @@ class WritebackCatalog:
             origin=remote.origin or "writeback",
             hypothesis_passed=remote.hypothesis_passed,
             tolerance=remote.tolerance,
+            reviewed_by=remote.reviewed_by,
+            reviewed_at=remote.reviewed_at,
         )
         self._staging.mark_written_back([remote.udf_key])
 
@@ -251,6 +274,26 @@ class WritebackCatalog:
             return kind, row
         remote = self._remote_success(udf_key)
         if remote is not None and remote.reconstructable() and tolerance_serves(remote.tolerance, spark):
+            from ai_udf_transpile.approval import blocks_serving
+
+            if _rejected_here(row, remote):
+                # A reviewer here rejected this exact rewrite; another
+                # reader's approval of it does not override that.
+                return kind, row
+
+            if blocks_serving(remote, spark):
+                # Published before this reader required approval (or by a
+                # writer that does not). Not served; park a local copy so
+                # the approve script can sign it off here.
+                if row is None:
+                    try:
+                        self._backfill(remote)
+                        self._staging.mark_awaiting_approval(udf_key)
+                    except Exception:
+                        logger.debug("writeback backfill failed for %s", udf_key[:12], exc_info=True)
+                        return kind, row
+                    return WAIT, self._staging.get(udf_key)
+                return kind, row
             if row is None:
                 # Pure miss locally: warm the cache. A pending/running local
                 # row is left alone -- the in-flight worker's success upserts
@@ -290,6 +333,23 @@ class WritebackCatalog:
 
     def promote_success(self, udf_key: str) -> None:
         self._staging.promote_success(udf_key)
+
+    def mark_awaiting_approval(self, udf_key: str) -> None:
+        self._staging.mark_awaiting_approval(udf_key)
+
+    def awaiting_approval(self) -> list[CacheRow]:
+        return self._staging.awaiting_approval()
+
+    def approve(self, udf_key: str, reviewer: str) -> bool:
+        # The approved row is publish-ready; append it to the shared table
+        # (threshold permitting) so other readers see the sign-off too.
+        if not self._staging.approve(udf_key, reviewer):
+            return False
+        self._maybe_flush()
+        return True
+
+    def reject(self, udf_key: str, reviewer: str, reason: str = "") -> bool:
+        return self._staging.reject(udf_key, reviewer, reason)
 
     def note_verified(self, udf_key: str) -> None:
         self._staging.mark_publish_ready(udf_key)

@@ -3,7 +3,8 @@
 Partial, non-blocking Python UDF transpilation for Apache Spark. Spark's
 built-in Catalyst transpiler covers simple functions; this plugin asks an
 agent (CoCo / Pi / Claude / Codex / Cursor; a deterministic fake backend
-stands in for tests only) to rewrite the rest into Catalyst SQL or a Java UDF, then
+stands in for tests only) to rewrite the rest into Catalyst SQL or a Java UDF
+(or, opt-in under Comet, a native Rust UDF), then
 Hypothesis-checks the rewrite against the original Python before it is served.
 
 Queries never wait on the agent. A miss inserts a `pending` catalog row and
@@ -34,7 +35,9 @@ A working experiment, not a dependency:
   and every service-calling row is a python-raise + sql-value allowance --
   so a hallucinated rewrite of `kms_encrypt` verifies in an env without
   AWS credentials. Verification cannot refute a service it cannot reach;
-  do not serve rewrites of service-calling UDFs from such an env.
+  do not serve rewrites of service-calling UDFs from such an env, or set
+  `requireApproval=network` so a person signs them off first (see
+  [Manual approval](#manual-approval)).
 - **Generated code runs in your driver.** The rewrite is SQL you execute
   and, for java UDFs, javac output loaded into the session. The CLI
   backends write into a sandbox directory — that is a work dir, not a
@@ -46,6 +49,11 @@ A working experiment, not a dependency:
 - **Fail-open everywhere.** A misconfigured catalog or unreachable backend
   never breaks UDF definition — which also means misconfiguration is
   silent.
+- **Except the opt-in `rust` target.** A Rust rewrite runs only inside
+  Comet's native execution; a query whose operator Comet does not take
+  fails instead of falling back to Python — including any query that puts a
+  Rust-served UDF beside a still-interpreted Python UDF. Off by default; read
+  [Rust target](#rust-target-comet-native-udfs-opt-in) before turning it on.
 
 ## Install
 
@@ -241,6 +249,162 @@ backend, shows agreement/divergence, the success-rate table, and picks the
 fastest rewrite by benchmark. One backend by default; `--all` for every
 AI CLI on PATH.
 
+## Rust target: Comet native UDFs (opt-in)
+
+[Apache DataFusion Comet](https://datafusion.apache.org/comet/) 1.2+ can load
+a scalar UDF written in Rust from a shared library and run it inside its
+native pipeline, on Arrow arrays, with no JVM or Python hop per row
+([Custom Rust UDFs](https://datafusion.apache.org/comet/user-guide/latest/rust_udfs.html);
+experimental upstream). With the `rust` target on, a UDF that has no SQL form
+is rewritten to Rust instead of a Java UDF:
+
+```python
+spark = (
+    SparkSession.builder.config("spark.jars", comet_jar)
+    .config("spark.plugins", "org.apache.spark.CometPlugin")
+    .config("spark.comet.enabled", "true")
+    .config("spark.comet.shuffle.enabled", "false")  # or Comet's shuffle manager
+    .config("spark.memory.offHeap.enabled", "true")
+    .config("spark.memory.offHeap.size", "2g")
+    .config("spark.sql.ansi.enabled", "true")
+    .getOrCreate()
+)
+enable(spark, backend="claude")
+spark.conf.set("spark.sql.experimental.aiUdfTranspile.targets", "catalyst,java_udf,rust")
+```
+
+SQL is still the first choice (Comet runs Catalyst expressions natively
+anyway, and SQL survives a fallback to Spark); Rust is second, Java third.
+
+**A rewrite is one row function, not a Comet UDF.** The model writes
+
+```rust
+pub fn udf(n: Option<i64>) -> Result<Option<i64>, String> {
+    // i128: 3n + 1 can leave i64 on the way to a result that fits.
+    let mut n = match n {
+        Some(v) if v >= 1 => v as i128,
+        _ => return Ok(None),
+    };
+    let mut steps: i64 = 0;
+    while n != 1 {
+        n = if n % 2 == 0 { n / 2 } else { 3 * n + 1 };
+        steps += 1;
+    }
+    Ok(Some(steps))
+}
+```
+
+with the exact signature dictated by the UDF's declared types (`None` is
+NULL, `Err` fails the query like a Python raise). `ai_udf_transpile/rustc.py`
+generates the Arrow glue around it — downcasts, the row loop, the output
+builder, the exported name — so a model never touches the arrow-rs API and a
+wrong type is a compile error rather than a truncation. The glue is compiled
+with `#[forbid(unsafe_code)]` on the model's module and overflow checks on
+(Python ints do not wrap: an overflow is a query error, never a wrong value).
+The same differential gate as the other targets then runs the built library
+through Comet on Hypothesis inputs before anything is served.
+`register_impl(spark, f, kind="rust", impl_source=...)` takes a hand-written
+row function through the same path.
+
+**What it needs.**
+
+- `cargo` on the driver (`rust.cargo`), and network access to crates.io for
+  the first build.
+- The `comet-udf-sdk` of the Comet you run — its ABI is experimental and
+  checked when the library loads. Resolved from `rust.cometSdk` (a Comet
+  checkout, the crate directory, or a TOML inline table), else `$COMET_HOME`
+  (what `examples/setup_comet.sh` exports), else the jar's own release tag or
+  commit fetched from GitHub by cargo.
+- Libraries are built into a content-addressed cache (`rust.buildDir`,
+  default `~/.cache/ai_udf_transpile/rust`). The first build against an SDK
+  compiles arrow (about two minutes); each UDF after that takes about a
+  second. Only source is stored in the catalog — a `.so` is platform- and
+  SDK-specific — so a row from the shared write-back table is built locally,
+  in the background, and served from the next definition on.
+
+All under `spark.sql.experimental.aiUdfTranspile.`:
+
+| conf | default | |
+|---|---|---|
+| `targets` | `catalyst,java_udf` | add `rust` to opt in (the other two are always on) |
+| `rust.cometSdk` | empty | Comet checkout, SDK crate directory, or TOML inline table; empty = `$COMET_HOME`, else the jar's tag/commit |
+| `rust.buildDir` | `~/.cache/ai_udf_transpile/rust` | build and library cache. A local SDK is keyed by the bytes of the files in its crate, except `target/` and hidden (`.`) files and directories; after changing any input its build reads that this leaves out (those, files outside the crate, environment variables), clear this directory |
+| `rust.cargo` | `cargo` | the cargo binary |
+| `rust.buildTimeoutSeconds` | `900` | per cargo invocation |
+| `rust.sharedBuildDir` | `false` | `true` = `rust.buildDir` is the same path on every executor; serve on non-local masters |
+| `verifyQueryTimeoutSeconds` | `300` | each verification query is cancelled after this; a Java/Rust candidate that never terminates fails verification (its task thread keeps a core busy in local mode) |
+
+**The one place this plugin is not fail-open.** Spark cannot evaluate a Comet
+native UDF. Where Comet does not take the operator holding the call, the
+query fails with `CometUdfNotEvaluatedException` instead of falling back to
+Python. That is why the target is opt-in, and why a Rust rewrite is only
+requested, verified and served while Comet is live in the session. It does
+not make it safe on every plan. A served Rust UDF fails:
+
+- **beside an interpreted Python UDF** — in the same `select`, or reading
+  one's output. Spark evaluates Python UDFs in their own node under the
+  projection, and Comet does not take a projection above it. "One UDF
+  rewritten, another still pending or declined" is this plugin's normal
+  state, so this is the common case, not a corner: turn the target on for
+  pipelines whose UDFs are all rewritten, not for a mixed one;
+- over a DataFrame built from local rows or an RDD (`createDataFrame`), unless
+  `spark.comet.convert.rdd.enabled=true`;
+- over `spark.range`, unless `spark.comet.exec.range.enabled=true` (or
+  `spark.comet.convert.range.enabled=true`);
+- over a `.cache()`d DataFrame, unless `spark.comet.exec.inMemoryCache.enabled=true`
+  (or `spark.comet.convert.inMemoryCache.enabled=true`);
+- over `VALUES` / local relations (the optimizer evaluates those eagerly),
+  in a filter on partition columns, and as the sort key of a global sort
+  (`orderBy(f(x))`; select it as a column and sort on that instead);
+- in any operator Comet declines for another reason (an unsupported
+  expression beside the call, a source Comet does not scan natively).
+
+Parquet scans, and the projections and filters above them, are the plans it
+is for. Check `EXPLAIN` for `CometProject` before trusting a pipeline to it.
+An upstream fix would be a native UDF call that carries a Spark-evaluable
+fallback; until then this target trades the plugin's safety for speed.
+
+**Other limits.**
+
+- Atomic inputs and outputs only: `bigint`, `int`, `smallint`, `tinyint`,
+  `double`, `float`, `boolean`, `string`, `binary`. No arrays, maps,
+  timestamps or decimals yet.
+- `local` masters only, unless `rust.sharedBuildDir=true` promises that
+  `rust.buildDir` is the same path on every executor (Comet does not
+  distribute the library).
+- A session that cannot run a cached Rust row (no Comet, `rust` not in its
+  targets, a non-local master) looks it up again under a `+no-rust` twin
+  key, which the worker fills with a SQL or Java rewrite only. Until that
+  twin is verified the UDF runs as interpreted Python there.
+- Generated native code runs in the driver and every executor. The source
+  scan (no `unsafe`, `extern`, `std::fs`/`process`/`net`/`env`/`io`,
+  `include!`, `#[path]`, ...) and the `unsafe` lint are a denylist, not a
+  sandbox — the Java target's caveat, with native code's blast radius.
+- No recursion: a stack overflow aborts the process (the driver, in local
+  mode) instead of failing the query. The check is by name, so any mention
+  of a function inside something it can reach from itself is refused, a
+  same-named local included. Trait impls, `dyn`, `std::any`, and types,
+  statics and consts that hold a function are refused too, since they can
+  call a function without naming it, and so are recursive types (dropping a
+  long `Option<Box<Node>>` chain recurses in std's drop glue). An adversarial pass (bypasses
+  confirmed by compiling them with rustc and overflowing the stack) shaped
+  the current rules, and its cases are tests in
+  `tests/test_rust_target.py`. That catches accidental recursion; it is not
+  a proof against a rewrite written to evade it.
+- Functions must be pure: Comet plans every native UDF as immutable.
+
+`examples/demo_rust_udf.py` runs the whole path on three loop-shaped UDFs and
+prints the rewrite the model wrote, the plan, and the throughput against the
+interpreted UDF. One run of it (4 cores, `local[*]`, 2M rows from a native
+range, noop sink, min of 3; Spark 4.3.0, Comet 1.2.0, `backend=claude`) —
+a data point, not a promise:
+
+| UDF | served as | python rows/s | rewrite rows/s | speedup |
+|---|---|---|---|---|
+| `collatz_steps` | rust | 324,418 | 6,655,398 | 20.5x |
+| `is_prime` | rust | 767,327 | 12,894,005 | 16.8x |
+| `longest_digit_run` | catalyst (the model found a regexp form) | — | — | — |
+
 ## Demos & benchmarks
 
 ```bash
@@ -252,7 +416,9 @@ examples/run_demos.sh --bench --transpilation-timing-csv bench_transpilation_tim
 examples/run_demos.sh --bench --rust-accel
 examples/run_demos.sh --bench-bytecode   # static (AST) vs bytecode->SQL vs Java bytecode eval vs python
 examples/run_demos.sh --bench-tpcds     # TPC-DS-inspired UDF patterns vs vanilla SQL
+examples/run_demos.sh --bench-fhi       # real pipeline text UDFs (regex, PII scrub) vs their rewrites
 examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
+python examples/demo_rust_udf.py        # rust target: loop-shaped UDFs rewritten to Rust, run natively by Comet
 ```
 
 The runner wires up `SPARK_HOME` (default `~/spark`), the py4j zip, and a
@@ -278,7 +444,14 @@ static and both AI kinds. A second transpilation timing CSV (auto-written when
 `--csv` is set, or explicit via `--transpilation-timing-csv`) captures one-time transpile fill costs
 and plain-vs-AI UDF lookup/definition costs. `--rust-accel` runs the same
 bench with rust acceleration Spark configs enabled (default preset: Comet; add
-`--rust-accel-conf key=value` for local overrides). For the Comet preset, set
+`--rust-accel-conf key=value` for local overrides). Under the Comet preset it
+also switches the `rust` target on and adds a fifth arm, AI as a Rust UDF run
+natively by Comet, filled through `*_rust` twins the way the Java arm uses
+`*_java` twins (a twin the backend served as SQL is not counted as a rust
+arm). `bench_catalog.py` times every cached rust row in its Comet session —
+the only place one can run — and `run_demos.sh` runs `demo_rust_udf.py`
+whenever a Comet jar is configured, so the regenerated
+`docs/EXAMPLES_TRANSPILED.md` carries rust rewrites and their numbers. For the Comet preset, set
 `AI_UDF_TRANSPILE_COMET_JAR` (or `COMET_JAR`) so the plugin jar is on Spark's
 classpath; `examples/setup_comet.sh` can clone/build Comet from source and emit
 the exports for your current Spark checkout.
@@ -295,6 +468,34 @@ python-semantics rewrites (spark_substr's clamped slice, spark_str's
 'None', spark_eq's NULL-safe `=`) carry guards the naive vanilla expression
 lacks, and three UDFBench date parsers are declined outright — no faithful
 SQL exists for int() over a free-form prefix.
+
+`examples/bench_fhi_udfs.py` benchmarks UDFs nobody wrote for this plugin:
+seven scalar text UDFs from Fight Health Insurance's training-data pipeline
+(verdict parsing, entity cleanup, the findings regex extractors, the regex
+PII scrubber), ported self-contained into
+`ai_udf_transpile/backends/fhi_udfs.py`. Every one is regex or a line loop
+over free text, and it is where "verified" and "faster" came apart: all
+seven got a rewrite that passed the gate on the first attempt, and five of
+those were slower than the interpreted Python (0.3x-0.9x, at 100k rows and
+at 50M alike), while a sixth was never served because its SQL used a
+lambda. A rewrite faithful to `str.strip()`, `splitlines()` and Python's
+unicode `\s`/`\d`/`\b` spells them out as `java.util.regex` classes and
+lookarounds, and each regex evaluation costs about as much as the Python
+round trip the rewrite saves.
+
+The bench keeps both kinds of rewrite on purpose: per function, the AI's
+first verified rewrite (`naive`, the regression exhibit) and a hand-tuned
+faithful one (`tuned`), timed next to Python and, with `--ai`, whatever the
+backend serves today; each over a nullable and a provably non-null column,
+with `ai_udf_transpile.regress`'s static guess printed beside every ratio.
+After the prompt gained a section on speed, six of the seven AI rewrites
+beat Python. The numbers, what changed and why are in
+[CHANGELOG.md](CHANGELOG.md).
+
+```bash
+examples/run_demos.sh --bench-fhi                       # or: python examples/bench_fhi_udfs.py
+python examples/bench_fhi_udfs.py --ai --only fhi_deidentify_text --sampled-strings-only
+```
 
 The perf graphs are generated from that CSV by a CLI tool
 (`examples/bench_graph.py`, matplotlib — no AI in the loop, ever). One
@@ -372,6 +573,60 @@ who can append to that table can run SQL and Java in every reader's driver.
 Failed rewrites cool down for 24h (`failCooldownSeconds`) and stop retrying
 after `maxRetries` (default 3).
 
+## Manual approval
+
+Hypothesis is weakest exactly where UDFs get interesting: string columns
+that secretly hold dates or JSON, nested struct/map/array values, and UDFs
+that call a service the verifier cannot reach. For those you can require a
+person to sign off before a rewrite is served:
+
+```python
+spark.conf.set("spark.sql.experimental.aiUdfTranspile.requireApproval", "hard")
+```
+
+| value | gates |
+|---|---|
+| `none` (default) | nothing |
+| `all` | every AI rewrite |
+| `string`, `struct`, `map`, `array`, `binary`, `timestamp` | rewrites whose input or return type contains that type (comma-separate several) |
+| `network` | UDFs whose source imports or calls a network client (`boto3`, `requests`, `socket`, `urllib`, `httpx`, DB/Kafka clients, ...; a denylist in `ai_udf_transpile/approval.py`) |
+| `hard` | `string,struct,map,array,network` |
+
+A gated rewrite still goes through every automated check (Hypothesis,
+reconstruction smoke test); passing them parks it in `awaiting_approval`
+instead of `success`, so Spark keeps running the Python UDF and nothing is
+written back. Review the queue with:
+
+```bash
+python -m ai_udf_transpile.approve --sqlite-path /tmp/ai_udf_transpile.sqlite          # interactive
+python -m ai_udf_transpile.approve --sqlite-path ... --browse   # interactive, read-only
+python -m ai_udf_transpile.approve --sqlite-path ... --list
+python -m ai_udf_transpile.approve --sqlite-path ... --approve 3fa2c1 --reviewer alice  # key prefixes ok
+python -m ai_udf_transpile.approve --sqlite-path ... --reject 3fa2c1 --reason "drops the tz"
+```
+
+The interactive loop shows each UDF's Python source, the SQL or Java
+rewrite, the backend/model, which flags it tripped, and a few of the real
+input rows it was checked against, then prompts `[y/n/skip]`: `y`
+approves, `n` rejects (with an optional reason), `skip` or Enter leaves it
+for later, `q` stops. `--browse` is the same view without the decisions: page through
+with Enter/`n`, `p`, a row number, or `q`, and nothing in the catalog
+changes. The reviewer (`--reviewer`, else `$AI_UDF_TRANSPILE_REVIEWER`, else
+`$USER`) and time are recorded on the row (`reviewed_by`, `reviewed_at`).
+Approve serves it; reject fails it with the reason (candidate kept), and it
+goes back to the backend after the normal cooldown, bounded by
+`maxRetries`. Any new payload for a key clears its review.
+
+The policy is checked when a rewrite is served, too: turn `requireApproval`
+on and existing unreviewed successes it covers are parked on their next
+lookup. With a write-back table, an unreviewed shared row is not served to
+a reader that requires approval; it is copied locally as
+`awaiting_approval`, and approving it re-publishes it with the sign-off.
+Human rewrites (`register_impl`) and the deterministic `bytecode` backend
+are never gated. The CLI talks to the SQLite catalog; for `catalog=delta`,
+use `catalog.awaiting_approval()`, `catalog.approve(key, reviewer)`, and
+`catalog.reject(key, reviewer, reason)`, or `ai_udf_transpile.approve.review(catalog, reviewer=...)`.
+
 ## Tests
 
 ```bash
@@ -383,6 +638,16 @@ The Spark tests need a package-only build of `apache/spark@master`
 (`./build/mvn -DskipTests -Phadoop-3 package -pl sql/core,assembly -am`).
 `tests/conftest.py` puts `$SPARK_HOME/python` and py4j on `sys.path` and pins
 `PYSPARK_PYTHON` to the running interpreter so workers match the driver.
+
+The rust target's JVM-free half (`tests/test_rust_target.py`) builds real
+libraries when `cargo` and a Comet checkout are available; running them
+needs Comet (`tests/test_rust_udf_comet.py`). Both skip cleanly otherwise:
+
+```bash
+export COMET_HOME=/path/to/datafusion-comet            # the checkout the jar was built from
+export AI_UDF_TRANSPILE_TEST_COMET_JAR=/path/to/comet-spark-spark4.x_2.13-<version>.jar
+pytest tests/test_rust_target.py tests/test_rust_udf_comet.py
+```
 
 CI's pytest uses `backend=fake` with a handful of annotated fixtures
 (`plus_one`, `is_none_branch`, `both_positive`, `greet`). Live
