@@ -309,3 +309,35 @@ def test_main_queue_only_needs_no_backend(tmp_path, sqlite_path, monkeypatch, ca
     root = _jobs(tmp_path)
     assert main([str(root), "--sqlite-path", sqlite_path, "--queue-only"]) == 0
     assert "2 queued" in capsys.readouterr().out
+
+
+def test_rust_row_this_session_cannot_serve_routes_to_the_twin(tmp_path, catalog, tracker, monkeypatch):
+    """Same routing as the hook: a served Rust row a non-Comet session cannot
+    attach sends the UDF to its +no-rust twin, which gets its own rewrite."""
+    from ai_udf_transpile.extract import extract_file
+    from ai_udf_transpile.targets import NO_RUST_SUFFIX, TranspileResult
+
+    root = _jobs(tmp_path)
+    plus_one = next(u for u in extract_file(root / "job.py").udfs if u.name == "plus_one")
+    primary = plus_one.key(VERSION)
+    catalog.upsert_success(
+        udf_key=primary,
+        source_text=plus_one.source_text,
+        param_names=plus_one.param_names,
+        input_types=plus_one.input_types,
+        input_categories=plus_one.input_categories,
+        return_type=plus_one.return_type,
+        spark_version=VERSION,
+        closure_fingerprint=plus_one.closure_fingerprint,
+        captures=plus_one.captures,
+        result=TranspileResult(kind="rust", rust_source="fn f(x: i64) -> i64 { x + 1 }"),
+        origin="fake",
+        hypothesis_passed=True,
+    )
+    monkeypatch.setattr("ai_udf_transpile.rustc.rust_unservable", lambda spark: "no Comet here")
+    report = _run([root], catalog, tracker, _CountingBackend())
+    result = next(o for o in report.outcomes if o.name == "plus_one")
+    twin = plus_one.key(VERSION + NO_RUST_SUFFIX)
+    assert result.udf_key == twin and result.outcome == "transpiled"
+    assert catalog.get(twin).catalyst_sql == "_udf_param_0 + 1"
+    assert catalog.get(primary).target_kind == "rust"  # untouched

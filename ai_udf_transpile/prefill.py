@@ -43,6 +43,7 @@ from typing import Any, Callable, Iterable, Iterator, Optional
 from ai_udf_transpile import conf
 from ai_udf_transpile.catalog import HIT, MISS, CacheRow, dumps, infra_failure, iso_now, loads_list
 from ai_udf_transpile.extract import EXTRACTOR_VERSION, ExtractedUDF, extract_file
+from ai_udf_transpile.targets import NO_RUST_SUFFIX
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,15 @@ def _prefill_udf(
     queue_only: bool,
     verify_fn: Optional[Callable[..., tuple[bool, Optional[str]]]],
 ) -> UDFOutcome:
+    from ai_udf_transpile.transpiler import _rust_elsewhere
     from ai_udf_transpile.worker import process_row
+
+    # Same routing as the hook: a Rust row this session cannot serve sends the
+    # UDF to its +no-rust twin key, which gets its own SQL/Java rewrite.
+    peek = catalog.get(key)
+    if peek is not None and _rust_elsewhere(peek, spark):
+        spark_version += NO_RUST_SUFFIX
+        key = udf.key(spark_version)
 
     def outcome(name: str, detail: Optional[str] = None) -> UDFOutcome:
         return UDFOutcome(udf.path, udf.lineno, udf.name, key, name, detail)
@@ -346,7 +355,6 @@ def prefill_paths(
                 report.udfs_gated += 1
                 log(f"  gated {udf.name} (line {udf.lineno}): inputs {udf.input_categories} not enabled")
                 continue
-            keys.append(key)
             try:
                 result = _prefill_udf(
                     udf,
@@ -363,6 +371,8 @@ def prefill_paths(
                 why = f"{type(exc).__name__}: {exc}"
                 result = UDFOutcome(udf.path, udf.lineno, udf.name, key, "failed", why)
             report.outcomes.append(result)
+            key = result.udf_key  # the +no-rust twin when the hook would route there
+            keys.append(key)
             detail = f" -- {result.detail}" if result.detail else ""
             log(f"  {result.outcome:<12} {udf.name} (line {udf.lineno}) {key[:12]}{detail}")
             settled = settled and _settled(catalog.get(key))

@@ -7,6 +7,26 @@ evidence for a direction, not a promise about your cluster.
 
 ## Unreleased
 
+### Prefill: extract UDFs from scripts into the catalog (2026-11-13)
+
+`python -m ai_udf_transpile.prefill PATH...` parses (never imports) Python
+files, finds `@udf` defs, `udf(fn, returnType)` calls and
+`spark.udf.register(...)`, rebuilds the exact key the runtime hook will
+compute, and runs each UDF through the worker's path (lookup, backend,
+Hypothesis, reconstruction smoke test, write-back), flushing the write-back
+table at the end regardless of `writebackThreshold`. A `prefill_files`
+table tracks path + SHA-256 so unchanged files are not re-read and
+identical content under a new path is deduped; a file is complete only
+once every UDF in it has settled. Anything whose runtime key cannot be
+proven statically is skipped with a reason. `--dry-run` lists what it
+would key; `--queue-only` leaves pending rows for a worker.
+
+**`@udf`-decorated functions now transpile.** The decorator line was part
+of the keyed source and `udf` counted as a non-stdlib capture, so every
+decorated UDF declined. PySpark's own `udf` decorator (resolved, not
+matched by name) is now dropped before keying; undecorated keys are
+unchanged.
+
 ### Rust target: Comet native UDFs, opt-in (2026-11-12)
 
 A new rewrite kind, `rust`, for Apache DataFusion Comet 1.2+'s experimental

@@ -28,10 +28,14 @@ def test_choose_best_returns_a_valid_candidate(spark):
 def test_benchmark_all_returns_sorted(spark):
     df = spark.range(0, 100_000, numPartitions=8).toDF("x").cache()
     df.count()
-    # One lightweight, one deliberately heavy (repeated expr).
+    # One lightweight, one deliberately heavy. "Heavy" must dwarf the fixed
+    # per-job overhead (~30 ms here) in every engine: repeat(x + 1, 100) did
+    # not under Comet, which runs it natively in about the same time as x + 1,
+    # so the ordering was noise. sha2 over ~6 KB per row is real work in any
+    # engine -- orders of magnitude more than one addition.
     candidates = [
         ("fake", "light", "_udf_param_0 + 1"),
-        ("fake", "heavy", "repeat(_udf_param_0 + 1, 100)"),
+        ("fake", "heavy", "sha2(cast(repeat(cast(_udf_param_0 as string), 1000) as binary), 256)"),
     ]
     results = benchmark_all(spark, candidates, df, ["x"])
     assert len(results) == 2
