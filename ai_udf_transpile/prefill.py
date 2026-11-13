@@ -281,6 +281,12 @@ def prefill_paths(
     from ai_udf_transpile.transpiler import _inputs_allowed
 
     report = PrefillReport()
+    # Like poll_once: a run killed mid-claim leaves rows 'running'; past
+    # claimTimeoutSeconds they go back to pending (or failed at maxRetries)
+    # so this run can pick them up instead of reporting them in-flight forever.
+    timeout = conf.get_int(conf.CLAIM_TIMEOUT, spark, int(conf.DEFAULTS[conf.CLAIM_TIMEOUT]))
+    max_retries = conf.get_int(conf.MAX_RETRIES, spark, int(conf.DEFAULTS[conf.MAX_RETRIES]))
+    catalog.reclaim_stale(timeout, max_retries)
     for path in iter_python_files(paths, exclude):
         try:
             extraction = extract_file(path)
@@ -468,7 +474,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     catalog = enable(spark, backend=args.backend, inline_worker=False, sqlite_path=args.sqlite_path)
     tracker = FileTracker(args.sqlite_path)
     try:
-        backend = get_backend(args.backend, spark)
+        # --queue-only never runs a backend: do not require its CLI on this machine.
+        backend = None if args.queue_only else get_backend(args.backend, spark)
         report = prefill_paths(
             args.paths,
             catalog=catalog,

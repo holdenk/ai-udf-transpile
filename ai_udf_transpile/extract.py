@@ -611,7 +611,7 @@ class _Finder(ast.NodeVisitor):
         if self.stack[-1].kind == "class":
             self._skip(fn.lineno, fn.name, "method UDFs are not extracted")
             return
-        self._add(fn, rt, list(self.stack), fn.lineno)
+        self._add(fn, rt, list(self.stack), fn.lineno, list(self.stack))
 
     def _from_udf_call(self, call: ast.Call) -> None:
         f, rt, kwargs = _udf_args(call)
@@ -651,7 +651,8 @@ class _Finder(ast.NodeVisitor):
             return
         if any(_is_udf_callee(decorator_callee(d), self._def_stacks[id(fn)]) for d in fn.decorator_list):
             return  # already a UDF object; its decorator was extracted where it is defined
-        self._add(fn, rt, self._def_stacks[id(fn)], lineno)
+        # Captures resolve where f is defined; the returnType where udf() is called.
+        self._add(fn, rt, self._def_stacks[id(fn)], lineno, list(self.stack))
 
     def _lookup_def(self, name: str) -> tuple[Optional[ast.FunctionDef], str]:
         for scope in _visible(self.stack):
@@ -679,9 +680,16 @@ class _Finder(ast.NodeVisitor):
     def _skip(self, lineno: int, name: str, reason: str) -> None:
         self.skipped.append(SkippedUDF(self.path, lineno, name, reason))
 
-    def _add(self, fn: ast.FunctionDef, rt: Optional[ast.AST], stack: list[_Scope], lineno: int) -> None:
+    def _add(
+        self,
+        fn: ast.FunctionDef,
+        rt: Optional[ast.AST],
+        stack: list[_Scope],
+        lineno: int,
+        rt_stack: list[_Scope],
+    ) -> None:
         try:
-            udf = self._build(fn, rt, stack)
+            udf = self._build(fn, rt, stack, rt_stack)
         except _Skip as exc:
             self._skip(lineno, fn.name, str(exc))
             return
@@ -691,7 +699,13 @@ class _Finder(ast.NodeVisitor):
         self._seen.add(marker)
         self.udfs.append(udf)
 
-    def _build(self, fn: ast.FunctionDef, rt: Optional[ast.AST], stack: list[_Scope]) -> ExtractedUDF:
+    def _build(
+        self,
+        fn: ast.FunctionDef,
+        rt: Optional[ast.AST],
+        stack: list[_Scope],
+        rt_stack: list[_Scope],
+    ) -> ExtractedUDF:
         stripped = strip_udf_decorators(fn, lambda parts: is_pyspark_udf_qualname(_qualname(parts, stack)))
         if stripped.decorator_list:
             raise _Skip("decorated with something other than pyspark's udf")
@@ -703,7 +717,7 @@ class _Finder(ast.NodeVisitor):
         params = [a.arg for a in args.args]
         if stack[-1].kind == "class":
             raise _Skip("method UDFs are not extracted")
-        simple = _return_simple(rt, stack)
+        simple = _return_simple(rt, rt_stack)
         if simple is None:
             shown = ast.unparse(rt) if rt is not None else "?"
             raise _Skip(f"return type {shown} is not a static atomic type")

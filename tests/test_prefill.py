@@ -277,3 +277,35 @@ def test_main_requires_sqlite_path(tmp_path, monkeypatch):
     monkeypatch.delenv("AI_UDF_TRANSPILE_SQLITE", raising=False)
     with pytest.raises(SystemExit):
         main([str(tmp_path)])
+
+
+def test_interrupted_claim_is_reclaimed_and_resumed(tmp_path, catalog, tracker):
+    root = _jobs(tmp_path)
+    _run([root], catalog, tracker, _CountingBackend(), queue_only=True)
+    key = catalog.oldest_pending().udf_key
+    # A previous run claimed this row and was killed before finishing it.
+    assert catalog.claim(key, "fake")
+    catalog._conn.execute("UPDATE cache SET claimed_at = '2000-01-01T00:00:00' WHERE udf_key = ?", (key,))
+    report = _run([root], catalog, tracker, _CountingBackend())
+    outcomes = {o.udf_key: o.outcome for o in report.outcomes}
+    assert outcomes[key] in {"transpiled", "failed"}, outcomes  # processed, not left in-flight
+    assert catalog.get(key).status in {"success", "failed"}
+
+
+def test_main_queue_only_needs_no_backend(tmp_path, sqlite_path, monkeypatch, capsys):
+    import ai_udf_transpile
+    import ai_udf_transpile.backends
+    from ai_udf_transpile import prefill
+
+    class _Spark:
+        version = VERSION
+
+    def _no_backend(*_a, **_k):
+        raise BackendError("auto backend: none of these are on PATH")
+
+    monkeypatch.setattr(prefill, "_spark_session", lambda master, confs: _Spark())
+    monkeypatch.setattr(ai_udf_transpile, "enable", lambda spark, **kw: SqliteCatalog(kw["sqlite_path"]))
+    monkeypatch.setattr(ai_udf_transpile.backends, "get_backend", _no_backend)
+    root = _jobs(tmp_path)
+    assert main([str(root), "--sqlite-path", sqlite_path, "--queue-only"]) == 0
+    assert "2 queued" in capsys.readouterr().out

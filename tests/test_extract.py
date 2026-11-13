@@ -486,3 +486,29 @@ def test_runtime_keeps_a_non_pyspark_udf_decorator(monkeypatch):
     exec(compile(src, "<mine>", "exec"), ns)
     fn_ast = ast.parse(src).body[0]
     assert udf_function_ast(ns["g"], fn_ast) is fn_ast
+
+
+def test_return_type_resolves_in_the_call_scope_not_the_def_scope():
+    result = _extract(
+        """
+        from pyspark.sql.functions import udf
+
+        RT = "string"
+
+        def f(x: int) -> int:
+            return x
+
+        def g(x: int) -> int:
+            return x - 1
+
+        def build():
+            RT = "bigint"
+            return udf(f, RT)
+
+        def build_local_only(spark):
+            LOCAL_RT = "bigint"
+            spark.udf.register("g", g, LOCAL_RT)
+        """
+    )
+    assert result.skipped == []
+    assert {u.name: u.return_type for u in result.udfs} == {"f": "bigint", "g": "bigint"}
