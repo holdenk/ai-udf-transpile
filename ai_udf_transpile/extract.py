@@ -162,7 +162,8 @@ class _Scope:
     kind: str  # module | function | class | lambda
     node: ast.AST
     bindings: dict[str, list[_Binding]] = field(default_factory=dict)
-    star_imports: list[Optional[str]] = field(default_factory=list)
+    # (module, lineno) of each `from M import *`; module None when relative.
+    star_imports: list[tuple[Optional[str], int]] = field(default_factory=list)
 
     def add(self, name: str, binding: _Binding) -> None:
         self.bindings.setdefault(name, []).append(binding)
@@ -199,7 +200,7 @@ class _BindingCollector(ast.NodeVisitor):
         module = node.module if node.level == 0 else None
         for alias in node.names:
             if alias.name == "*":
-                self.scope.star_imports.append(module)
+                self.scope.star_imports.append((module, node.lineno))
                 continue
             target = f"{module}.{alias.name}" if module else None
             self.scope.add(alias.asname or alias.name, _Binding("from", node.lineno, target=target))
@@ -313,6 +314,23 @@ def _visible(stack: list[_Scope]) -> list[_Scope]:
     return out
 
 
+def _later_star(scope: _Scope, found: list[_Binding], *, pyspark_ok: bool = False) -> bool:
+    """A `from M import *` after the binding may rebind the name at runtime.
+
+    ``pyspark_ok``: a later PySpark star import does not count against a
+    binding that is already PySpark's (scripts routinely do both, and the
+    star re-exports the same object under the same name).
+    """
+    last = max(b.lineno for b in found)
+    for module, lineno in scope.star_imports:
+        if lineno <= last:
+            continue
+        if pyspark_ok and module and module.startswith("pyspark."):
+            continue
+        return True
+    return False
+
+
 def _qualname(parts: list[str], stack: list[_Scope]) -> Optional[str]:
     """Statically resolve ``F.udf`` to ``pyspark.sql.functions.udf`` through imports."""
     head, rest = parts[0], parts[1:]
@@ -324,11 +342,13 @@ def _qualname(parts: list[str], stack: list[_Scope]) -> Optional[str]:
         if len(targets) != 1 or any(b.kind not in {"import", "from"} for b in found):
             return None  # rebound, or bound to something that is not an import
         target = targets.pop()
-        return ".".join([target, *rest]) if target else None
+        if not target or _later_star(scope, found, pyspark_ok=target.startswith("pyspark.")):
+            return None
+        return ".".join([target, *rest])
     if not rest:
         # `from pyspark.sql.functions import *` then a bare `udf`.
         for scope in _visible(stack):
-            for module in scope.star_imports:
+            for module, _lineno in scope.star_imports:
                 if module and module.startswith("pyspark."):
                     return f"{module}.{head}"
     return None
@@ -372,7 +392,7 @@ def _resolve_capture(name: str, module: _Scope, rebound: set[str]) -> tuple[bool
     found = module.bindings.get(name)
     if not found:
         if module.star_imports:
-            for star in module.star_imports:
+            for star, _lineno in module.star_imports:
                 if star in {"pyspark.sql.functions", "pyspark.sql.functions.builtin"}:
                     if name in PYSPARK_FUNCTIONS_SHADOWED_BUILTINS:
                         raise _Skip(f"{name!r} is pyspark.sql.functions.{name} here (star import)")
@@ -391,6 +411,8 @@ def _resolve_capture(name: str, module: _Scope, rebound: set[str]) -> tuple[bool
         raise _Skip(f"{name!r} is rebound with `global`; its value is not static")
     if len(found) != 1:
         raise _Skip(f"{name!r} is bound {len(found)} times at module level; its value is not static")
+    if _later_star(module, found):
+        raise _Skip(f"{name!r} may be rebound by a later `import *`; its value is not static")
     binding = found[0]
     if binding.kind == "import":
         target = binding.target or name

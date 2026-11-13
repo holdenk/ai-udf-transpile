@@ -639,3 +639,45 @@ def test_udf_imported_inside_a_factory_is_skipped():
     )
     assert result.udfs == []
     assert "imported inside the enclosing function" in _skips(result)["inner"]
+
+
+def test_a_later_star_import_may_shadow_an_explicit_binding():
+    result = _extract(
+        """
+        from pyspark.sql.types import LongType
+
+        LIMIT = 10
+
+        from my_types import *  # may export LongType (or LIMIT) of its own
+        from pyspark.sql.functions import udf
+
+        @udf(LongType())
+        def typed(x: int) -> int:
+            return x
+
+        @udf("bigint")
+        def limited(x: int) -> int:
+            return x + LIMIT
+        """
+    )
+    skips = _skips(result)
+    assert result.udfs == []
+    assert "not a static atomic type" in skips["typed"]
+    assert "later `import *`" in skips["limited"]
+
+
+def test_a_later_pyspark_star_import_keeps_pyspark_bindings():
+    """`from pyspark.sql.functions import *` after explicit imports is routine."""
+    result = _extract(
+        """
+        from pyspark.sql.functions import udf
+        from pyspark.sql.types import LongType
+        from pyspark.sql.functions import *
+        from pyspark.sql.types import *
+
+        @udf(LongType())
+        def f(x: int) -> int:
+            return x
+        """
+    )
+    assert [(u.name, u.return_type) for u in result.udfs] == [("f", "bigint")]
