@@ -681,3 +681,50 @@ def test_a_later_pyspark_star_import_keeps_pyspark_bindings():
         """
     )
     assert [(u.name, u.return_type) for u in result.udfs] == [("f", "bigint")]
+
+
+def test_a_later_star_import_may_shadow_a_star_imported_constructor():
+    result = _extract(
+        """
+        from pyspark.sql.types import *
+        from my_types import *  # may export a LongType of its own
+        from pyspark.sql.functions import udf
+
+        @udf(LongType())
+        def typed(x: int) -> int:
+            return x
+        """
+    )
+    assert result.udfs == []
+    assert "not a static atomic type" in _skips(result)["typed"]
+
+
+def test_star_imported_pyspark_names_resolve_when_last():
+    result = _extract(
+        """
+        from my_types import *
+        from pyspark.sql.types import *
+        from pyspark.sql.functions import *
+
+        @udf(LongType())
+        def typed(x: int) -> int:
+            return x
+        """
+    )
+    assert [(u.name, u.return_type) for u in result.udfs] == [("typed", "bigint")]
+
+
+def test_a_pyspark_star_that_cannot_export_the_name_does_not_claim_it():
+    """functions has no LongType: my_types' LongType is the one in scope."""
+    result = _extract(
+        """
+        from my_types import *
+        from pyspark.sql.functions import *
+
+        @udf(LongType())
+        def typed(x: int) -> int:
+            return x
+        """
+    )
+    assert result.udfs == []
+    assert "not a static atomic type" in _skips(result)["typed"]

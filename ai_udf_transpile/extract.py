@@ -331,6 +331,15 @@ def _later_star(scope: _Scope, found: list[_Binding], *, pyspark_ok: bool = Fals
     return False
 
 
+def _pyspark_star_exports(module: str, name: str) -> bool:
+    """Whether ``from <module> import *`` can bind ``name`` (unknown modules: assume so)."""
+    if module == "pyspark.sql.types":
+        return name.endswith("Type")
+    if module in {"pyspark.sql.functions", "pyspark.sql.functions.builtin"}:
+        return not name.endswith("Type")
+    return True
+
+
 def _qualname(parts: list[str], stack: list[_Scope]) -> Optional[str]:
     """Statically resolve ``F.udf`` to ``pyspark.sql.functions.udf`` through imports."""
     head, rest = parts[0], parts[1:]
@@ -347,10 +356,18 @@ def _qualname(parts: list[str], stack: list[_Scope]) -> Optional[str]:
         return ".".join([target, *rest])
     if not rest:
         # `from pyspark.sql.functions import *` then a bare `udf`.
+        # The latest star import that exports the name wins at runtime. Walk
+        # back from the last one: a non-PySpark module may export anything, so
+        # it ends the search unresolved; a PySpark module that does not export
+        # this name (functions has no *Type, types has no udf) is passed over.
         for scope in _visible(stack):
-            for module, _lineno in scope.star_imports:
-                if module and module.startswith("pyspark."):
+            for module, _lineno in sorted(scope.star_imports, key=lambda star: -star[1]):
+                if not (module and module.startswith("pyspark.")):
+                    return None
+                if _pyspark_star_exports(module, head):
                     return f"{module}.{head}"
+            if scope.star_imports:
+                return None
     return None
 
 
