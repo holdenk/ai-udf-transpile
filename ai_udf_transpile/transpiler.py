@@ -17,6 +17,7 @@ from ai_udf_transpile.keys import (
     closure_fingerprint,
     extract_captures,
     func_from_spark_stack,
+    udf_function_ast,
     udf_key,
 )
 from ai_udf_transpile.targets import NO_RUST_SUFFIX
@@ -219,6 +220,8 @@ def get_transpiler_class() -> type:
             del src, ast_info, param_categories
             spark = get_session()
             try:
+                func = func_from_spark_stack()
+                function_ast = udf_function_ast(func, function_ast)
                 if not types_known(function_ast, params, returnType):
                     return None
                 in_types = input_spark_types(function_ast, params)
@@ -229,7 +232,6 @@ def get_transpiler_class() -> type:
                 if not _inputs_allowed(in_cats, spark):
                     logger.debug("input categories %s gated out by conf", in_cats)
                     return None
-                func = func_from_spark_stack()
                 captures = extract_captures(func, function_ast, params)
                 if captures is None:
                     return None

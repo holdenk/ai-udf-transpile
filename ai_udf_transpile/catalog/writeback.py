@@ -178,6 +178,25 @@ class WritebackCatalog:
             # Write-back is best-effort: the local row is already a success.
             logger.warning("writeback to %s failed; rows stay staged", self._table, exc_info=True)
 
+    def flush(self) -> int:
+        """Append every staged verified row now, threshold or not; returns how many.
+
+        For one-off runs (prefill): the threshold batches a long-lived
+        session's appends, but a run that exits must not strand rows locally.
+        Fail-open like the threshold flush: errors leave the rows staged.
+        """
+        if not self._available:
+            return 0
+        try:
+            with self._flush_lock:
+                staged = self._staging.staged_successes()
+                if staged:
+                    self._flush(staged)
+                return len(staged)
+        except Exception:
+            logger.warning("writeback to %s failed; rows stay staged", self._table, exc_info=True)
+            return 0
+
     def _flush(self, staged: list[CacheRow]) -> None:
         from pyspark.sql.types import (
             BinaryType,

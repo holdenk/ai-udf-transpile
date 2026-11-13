@@ -114,6 +114,57 @@ Standalone worker when `inlineWorker` is false:
 python -m ai_udf_transpile.worker --sqlite-path /tmp/ai_udf_transpile.sqlite --backend coco
 ```
 
+`@udf` / `@udf(LongType())` / `@F.udf("bigint")` decorated functions are
+keyed without the decorator line (only when it resolves to PySpark's own
+`udf`), so they cache exactly like `udf(plus_one, LongType())`.
+
+## Pre-filling the catalog from scripts
+
+`python -m ai_udf_transpile.prefill` is the one-off version of the worker:
+point it at job scripts (or a directory of them) and it extracts every UDF
+from the source, keys it the way the runtime hook will, and runs it through
+the same backend → Hypothesis → reconstruction path, writing to the same
+SQLite catalog and (optionally) the shared Iceberg write-back table. Files
+are parsed, never imported.
+
+```bash
+python -m ai_udf_transpile.prefill jobs/ \
+    --sqlite-path /tmp/ai_udf_transpile.sqlite --backend coco \
+    --writeback-table polaris.db.ai_udf_writeback --writeback-format iceberg \
+    --conf spark.sql.catalog.polaris=org.apache.iceberg.spark.SparkCatalog \
+    --conf spark.sql.catalog.polaris.type=rest \
+    --conf spark.sql.catalog.polaris.uri=https://polaris.example.com/api/catalog
+
+python -m ai_udf_transpile.prefill jobs/ --dry-run   # list what it would key; no Spark
+```
+
+It recognizes `@udf(...)` defs, `udf(fn, returnType)` / `F.udf(f=fn, ...)`
+calls, and `spark.udf.register("name", fn, returnType)`, with the same
+gates as the runtime (annotated params, atomic return type,
+`inputCategories`). Anything whose runtime key it cannot prove statically
+is skipped with a reason (`-v` lists them): lambdas, functions imported
+from another module, closures over locals, non-literal or non-stdlib
+captures, names rebound at module level, Arrow or nondeterministic UDFs.
+
+Two levels of "already done":
+
+- **Files**: a `prefill_files` table in the same SQLite file tracks path +
+  SHA-256 (+ Spark version + extractor version). A file whose bytes match
+  a completed scan is not re-read, and identical content under another
+  path is not re-processed. A file only counts as complete once every UDF
+  in it has settled (verified, or failed for a non-transient reason), so
+  a run interrupted by a rate limit picks up where it stopped. `--rescan`
+  ignores the tracker.
+- **UDFs**: each key goes through `catalog.lookup` first, so a verified row
+  (local, or in the write-back table) is a hit and costs no backend call;
+  failed rows honor `failCooldownSeconds` / `maxRetries` like everywhere else.
+
+Staged successes are flushed to the write-back table at the end of the run
+regardless of `writebackThreshold`. `--queue-only` just inserts pending rows
+for a standalone worker to drain. Keys include the Spark version and the
+`ast.unparse` canonical source, so pre-fill with the same Spark build and
+Python minor version the jobs run on.
+
 ## Backends: the six paths
 
 Three deterministic static paths, no AI anywhere, then the AI paths:
