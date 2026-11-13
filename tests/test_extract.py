@@ -512,3 +512,130 @@ def test_return_type_resolves_in_the_call_scope_not_the_def_scope():
     )
     assert result.skipped == []
     assert {u.name: u.return_type for u in result.udfs} == {"f": "bigint", "g": "bigint"}
+
+
+def test_only_vetted_modules_are_ever_imported(monkeypatch):
+    """`import unittest.__main__ as runner` would start a test runner on import."""
+    imported = []
+    real = __import__("importlib").import_module
+    monkeypatch.setattr(
+        "ai_udf_transpile.extract.importlib.import_module", lambda n: imported.append(n) or real(n)
+    )
+    result = _extract(
+        """
+        import unittest.__main__ as runner
+        from pyspark.sql.functions import udf
+
+        @udf("bigint")
+        def f(x: int) -> int:
+            return runner and x
+        """
+    )
+    assert imported == []
+    assert "not on the vetted stdlib import list" in _skips(result)["f"]
+
+
+def test_type_constructors_resolve_through_imports():
+    result = _extract(
+        """
+        from pyspark.sql.functions import udf
+        from pyspark.sql.types import StringType
+
+        def LongType():
+            return StringType()
+
+        @udf(LongType())
+        def shadowed(x: int) -> int:
+            return x
+
+        @udf(DecimalType(10, 2))
+        def unimported(x: float) -> float:
+            return x
+        """
+    )
+    assert result.udfs == []
+    assert set(_skips(result)) == {"shadowed", "unimported"}
+
+
+def test_assigned_return_type_resolves_in_the_assignments_scope():
+    result = _extract(
+        """
+        from pyspark.sql.functions import udf
+
+        BASE = "bigint"
+        RT = BASE
+
+        def f(x: int) -> int:
+            return x
+
+        def build():
+            BASE = "string"
+            return udf(f, RT)
+        """
+    )
+    assert [(u.name, u.return_type) for u in result.udfs] == [("f", "bigint")]
+
+
+def test_unpacked_arguments_are_not_static():
+    result = _extract(
+        """
+        from pyspark.sql.functions import udf
+
+        OPTIONS = {"returnType": "bigint"}
+
+        def f(x: int) -> int:
+            return x
+
+        def g(x: int) -> int:
+            return x
+
+        a = udf(f, **OPTIONS)
+        b = udf(*(g, "bigint"))
+
+        @udf(**OPTIONS)
+        def h(x: int) -> int:
+            return x
+
+        def main(spark):
+            spark.udf.register("f2", f, **OPTIONS)
+        """
+    )
+    assert result.udfs == []
+    assert len(result.skipped) == 4
+    assert all("unpacked" in s.reason for s in result.skipped)
+
+
+def test_non_literal_use_arrow_is_skipped():
+    result = _extract(
+        """
+        from pyspark.sql.functions import udf
+
+        ARROW = True
+
+        def f(x: int) -> int:
+            return x
+
+        a = udf(f, "bigint", useArrow=ARROW)
+        b = udf(f, "double", useArrow=False)
+        """
+    )
+    assert [(u.name, u.return_type) for u in result.udfs] == [("f", "double")]
+    assert "useArrow is not a literal" in result.skipped[0].reason
+
+
+def test_udf_imported_inside_a_factory_is_skipped():
+    """Decorators run in the enclosing scope; the hook only sees globals."""
+    result = _extract(
+        """
+        def build():
+            from pyspark.sql.functions import udf
+
+            @udf("bigint")
+            def inner(x: int) -> int:
+                return x + 1
+
+            return inner
+        """
+    )
+    assert result.udfs == []
+    assert "imported inside the enclosing function" in _skips(result)["inner"]

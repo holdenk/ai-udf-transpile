@@ -15,13 +15,15 @@ import uuid
 
 import pytest
 
-pytest.importorskip("pyspark")
-
 from ai_udf_transpile import conf, enable
 from ai_udf_transpile.backends.fake import FakeBackend
 from ai_udf_transpile.catalog import HIT
 from ai_udf_transpile.catalog.writeback import WritebackCatalog
 from ai_udf_transpile.prefill import FileTracker, main, prefill_paths
+
+# No module-level importorskip: nothing below imports pyspark, and the
+# `spark` fixture owns the rule (fail when SPARK_HOME is set but PySpark is
+# unusable, skip when Spark is not configured at all).
 
 pytestmark = pytest.mark.spark
 

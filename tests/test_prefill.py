@@ -341,3 +341,16 @@ def test_rust_row_this_session_cannot_serve_routes_to_the_twin(tmp_path, catalog
     assert result.udf_key == twin and result.outcome == "transpiled"
     assert catalog.get(twin).catalyst_sql == "_udf_param_0 + 1"
     assert catalog.get(primary).target_kind == "rust"  # untouched
+
+
+def test_finished_file_is_revisited_when_its_rows_no_longer_serve(tmp_path, catalog, tracker):
+    """A stricter tolerance makes lookup re-queue loosely verified rows."""
+    root = _jobs(tmp_path)
+    conf.set_value(conf.TOLERANCE, "0.1")
+    _run([root], catalog, tracker, _CountingBackend())
+    conf.set_value(conf.TOLERANCE, "0")
+    backend = _CountingBackend()
+    report = _run([root], catalog, tracker, backend)
+    assert report.files_unchanged == 0 and report.files_scanned == 1
+    assert {o.name: o.outcome for o in report.outcomes}["plus_one"] == "transpiled"
+    assert catalog.get(next(o.udf_key for o in report.outcomes if o.name == "plus_one")).tolerance == 0

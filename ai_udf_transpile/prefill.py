@@ -214,6 +214,21 @@ def _settled(row: Optional[CacheRow]) -> bool:
     return row.status == "failed" and not infra_failure(row)
 
 
+def _still_settled(catalog: Any, keys: list[str], spark: Any) -> bool:
+    """Whether a finished scan still holds, asked through ``lookup``.
+
+    The file's bytes are unchanged, but the catalog may not be: a stricter
+    tolerance than the rows were verified at (lookup re-queues them), a
+    failed row past its cooldown (lookup makes it pending again), a row
+    deleted. Any of those means the file is worth a pass.
+    """
+    for key in keys:
+        kind, row = catalog.lookup(key, spark=spark)
+        if kind != HIT and not _settled(row):
+            return False
+    return True
+
+
 def _prefill_udf(
     udf: ExtractedUDF,
     key: str,
@@ -305,7 +320,7 @@ def prefill_paths(
             continue
         if tracker is not None and not rescan:
             prior = tracker.done(str(path), extraction.sha256, spark_version)
-            if prior is not None:
+            if prior is not None and _still_settled(catalog, loads_list(prior["udf_keys"]), spark):
                 report.files_unchanged += 1
                 if prior["path"] != str(path):
                     # Same bytes under a new path: inherit the finished scan.

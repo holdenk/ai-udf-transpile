@@ -47,6 +47,7 @@ from ai_udf_transpile.keys import (
     udf_key,
 )
 from ai_udf_transpile.types import input_categories, input_spark_types, return_spark_type
+from ai_udf_transpile.verify import STDLIB_ALLOWLIST
 
 # Bump when extraction changes what it finds, so the prefill file tracker
 # rescans files an older extractor already marked done.
@@ -60,8 +61,12 @@ PYSPARK_FUNCTIONS_SHADOWED_BUILTINS = frozenset(
     {"abs", "ascii", "bin", "filter", "hash", "hex", "max", "min", "pow", "round", "slice", "sum"}
 )
 
-# Stdlib modules with import-time side effects; never import them to resolve.
-_NO_IMPORT = frozenset({"antigravity", "this", "idlelib", "tkinter", "turtle", "turtledemo"})
+# The only modules extraction ever imports (to read a constant such as
+# math.pi, or an aliased submodule's __name__): exact names, side-effect free.
+# Everything else is resolved without importing, or skipped.
+_IMPORTABLE = STDLIB_ALLOWLIST | frozenset(
+    {"os.path", "posixpath", "ntpath", "base64", "binascii", "calendar", "html", "struct", "textwrap"}
+)
 
 # DDL type strings -> Spark simpleString, for _parse_datatype_string parity.
 _DDL_SIMPLE = {
@@ -335,9 +340,13 @@ def _is_udf_callee(node: ast.AST, stack: list[_Scope]) -> bool:
 
 
 def _safe_import(name: str) -> Any:
-    top = name.split(".")[0]
-    if top not in getattr(sys, "stdlib_module_names", frozenset()) or top in _NO_IMPORT:
-        raise _Skip(f"captures non-stdlib module {name!r}")
+    """Import a module to read a value from it -- only exact, vetted names.
+
+    Root-level vetting is not enough: some stdlib submodules run on import
+    (``unittest.__main__`` starts a test runner over ``sys.argv``).
+    """
+    if name not in _IMPORTABLE:
+        raise _Skip(f"captures module {name!r}, which is not on the vetted stdlib import list")
     try:
         return importlib.import_module(name)
     except Exception as exc:
@@ -384,22 +393,26 @@ def _resolve_capture(name: str, module: _Scope, rebound: set[str]) -> tuple[bool
         raise _Skip(f"{name!r} is bound {len(found)} times at module level; its value is not static")
     binding = found[0]
     if binding.kind == "import":
-        mod = _safe_import(binding.target or name)
-        return _capture_value(mod, name)
+        target = binding.target or name
+        if "." not in target:
+            # `import re` / `import re as regex`: a top-level module's
+            # __name__ is its import name, so there is nothing to import.
+            if target not in getattr(sys, "stdlib_module_names", frozenset()):
+                raise _Skip(f"captures non-stdlib module {target!r} as {name!r}")
+            return True, {"__module__": target}
+        # `import os.path as p`: __name__ may differ (posixpath); vetted only.
+        return _capture_value(_safe_import(target), name)
     if binding.kind == "from":
         if not binding.target:
             raise _Skip(f"{name!r} comes from a relative import")
         module_name, _, attr = binding.target.rpartition(".")
         if module_name.split(".")[0] not in getattr(sys, "stdlib_module_names", frozenset()):
             raise _Skip(f"captures {name!r} from non-stdlib module {module_name!r}")
-        try:
-            mod = _safe_import(binding.target)  # `from os import path` is a module
-        except _Skip:
-            mod = _safe_import(module_name)
-            if not hasattr(mod, attr):
-                raise _Skip(f"stdlib {module_name!r} has no {attr!r}") from None
+        mod = _safe_import(module_name)
+        if hasattr(mod, attr):
             return _capture_value(getattr(mod, attr), name)
-        return _capture_value(mod, name)
+        # `from xml import dom`: a submodule not loaded by its parent.
+        return _capture_value(_safe_import(binding.target), name)
     if binding.kind == "assign":
         try:
             value = ast.literal_eval(binding.node)
@@ -463,6 +476,12 @@ def _return_simple(node: Optional[ast.AST], stack: list[_Scope], depth: int = 0)
         if not parts:
             return None
         cls = parts[-1]
+        if cls not in _TYPE_CLASS_SIMPLE and cls != "DecimalType":
+            return None
+        # By binding, not by name: a local `LongType()` factory is not PySpark's.
+        qualname = _qualname(parts, stack) or ""
+        if not (qualname.startswith("pyspark.") and qualname.endswith("." + cls)):
+            return None
         if cls in _TYPE_CLASS_SIMPLE and not node.args and not node.keywords:
             return _TYPE_CLASS_SIMPLE[cls]
         if cls == "DecimalType":
@@ -480,7 +499,10 @@ def _return_simple(node: Optional[ast.AST], stack: list[_Scope], depth: int = 0)
             if node.id in scope.bindings:
                 binding = scope.only(node.id)
                 if binding is not None and binding.kind == "assign":
-                    return _return_simple(binding.node, stack, depth + 1)
+                    # The value's own names resolve where it was assigned,
+                    # not in the caller's inner scopes.
+                    owner = next(i for i, s in enumerate(stack) if s is scope)
+                    return _return_simple(binding.node, stack[: owner + 1], depth + 1)
                 return None
     return None
 
@@ -511,9 +533,24 @@ def _udf_args(call: ast.Call) -> tuple[Optional[ast.AST], Optional[ast.AST], dic
     return f, rt, kwargs
 
 
-def _uses_arrow(kwargs: dict[str, ast.AST]) -> bool:
-    node = kwargs.get("useArrow")
-    return isinstance(node, ast.Constant) and node.value is True
+_UNPACKED = "arguments are unpacked with * or **; the returnType is not static"
+
+
+def _unpacked(call: ast.Call) -> bool:
+    """``udf(f, **options)`` may carry a returnType the defaults would hide."""
+    return any(kw.arg is None for kw in call.keywords) or any(isinstance(a, ast.Starred) for a in call.args)
+
+
+def _not_static(call: ast.Call, kwargs: dict[str, ast.AST]) -> Optional[str]:
+    """Why this call's UDF settings cannot be read statically, or None."""
+    if _unpacked(call):
+        return _UNPACKED
+    arrow = kwargs.get("useArrow")
+    if arrow is None or (isinstance(arrow, ast.Constant) and arrow.value in (None, False)):
+        return None
+    if isinstance(arrow, ast.Constant) and arrow.value is True:
+        return "Arrow UDF (useArrow=True) is never transpiled"
+    return "useArrow is not a literal, so it may be an Arrow UDF (never transpiled)"
 
 
 class _Finder(ast.NodeVisitor):
@@ -605,8 +642,9 @@ class _Finder(ast.NodeVisitor):
             # positional, whatever it looks like, is the returnType.
             kwargs = {kw.arg: kw.value for kw in decorator.keywords if kw.arg}
             rt = kwargs.get("returnType") or (decorator.args[0] if decorator.args else None)
-            if _uses_arrow(kwargs):
-                self._skip(fn.lineno, fn.name, "Arrow UDF (useArrow=True) is never transpiled")
+            why = _not_static(decorator, kwargs)
+            if why:
+                self._skip(fn.lineno, fn.name, why)
                 return
         if self.stack[-1].kind == "class":
             self._skip(fn.lineno, fn.name, "method UDFs are not extracted")
@@ -615,11 +653,15 @@ class _Finder(ast.NodeVisitor):
 
     def _from_udf_call(self, call: ast.Call) -> None:
         f, rt, kwargs = _udf_args(call)
+        if f is None and _unpacked(call):
+            self._skip(call.lineno, "udf(...)", _UNPACKED)
+            return
         if f is None:
             return  # udf(LongType()) used as a decorator factory; the def is handled there
         label = ast.unparse(f) if not isinstance(f, ast.Lambda) else "<lambda>"
-        if _uses_arrow(kwargs):
-            self._skip(call.lineno, label, "Arrow UDF (useArrow=True) is never transpiled")
+        why = _not_static(call, kwargs)
+        if why:
+            self._skip(call.lineno, label, why)
             return
         parent = self.parents.get(id(call))
         if isinstance(parent, ast.Attribute) and parent.attr == "asNondeterministic":
@@ -632,6 +674,9 @@ class _Finder(ast.NodeVisitor):
         args = list(call.args)
         f = args[1] if len(args) > 1 else kwargs.get("f")
         rt = args[2] if len(args) > 2 else kwargs.get("returnType")
+        if _unpacked(call):
+            self._skip(call.lineno, ast.unparse(f) if f is not None else "register(...)", _UNPACKED)
+            return
         if f is None:
             return
         label = ast.unparse(f) if not isinstance(f, ast.Lambda) else "<lambda>"
@@ -706,7 +751,14 @@ class _Finder(ast.NodeVisitor):
         stack: list[_Scope],
         rt_stack: list[_Scope],
     ) -> ExtractedUDF:
-        stripped = strip_udf_decorators(fn, lambda parts: is_pyspark_udf_qualname(_qualname(parts, stack)))
+        # The runtime resolves the decorator through the function's globals
+        # (and closure), never an enclosing function's locals -- mirror that.
+        module_only = [stack[0]]
+        stripped = strip_udf_decorators(
+            fn, lambda parts: is_pyspark_udf_qualname(_qualname(parts, module_only))
+        )
+        if any(_is_udf_callee(decorator_callee(d), stack) for d in stripped.decorator_list):
+            raise _Skip("udf is imported inside the enclosing function; the runtime hook cannot resolve it")
         if stripped.decorator_list:
             raise _Skip("decorated with something other than pyspark's udf")
         args = stripped.args
