@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
@@ -100,12 +101,18 @@ def test_comet_output_path_collision_is_rejected(tmp_path):
     (spark_home / "python" / "lib" / "py4j-test-src.zip").write_bytes(b"")
     proc = subprocess.run(
         [
-            str(EXAMPLES / "run_demos.sh"), "--all-benches", "--rust-accel",
-            "--csv", str(tmp_path / "out_comet.csv"),
-            "--transpilation-timing-csv", str(tmp_path / "out.csv"),
+            str(EXAMPLES / "run_demos.sh"),
+            "--all-benches",
+            "--rust-accel",
+            "--csv",
+            str(tmp_path / "out_comet.csv"),
+            "--transpilation-timing-csv",
+            str(tmp_path / "out.csv"),
         ],
-        capture_output=True, text=True, timeout=60,
-        env={**os.environ, "SPARK_HOME": str(spark_home)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "SPARK_HOME": str(spark_home), "PYTHON": sys.executable},
     )
     assert proc.returncode == 2
     assert "collision" in proc.stderr
