@@ -157,7 +157,9 @@ def kernel_error(cuda: str, abi: KernelAbi) -> Optional[str]:
     for use in re.finditer(rf"\b{re.escape(out_name)}\b", body):
         before = body[: use.start()].rstrip()
         after = body[use.end() :].lstrip()
-        if not before.endswith("*") or after.startswith("["):
+        # `*out++` moves the pointer, `&*out` aliases it for later indexing.
+        deref = before.endswith("*") and not before[:-1].rstrip().endswith("&")
+        if not deref or after.startswith(("[", "++", "--")):
             return f"kernel may only use the output as `*{out_name}`"
     if not re.search(rf"\*\s*{re.escape(out_name)}\s*=(?!=)", body):
         return f"kernel never assigns `*{out_name}`"

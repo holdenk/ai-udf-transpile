@@ -575,6 +575,8 @@ def collatz_steps(n: int) -> int:
         n = n // 2 if n % 2 == 0 else 3 * n + 1
         steps += 1
     return steps
+
+
 # gpu_kernel fixture: a loop SQL cannot express, one fixed-width input, and a
 # result that always fits the INT32 cudf's Java transform produces.
 def low_bits_set(x: int) -> int:
@@ -999,7 +1001,7 @@ class FakeBackend:
         result = FIXTURES.get(key)
         if result is None:
             raise BackendDecline(f"no fake fixture for source {key!r}")
-        if result.kind not in job.targets:
+        if result.kind == KIND_RUST and KIND_RUST not in job.targets:
             # Rust is only on offer where the session can build and run it; a
             # real model is not shown the Rust rules otherwise either.
             raise BackendDecline(f"fake fixture is {result.kind}, which this job does not accept")

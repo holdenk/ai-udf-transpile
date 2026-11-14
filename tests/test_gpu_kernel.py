@@ -112,6 +112,12 @@ def test_kernel_scan_accepts_the_documented_shape():
         ("__device__ inline void udf(int32_t* out, int64_t x) { out[1] = 1; *out = 1; }", "only use"),
         ("__device__ inline void udf(int32_t* out, int64_t x) { *(out + 1) = 1; *out = 1; }", "only use"),
         ("__device__ inline void udf(int32_t* out, int64_t x) { *out[1] = 1; *out = 1; }", "only use"),
+        ("__device__ inline void udf(int32_t* out, int64_t x) { *out++ = 0; *out = 1; }", "only use"),
+        ("__device__ inline void udf(int32_t* out, int64_t x) { *out-- = 0; *out = 1; }", "only use"),
+        (
+            "__device__ inline void udf(int32_t* out, int64_t x) { int* p = &*out; p[1] = 1; *out = 1; }",
+            "only use",
+        ),
         ("__device__ inline void udf(int32_t* out, int64_t x) { int y = x; }", "never assigns"),
         ("__device__ inline void udf(int32_t* out, int64_t x) { if (*out == 1) { } }", "never assigns"),
         ("__device__ inline void udf(int32_t* out, int64_t x) { *out = 1; ", "braces"),

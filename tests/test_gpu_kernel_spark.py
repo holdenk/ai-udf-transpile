@@ -30,6 +30,7 @@ from ai_udf_transpile.javac import (
     _stage_jar,
     compile_java,
     merge_jars,
+    unique_class_name,
     verify_function_name,
 )
 from ai_udf_transpile.targets import KIND_GPU_KERNEL, KIND_JAVA_UDF, TranspileResult
@@ -37,6 +38,9 @@ from ai_udf_transpile.transpiler import _pin_session, _reconstruct_column, get_c
 from ai_udf_transpile.verify import hypothesis_check
 
 pytestmark = pytest.mark.spark
+
+# javac.compile_java names classes by content.
+LOW_BITS_CLASS = unique_class_name(LOW_BITS_JAVA, "ai_udf.LowBits")
 
 ABI = rapids.stock_abi(["bigint"], "bigint")
 
@@ -137,15 +141,17 @@ def _verify(spark, result):
 def test_wrapper_builds_against_the_cpu_jar_and_keeps_its_bytes(spark, stubbed):
     cpu = compile_java(spark, LOW_BITS_JAVA)
     jar, name = rapids.build_wrapper_jar(spark, cpu.jar_bytes, cpu.class_name, LOW_BITS_CUDA, ABI)
-    assert name == "ai_udf.LowBits__Rapids"
-    assert rapids.jar_has_class(jar, "ai_udf.LowBits__Rapids")
+    assert name == LOW_BITS_CLASS + "__Rapids"
+    assert rapids.jar_has_class(jar, LOW_BITS_CLASS + "__Rapids")
     # Deterministic, and the CPU class is the verified one, not a recompile.
     assert jar == rapids.build_wrapper_jar(spark, cpu.jar_bytes, cpu.class_name, LOW_BITS_CUDA, ABI)[0]
     import io
     import zipfile
 
     with zipfile.ZipFile(io.BytesIO(jar)) as merged, zipfile.ZipFile(io.BytesIO(cpu.jar_bytes)) as only_cpu:
-        assert merged.read("ai_udf/LowBits.class") == only_cpu.read("ai_udf/LowBits.class")
+        assert merged.read(LOW_BITS_CLASS.replace(".", "/") + ".class") == only_cpu.read(
+            LOW_BITS_CLASS.replace(".", "/") + ".class"
+        )
 
 
 def test_wrapper_needs_the_rapids_api_to_compile(spark, monkeypatch):
@@ -184,7 +190,7 @@ def test_cpu_plan_never_vouches_for_the_kernel(spark, stubbed):
     assert len(stubbed) == 1  # it got as far as the sibling session
 
     # The probe itself, against that session's real physical plan.
-    wrapper_jar, name = rapids.build_wrapper_jar(spark, cpu_jar, "ai_udf.LowBits", LOW_BITS_CUDA, ABI)
+    wrapper_jar, name = rapids.build_wrapper_jar(spark, cpu_jar, LOW_BITS_CLASS, LOW_BITS_CUDA, ABI)
     from ai_udf_transpile.verify import _java_udf_expr
 
     expr = _java_udf_expr(
@@ -233,9 +239,9 @@ def test_gate_passes_only_with_a_columnar_plan_then_serves_the_wrapper(spark, st
     assert (result.kind, result.entry, result.class_name) == (
         KIND_GPU_KERNEL,
         LOW_BITS_CUDA,
-        "ai_udf.LowBits",
+        LOW_BITS_CLASS,
     )
-    assert rapids.jar_has_class(result.binary, "ai_udf.LowBits__Rapids")
+    assert rapids.jar_has_class(result.binary, LOW_BITS_CLASS + "__Rapids")
 
 
 def test_gpu_kernel_row_serves_the_java_class_where_the_wrapper_cannot_load(spark, stub_api, monkeypatch):
@@ -293,8 +299,8 @@ def test_end_to_end_without_rapids_serves_the_java_udf(spark, sqlite_path):
     assert not first.transpiled and values == [0, 8, 32]
     row = _wait_for_row(get_catalog())
     assert row is not None and row.status == "success", getattr(row, "error", "no row")
-    assert (row.target_kind, row.impl_entry, row.impl_class) == (KIND_JAVA_UDF, None, "ai_udf.LowBits")
-    assert not rapids.jar_has_class(row.impl_binary, "ai_udf.LowBits__Rapids")
+    assert (row.target_kind, row.impl_entry, row.impl_class) == (KIND_JAVA_UDF, None, LOW_BITS_CLASS)
+    assert not rapids.jar_has_class(row.impl_binary, LOW_BITS_CLASS + "__Rapids")
     second, values = _low_bits_via_udf(spark)
     assert second.transpiled and values == [0, 8, 32]
 
@@ -316,9 +322,9 @@ def test_end_to_end_gpu_kernel_row_is_stored_and_served_through_the_wrapper(
     assert (row.target_kind, row.impl_entry, row.impl_class) == (
         KIND_GPU_KERNEL,
         LOW_BITS_CUDA,
-        "ai_udf.LowBits",
+        LOW_BITS_CLASS,
     )
-    assert rapids.jar_has_class(row.impl_binary, "ai_udf.LowBits__Rapids")
+    assert rapids.jar_has_class(row.impl_binary, LOW_BITS_CLASS + "__Rapids")
     second, values = _low_bits_via_udf(spark)
     assert values == [0, 8, 32]
     served = " ".join(str(sql) for sql in second.transpiled)

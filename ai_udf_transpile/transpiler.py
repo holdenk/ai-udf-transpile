@@ -169,7 +169,9 @@ def _rust_elsewhere(row: Any, spark: Any) -> bool:
     return rust_unservable(spark) is not None
 
 
-def _gpu_kernel_column(row: Any, class_name: str, binary: Any, args: str, return_type: Any, spark: Any) -> Any:
+def _gpu_kernel_column(
+    row: Any, class_name: str, binary: Any, args: str, return_type: Any, spark: Any
+) -> Any:
     """The RapidsUDF wrapper of a gpu_kernel row as a Column, or None to serve the java class."""
     import pyspark.sql.functions as F
 
