@@ -188,6 +188,29 @@ def cursor_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
     return [binary, "-p", prompt_text, "--trust", "--force", "--output-format", "text"]
 
 
+def pi_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
+    del sandbox
+    return [
+        binary,
+        "--mode",
+        "text",
+        "--no-session",
+        "--no-extensions",
+        "--no-skills",
+        "--no-context-files",
+        "--no-prompt-templates",
+        # Empty overrides stop a global SYSTEM.md / APPEND_SYSTEM.md leaking in.
+        "--system-prompt",
+        "",
+        "--append-system-prompt",
+        "",
+        "--tools",
+        "read,write",
+        "-p",
+        prompt_text,
+    ]
+
+
 def claude_argv(binary: str, sandbox: Path, prompt_text: str) -> list[str]:
     del sandbox
     return [
@@ -231,7 +254,7 @@ PI_SPEC = CliSpec(
     name="pi",
     default_binary=conf.DEFAULTS[conf.BINARY_PI],
     binary_conf_key=conf.BINARY_PI,
-    argv=cursor_argv,
+    argv=pi_argv,
     model_conf_key=conf.MODEL_PI,
     model_flag="--model",
 )
@@ -305,6 +328,7 @@ class CliBackend:
                 argv,
                 cwd=str(sandbox),
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 text=True,
                 timeout=timeout,
                 env=env,

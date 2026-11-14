@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -62,12 +63,37 @@ def test_cursor_argv(tmp_path):
 def test_pi_argv(tmp_path):
     backend = PiBackend()
     argv = backend.build_argv(tmp_path, "PROMPT TEXT")
-    assert argv[0] == "pi"
-    assert "-p" in argv
-    assert "PROMPT TEXT" in argv
-    assert "--trust" in argv
-    assert "--force" in argv
-    assert "--output-format" in argv
+    assert argv == [
+        "pi",
+        "--mode",
+        "text",
+        "--no-session",
+        "--no-extensions",
+        "--no-skills",
+        "--no-context-files",
+        "--no-prompt-templates",
+        "--system-prompt",
+        "",
+        "--append-system-prompt",
+        "",
+        "--tools",
+        "read,write",
+        "-p",
+        "PROMPT TEXT",
+    ]
+
+
+def test_cli_backend_closes_stdin(tmp_path):
+    seen = {}
+
+    def runner(argv, **kwargs):
+        seen["stdin"] = kwargs.get("stdin")
+        (Path(kwargs["cwd"]) / "OUT.sql").write_text("_udf_param_0 + 1\n")
+        return _Completed()
+
+    (tmp_path / "PROMPT.md").write_text("hello")
+    PiBackend(runner=runner).run(None, tmp_path)
+    assert seen["stdin"] == subprocess.DEVNULL
 
 
 def test_codex_argv(tmp_path):
