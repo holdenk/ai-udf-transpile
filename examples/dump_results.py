@@ -42,7 +42,7 @@ from ai_udf_transpile.backends.bytecode import BytecodeBackend  # noqa: E402
 from ai_udf_transpile.catalog import CacheRow  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
 from ai_udf_transpile.sandbox import make_sandbox  # noqa: E402
-from ai_udf_transpile.targets import KIND_JAVA_UDF, KIND_RUST, NO_RUST_SUFFIX  # noqa: E402
+from ai_udf_transpile.targets import KIND_GPU_KERNEL, KIND_JAVA_UDF, KIND_RUST, NO_RUST_SUFFIX  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
@@ -265,6 +265,18 @@ def _ai_section(row: CacheRow) -> list[str]:
         label = f"{label} / {row.model}"
     tail = f" (attempt_count={row.attempt_count}, hypothesis_passed={row.hypothesis_passed})"
     if row.status == "success":
+        if row.target_kind == KIND_GPU_KERNEL:
+            return [
+                f"- **AI ({label})**: CUDA kernel (GPU) with a java UDF (CPU):{tail}",
+                "",
+                "```cpp",
+                row.impl_entry or "",
+                "```",
+                "",
+                "```java",
+                row.impl_source or "",
+                "```",
+            ]
         if row.target_kind == KIND_JAVA_UDF:
             return [f"- **AI ({label})**: java UDF:{tail}", "", "```java", row.impl_source or "", "```"]
         if row.target_kind == KIND_RUST:

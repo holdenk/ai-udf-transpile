@@ -11,7 +11,7 @@ import types
 from contextlib import contextmanager
 from importlib.resources import files
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 from ai_udf_transpile import conf
 from ai_udf_transpile.targets import KIND_RUST, TranspileJob
@@ -122,13 +122,24 @@ def job_appendix(job: TranspileJob, inputs: Optional[str] = None) -> str:
 
 
 def write_sandbox(
-    root: Path, job: TranspileJob, prompt: str | None = None, inputs: Optional[str] = None
+    root: Path,
+    job: TranspileJob,
+    prompt: str | None = None,
+    inputs: Optional[str] = None,
+    gpu_kernel: Any = None,
 ) -> Path:
+    """``gpu_kernel``: a ``rapids.KernelAbi`` when this job may also ship a CUDA
+    kernel (``OUT.cu``). None leaves the prompt exactly as it was."""
     root.mkdir(parents=True, exist_ok=True)
     body = prompt if prompt is not None else default_prompt()
     signature = rust_signature_for(job)
     if signature:
         body = body.rstrip() + "\n\n" + rust_prompt(signature)
+    if gpu_kernel is not None:
+        from ai_udf_transpile.rapids import kernel_prompt
+
+        arg = job.param_names[0] if job.param_names else "a"
+        body = body.rstrip() + "\n\n" + kernel_prompt(gpu_kernel, arg)
     (root / "PROMPT.md").write_text(body.rstrip() + "\n" + job_appendix(job, inputs), encoding="utf-8")
     mode = representation(inputs)
     if mode in (SOURCE, SOURCE_PLUS_BYTECODE):
@@ -146,7 +157,10 @@ def write_sandbox(
 
 @contextmanager
 def make_sandbox(
-    job: TranspileJob, prompt: str | None = None, inputs: Optional[str] = None
+    job: TranspileJob,
+    prompt: str | None = None,
+    inputs: Optional[str] = None,
+    gpu_kernel: Any = None,
 ) -> Iterator[Path]:
     with tempfile.TemporaryDirectory(prefix="ai-udf-transpile-") as tmp:
-        yield write_sandbox(Path(tmp), job, prompt, inputs)
+        yield write_sandbox(Path(tmp), job, prompt, inputs, gpu_kernel)

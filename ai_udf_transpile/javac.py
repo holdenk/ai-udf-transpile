@@ -23,7 +23,7 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,19 @@ def _jar_entries(entries: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
-def _compile_jdk(spark: Any, java_source: str, class_name: str) -> bytes:
+def merge_jars(*jars: bytes) -> bytes:
+    """One deterministic jar from several; the first jar to name an entry wins."""
+    entries: dict[str, bytes] = {}
+    for jar_bytes in jars:
+        with zipfile.ZipFile(io.BytesIO(jar_bytes)) as jar:
+            for name in jar.namelist():
+                entries.setdefault(name, jar.read(name))
+    return _jar_entries(entries)
+
+
+def _compile_jdk(spark: Any, java_source: str, class_name: str, extra_classpath: Sequence[str] = ()) -> bytes:
+    """``extra_classpath``: jars javac needs that are not on ``java.class.path``
+    (anything added with ``--jars``, or another compiled rewrite)."""
     jvm = spark._jvm
     compiler = jvm.javax.tools.ToolProvider.getSystemJavaCompiler()
     if compiler is None:
@@ -107,7 +119,8 @@ def _compile_jdk(spark: Any, java_source: str, class_name: str) -> bytes:
             handle.write(java_source)
         file_manager = compiler.getStandardFileManager(None, None, None)
         units = file_manager.getJavaFileObjectsFromStrings(jvm.java.util.Collections.singletonList(src_file))
-        classpath = jvm.java.lang.System.getProperty("java.class.path")
+        base = str(jvm.java.lang.System.getProperty("java.class.path"))
+        classpath = os.pathsep.join([base, *extra_classpath])
         options = jvm.java.util.ArrayList()
         for opt in ("-classpath", classpath, "-d", out_dir, "-proc:none", "-encoding", "UTF-8"):
             options.add(opt)

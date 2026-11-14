@@ -14,6 +14,7 @@ from typing import Any, Optional, Protocol
 from ai_udf_transpile import conf
 from ai_udf_transpile.targets import (
     KIND_CATALYST,
+    KIND_GPU_KERNEL,
     KIND_JAVA_UDF,
     KIND_RUST,
     TranspileJob,
@@ -134,7 +135,9 @@ class CacheRow:
             return False
         if self.target_kind == KIND_CATALYST and self.catalyst_sql:
             return True
-        if self.target_kind == KIND_JAVA_UDF and (self.impl_class or self.impl_source or self.impl_binary):
+        if self.target_kind in (KIND_JAVA_UDF, KIND_GPU_KERNEL) and (
+            self.impl_class or self.impl_source or self.impl_binary
+        ):
             return True
         if self.target_kind == KIND_RUST and self.impl_source:
             return True

@@ -22,7 +22,10 @@ V1_KINDS = frozenset({KIND_CATALYST, KIND_JAVA_UDF})
 # Rust UDF runs only inside Comet's native execution (see rustc.py).
 OPT_IN_KINDS = frozenset({KIND_RUST})
 SERVABLE_KINDS = V1_KINDS | OPT_IN_KINDS
-RESERVED_KINDS = frozenset({KIND_GPU_KERNEL, KIND_BINARY})
+# Opt-in (gpuKernel conf plus Spark RAPIDS): a java_udf with a CUDA row kernel
+# in ``entry``. See ai_udf_transpile.rapids.
+EXPERIMENTAL_KINDS = frozenset({KIND_GPU_KERNEL})
+RESERVED_KINDS = frozenset({KIND_BINARY})
 
 
 @dataclass
@@ -62,7 +65,8 @@ class TranspileResult:
     def reconstructable(self) -> bool:
         if self.kind == KIND_CATALYST:
             return bool(self.sql and self.sql.strip())
-        if self.kind == KIND_JAVA_UDF:
+        if self.kind in (KIND_JAVA_UDF, KIND_GPU_KERNEL):
+            # A gpu_kernel is served as its java class wherever the kernel cannot run.
             return bool(self.class_name or self.java_source or self.binary)
         if self.kind == KIND_RUST:
             return bool(self.rust_source and self.rust_source.strip())

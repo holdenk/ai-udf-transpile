@@ -20,6 +20,7 @@ from ai_udf_transpile.approval import row_approval_reasons
 from ai_udf_transpile.backends import get_backend
 from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.catalog import Catalog, configured_tolerance, open_catalog, publish_verified
+from ai_udf_transpile.rapids import offered_abi, verify_result
 from ai_udf_transpile.sandbox import make_sandbox
 from ai_udf_transpile.targets import KIND_RUST, NO_RUST_SUFFIX, TranspileResult
 from ai_udf_transpile.verify import (
@@ -119,7 +120,11 @@ def process_row(
             job = row.as_job()
             if not _no_rust_row(row) and _rust_offered(spark, job.input_types, job.return_type):
                 job.targets = [*job.targets, KIND_RUST]
-            with make_sandbox(job, inputs=conf.get_value(conf.AI_REPRESENTATION, spark)) as sandbox:
+            with make_sandbox(
+                job,
+                inputs=conf.get_value(conf.AI_REPRESENTATION, spark),
+                gpu_kernel=offered_abi(spark, job.input_types, job.return_type),
+            ) as sandbox:
                 result = backend.run(job, sandbox)
         model = result.model
         rejected = rejected_rewrite(result) or _rust_refusal(spark, result, row)
@@ -129,7 +134,12 @@ def process_row(
             )
             logger.info("transpile rejected key=%s: %s", key[:12], rejected)
             return
-        if result.kind == "java_udf" and result.java_source and not result.binary and spark is not None:
+        if (
+            result.kind in ("java_udf", "gpu_kernel")
+            and result.java_source
+            and not result.binary
+            and spark is not None
+        ):
             from ai_udf_transpile.javac import compile_java
 
             compiled = compile_java(spark, result.java_source, result.class_name)
@@ -143,7 +153,10 @@ def process_row(
             samples = catalog.samples_for(key)
         except Exception:
             logger.debug("samples_for failed for %s", key[:12], exc_info=True)
-        ok, err = verify_fn(
+        # A gpu_kernel result comes back gpu_kernel only if its kernel also
+        # matched on a GPU; otherwise it is the java_udf it contains.
+        ok, err = verify_result(
+            verify_fn,
             source_text=row.source_text,
             captures=row.captures,
             result=result,
