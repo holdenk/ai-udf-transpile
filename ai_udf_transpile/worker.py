@@ -22,7 +22,7 @@ from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.catalog import Catalog, configured_tolerance, open_catalog, publish_verified
 from ai_udf_transpile.rapids import offered_abi, verify_result
 from ai_udf_transpile.sandbox import make_sandbox
-from ai_udf_transpile.targets import KIND_RUST, NO_RUST_SUFFIX, TranspileResult
+from ai_udf_transpile.targets import KIND_GPU_KERNEL, KIND_RUST, NO_RUST_SUFFIX, TranspileResult
 from ai_udf_transpile.verify import (
     hypothesis_check,
     rejected_rewrite,
@@ -118,8 +118,12 @@ def process_row(
             origin = "human"
         else:
             job = row.as_job()
+            wanted = conf.get_csv(conf.TARGETS, spark, conf.DEFAULTS[conf.TARGETS])
+            job.targets = [k for k in job.targets if k in wanted]
             if not _no_rust_row(row) and _rust_offered(spark, job.input_types, job.return_type):
                 job.targets = [*job.targets, KIND_RUST]
+            if not job.targets:
+                raise BackendDecline(f"no rewrite kind offered for targets={sorted(wanted)}")
             with make_sandbox(
                 job,
                 inputs=conf.get_value(conf.AI_REPRESENTATION, spark),
@@ -127,7 +131,12 @@ def process_row(
             ) as sandbox:
                 result = backend.run(job, sandbox)
         model = result.model
-        rejected = rejected_rewrite(result) or _rust_refusal(spark, result, row)
+        unasked = (
+            f"answered {result.kind}, but only {job.targets} were asked for"
+            if origin != "human" and result.kind not in (*job.targets, KIND_GPU_KERNEL)
+            else None
+        )
+        rejected = rejected_rewrite(result) or _rust_refusal(spark, result, row) or unasked
         if rejected:
             catalog.mark_failed(
                 key, rejected, origin=origin, model=model or _reported_model(backend), result=result

@@ -166,7 +166,7 @@ def test_no_documented_win_is_called_a_likely_regression():
         name = section.split("\n", 1)[0].strip()
         source = re.search(r"```python\n(.*?)```", section, re.S)
         served = re.search(
-            r"^- \*\*AI \([^)]*\)\*\*: `(.*?)` \(attempt_count.*?\(([0-9.]+)x vs python\)",
+            r"^- \*\*(?:AI|SQL) \([^)]*\)\*\*: `(.*?)` \(attempt_count.*?\(([0-9.]+)x vs python\)",
             section,
             re.M | re.S,
         )
