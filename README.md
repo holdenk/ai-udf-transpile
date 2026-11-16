@@ -384,7 +384,12 @@ fallback; until then this target trades the plugin's safety for speed.
   `rust.buildDir` is the same path on every executor. Comet registers the
   library by absolute path and does not distribute it, and `--files` /
   `spark.files` / `SparkContext.addFile` do not help on their own: they land
-  in a per-executor temp directory, not at the driver's path. On a cluster,
+  in a per-executor temp directory, not at the driver's path (upstream:
+  "The library must already be present on every executor, at the same
+  absolute path given to `register`"). Comet also accepts a bare library
+  name resolved through `LD_LIBRARY_PATH`, but this plugin builds libraries
+  at runtime and the loader path is fixed when the executor starts, so that
+  is no route either. On a cluster,
   point `rust.buildDir` at a mount every node sees at the same path (NFS,
   EFS, a shared volume in Kubernetes) and set `rust.sharedBuildDir=true`.
   Without that the guard simply never offers Rust there; nothing breaks.
