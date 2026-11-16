@@ -156,6 +156,7 @@ def test_map_samples_captured_end_to_end(spark, sqlite_path):
     conf.set_value(conf.INPUT_CATEGORIES, "numeric,string,bool,binary,map")
     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    conf.set_value(conf.SAMPLING, "true")  # opt-in
     udf = UserDefinedFunction(pymap, StringType())  # cache miss -> func wrapped
     df = spark.createDataFrame(
         [({"a": "1", "b": "plain"},), ({"c": "{'x': 2}"},), (None,)],

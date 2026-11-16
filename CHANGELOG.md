@@ -7,6 +7,22 @@ evidence for a direction, not a promise about your cluster.
 
 ## Unreleased
 
+### Real-row sampling is now opt-in (2026-11-16)
+
+`spark.sql.experimental.aiUdfTranspile.sampling` now defaults to `false`.
+Sampling copies real UDF arguments into the SQLite catalog file, which is
+the wrong default for columns holding personal or secret data, and it
+records nothing in cluster mode with a driver-local catalog path anyway.
+Set it to `true` to get the old behaviour; the README has a new
+"Real-row sampling" section on what it captures and when it works.
+
+The approval CLI (`python -m ai_udf_transpile.approve`) now says when a
+parked rewrite with string, map, timestamp or array inputs has no sampled
+rows: a count in a banner at the start of `--list`, `--browse` and the
+interactive review, and a `!! NO REAL INPUT ROWS SAMPLED` note on each
+such row saying how to turn sampling on. Previously only string inputs got
+a one-line note.
+
 ### Prefill: extract UDFs from scripts into the catalog (2026-11-13)
 
 `python -m ai_udf_transpile.prefill PATH...` parses (never imports) Python

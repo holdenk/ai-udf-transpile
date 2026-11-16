@@ -153,6 +153,7 @@ def _record_samples(spark, sqlite_path):
     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     conf.set_value(conf.INPUT_CATEGORIES, ARRAY_CATEGORIES)
+    conf.set_value(conf.SAMPLING, "true")
     df = spark.createDataFrame(
         [(s[0], s[1], s[2], s[3]) for s in BSP_SAMPLES],
         ["OLD_LAC", "NEW_LAC", "bsp_lacs", "mid_lacs"],

@@ -30,7 +30,9 @@ A working experiment, not a dependency:
   not "faithful". String columns are not invented: a string may hold a
   date, JSON, or a number. Set
   `spark.sql.experimental.aiUdfTranspile.partyOnStrings` to generate
-  string values anyway. And for service-calling UDFs the gate is only as
+  string values anyway, or turn on [real-row sampling](#real-row-sampling)
+  (off by default) so verification also runs on rows your job actually
+  saw. And for service-calling UDFs the gate is only as
   strong as the verification env: with the service unreachable, a
   NULL-guarded function (return None on NULL, call the service otherwise)
   supplies the one successful python eval the vacuous-pass guard needs,
@@ -667,6 +669,47 @@ who can append to that table can run SQL and Java in every reader's driver.
 Failed rewrites cool down for 24h (`failCooldownSeconds`) and stop retrying
 after `maxRetries` (default 3).
 
+## Real-row sampling
+
+Off by default. Hypothesis is weakest on string, map, timestamp and array
+inputs: random text rarely looks like the JSON, date or code a column
+really holds, so a wrong rewrite can "match" because both sides raise or
+return NULL on every generated value. Sampling feeds real rows to
+verification instead:
+
+```python
+spark.conf.set("spark.sql.experimental.aiUdfTranspile.sampling", "true")
+spark.conf.set("spark.sql.experimental.aiUdfTranspile.maxSamples", "8")  # per UDF, per executor process
+```
+
+With it on, a cache miss on a UDF with a string, map, timestamp or array
+input wraps the UDF's function before PySpark pickles it. The first
+`maxSamples` calls per executor process with at least one non-NULL
+argument are written to the SQLite catalog's `samples` table (newest 64
+per UDF kept). The UDF's results are unchanged and a failed write is
+ignored. The worker then runs every stored row as an explicit Hypothesis
+example, and the approval CLI shows a few of them to the reviewer.
+
+Why it is opt-in:
+
+- **It copies production values into the catalog file.** Arguments are
+  stored as JSON in plain SQLite, readable by anyone who can read the
+  file, and shown by `python -m ai_udf_transpile.approve`. Do not turn it
+  on for columns holding secrets or personal data unless the catalog file
+  is protected like the data.
+- **It only works where executors can write the catalog path.** SQLite
+  catalog only, and only when that path is reachable from the executors
+  (local mode, or a shared filesystem). In cluster mode with a
+  driver-local path it silently records nothing. `catalog=delta` never
+  samples.
+- It adds a function wrapper and a few SQLite writes on the first calls
+  in each executor process.
+
+Sampling captures rows from the first run after the cache miss, which is
+also when the rewrite is queued. With the inline worker, verification can
+start before any rows land; run the UDF once more (or use a standalone
+worker) if you want the first verification to see them.
+
 ## Manual approval
 
 Hypothesis is weakest exactly where UDFs get interesting: string columns
@@ -703,7 +746,12 @@ The interactive loop shows each UDF's Python source, the SQL or Java
 rewrite, the backend/model, which flags it tripped, and a few of the real
 input rows it was checked against, then prompts `[y/n/skip]`: `y`
 approves, `n` rejects (with an optional reason), `skip` or Enter leaves it
-for later, `q` stops. `--browse` is the same view without the decisions: page through
+for later, `q` stops. When a rewrite with string, map, timestamp or
+array inputs has no sampled rows, the script says so in a banner at the
+start and a `!! NO REAL INPUT ROWS SAMPLED` note on that row: it was
+checked only on built-in and generated values. Turn on
+[real-row sampling](#real-row-sampling) and run the UDF again before
+approving it. `--browse` is the same view without the decisions: page through
 with Enter/`n`, `p`, a row number, or `q`, and nothing in the catalog
 changes. The reviewer (`--reviewer`, else `$AI_UDF_TRANSPILE_REVIEWER`, else
 `$USER`) and time are recorded on the row (`reviewed_by`, `reviewed_at`).
