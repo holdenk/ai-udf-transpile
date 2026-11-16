@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
     [("declined: no faithful rewrite", 0), ("BackendError: timed out", 1)],
 )
 def test_fill_reports_infrastructure_errors(tmp_path, monkeypatch, error, exit_code):
+    pytest.importorskip("pyspark")
     spec = importlib.util.spec_from_file_location("fill_targets", ROOT / "examples/fill_targets.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
