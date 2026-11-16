@@ -63,6 +63,70 @@ def test_setup_spark_reuses_a_cached_release(tmp_path):
     assert "py4j-test-src.zip" in exports
 
 
+def _fake_spark_repo(tmp_path, mvn_body):
+    """A local 'apache/spark' whose build/mvn is a stub, so the ref path runs offline."""
+    repo = tmp_path / "upstream"
+    (repo / "python" / "pyspark" / "sql").mkdir(parents=True)
+    (repo / "python" / "pyspark" / "sql" / "transpile.py").write_text("")
+    (repo / "python" / "lib").mkdir()
+    (repo / "python" / "lib" / "py4j-test-src.zip").write_bytes(b"")
+    (repo / "build").mkdir()
+    mvn = repo / "build" / "mvn"
+    mvn.write_text("#!/usr/bin/env bash\n" + mvn_body)
+    mvn.chmod(0o755)
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run(["git", "init", "-q", "-b", "branch-4.x", str(repo)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "init"], check=True)
+    return repo
+
+
+def _setup_ref(tmp_path, repo):
+    return subprocess.run(
+        [
+            str(EXAMPLES / "setup_spark.sh"),
+            "--spark",
+            "branch-4.x",
+            "--repo",
+            f"file://{repo}",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--print-home",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.skipif(
+    subprocess.run(["bash", "-c", "command -v git java"], capture_output=True).returncode != 0,
+    reason="needs git and java",
+)
+def test_setup_spark_ref_build_failure_is_fatal(tmp_path):
+    repo = _fake_spark_repo(tmp_path, 'echo "[ERROR] tests do not compile"; exit 1\n')
+    proc = _setup_ref(tmp_path, repo)
+    assert proc.returncode != 0
+    assert proc.stdout == ""
+    assert "tests do not compile" in proc.stderr
+    assert "build of branch-4.x" in proc.stderr
+
+
+@pytest.mark.skipif(
+    subprocess.run(["bash", "-c", "command -v git java"], capture_output=True).returncode != 0,
+    reason="needs git and java",
+)
+def test_setup_spark_ref_builds_once_per_sha(tmp_path):
+    repo = _fake_spark_repo(tmp_path, f'echo built >> "{tmp_path}/builds"\n')
+    first = _setup_ref(tmp_path, repo)
+    assert first.returncode == 0, first.stderr
+    assert first.stdout.strip() == str(tmp_path / "cache" / "src-branch-4.x")
+    second = _setup_ref(tmp_path, repo)
+    assert second.returncode == 0, second.stderr
+    assert "already built" in second.stderr
+    assert (tmp_path / "builds").read_text().count("built") == 1
+
+
 def test_setup_spark_refuses_a_release_without_the_hook(tmp_path):
     home = _fake_release(tmp_path, "4.2.1")
     (home / "python" / "pyspark" / "sql" / "transpile.py").unlink()
