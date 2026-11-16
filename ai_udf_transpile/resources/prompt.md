@@ -230,7 +230,10 @@ public class Backwards implements UDF1<Object, Object> {
 ## When to DECLINE
 
 - The UDF calls a network/service/SDK (boto3, requests), reads the clock or
-  randomness, or does I/O: no faithful rewrite exists.
+  randomness, or does I/O. A faithful rewrite may exist, but it cannot be
+  verified: the differential test replays generated inputs and compares
+  outputs, and an external call or a clock/random read gives no stable output
+  to compare, so the rewrite would be accepted (or rejected) by luck.
 - You cannot match Python semantics for the declared types with confidence.
 - Never emit `reflect`, `try_reflect` or `java_method`. They invoke arbitrary JVM methods
   and are rejected before the rewrite is run.
