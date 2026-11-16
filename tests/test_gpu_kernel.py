@@ -595,6 +595,27 @@ def test_process_row_without_rapids_stores_a_java_udf_and_never_offers_the_kerne
     assert "OUT.cu" not in backend.prompt
 
 
+def test_process_row_sql_only_rejects_gpu_results_without_verifying(tmp_path, monkeypatch):
+    conf.set_value(conf.TARGETS, "catalyst")
+    monkeypatch.setattr("ai_udf_transpile.worker.offered_abi", lambda *a: ABI)
+    cat = _pending(tmp_path)
+    backend = _KernelBackend()
+    verified = []
+    process_row(cat, cat.get("k"), backend, verify_fn=lambda **k: verified.append(k))
+    assert cat.get("k").status == "failed"
+    assert "answered gpu_kernel" in cat.get("k").error
+    assert not verified
+    assert "OUT.cu" not in backend.prompt
+
+
+def test_java_only_prompt_preserves_the_optional_gpu_kernel(tmp_path):
+    job = _job()
+    job.targets = [KIND_JAVA_UDF]
+    prompt = (write_sandbox(tmp_path, job, gpu_kernel=ABI) / "PROMPT.md").read_text()
+    assert "ONLY a Java UDF" in prompt
+    assert "optional CUDA kernel (`OUT.cu`)" in prompt
+
+
 def test_process_row_stores_a_gpu_verified_kernel_and_offers_it_in_the_prompt(
     tmp_path, fake_gpu, monkeypatch
 ):

@@ -37,5 +37,5 @@ done
 # A partial (--only) or failed run must not replace the committed doc.
 OUT=docs/EXAMPLES_TRANSPILED.md
 if [ $# -gt 0 ] || [ "$FAILED" = 1 ]; then OUT="$DIR/EXAMPLES_TRANSPILED.partial.md"; fi
-"$PYTHON" -u examples/dump_results.py --targets-dir "$DIR" --out "$OUT"
+"$PYTHON" -u examples/dump_results.py --targets-dir "$DIR" --out "$OUT" || FAILED=1
 exit "$FAILED"

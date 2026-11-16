@@ -59,13 +59,18 @@ def _comet_confs(jar: str) -> dict[str, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True, choices=KINDS)
-    parser.add_argument("--source", default="target/examples_transpiled.sqlite", help="catalog holding the UDF sources")
+    parser.add_argument(
+        "--source", default="target/examples_transpiled.sqlite", help="catalog holding the UDF sources"
+    )
     parser.add_argument("--out", help="per-kind catalog (default target/targets/<kind>.sqlite)")
     parser.add_argument("--only", action="append", default=[], help="function name to run (repeatable)")
     args = parser.parse_args()
     out = Path(args.out or f"target/targets/{args.target}.sqlite")
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    if not Path(args.source).is_file():
+        print(f"no source catalog at {args.source}", file=sys.stderr)
+        return 1
     src = SqliteCatalog(Path(args.source))
     sources: dict[str, object] = {}
     for raw in src._conn.execute("SELECT * FROM cache").fetchall():
@@ -75,6 +80,10 @@ def main() -> int:
     rows = sorted(sources.values(), key=lambda r: (_function_name(r.source_text), r.udf_key))
     if args.only:
         rows = [r for r in rows if _function_name(r.source_text) in args.only]
+    src.close()
+    if not rows:
+        print("no matching UDF sources", file=sys.stderr)
+        return 1
 
     extra = None
     if args.target == "rust":
@@ -90,6 +99,7 @@ def main() -> int:
         conf.INPUT_CATEGORIES, ",".join(sorted({c for r in rows for c in r.input_categories})), spark
     )
     backend = get_backend(spark=spark)
+    failed = False
     try:
         for i, row in enumerate(rows, 1):
             name = _function_name(row.source_text) or row.udf_key[:12]
@@ -116,14 +126,20 @@ def main() -> int:
                 )
             if not catalog.claim(row.udf_key, getattr(backend, "name", "unknown")):
                 print(f"[{i}/{len(rows)}] {name}: claim failed", file=sys.stderr)
+                failed = True
                 continue
             process_row(catalog, catalog.get(row.udf_key), backend, spark)
             final = catalog.get(row.udf_key)
-            print(f"[{i}/{len(rows)}] {name}: {final.status} {final.target_kind or ''} {(final.error or '')[:160]}")
+            if final.status not in ("success", "failed") or infra_failure(final):
+                failed = True
+            print(
+                f"[{i}/{len(rows)}] {name}: {final.status} {final.target_kind or ''} "
+                f"{(final.error or '')[:160]}"
+            )
     finally:
         shutdown()
         spark.stop()
-    return 0
+    return int(failed)
 
 
 if __name__ == "__main__":

@@ -226,6 +226,26 @@ def _load_dump_module():
     return module
 
 
+def test_dump_targets_shows_each_kind_and_marks_backend_errors_unavailable(spark, tmp_path):
+    targets = tmp_path / "targets"
+    targets.mkdir()
+    _fill_catalog(targets / "catalyst.sqlite")
+    _fill_catalog(targets / "java_udf.sqlite")
+    cat = SqliteCatalog(targets / "rust.sqlite")
+    _insert(cat, "k_plus_one", PLUS_ONE_SRC, ["x"], ["bigint"], ["numeric"], "bigint")
+    cat.claim("k_plus_one", "coco")
+    cat.mark_failed("k_plus_one", "BackendError: timed out", origin="coco")
+    cat.close()
+    out = tmp_path / "dump.md"
+    assert _load_dump_module().dump_targets(spark, str(targets), str(out), "coco") == 0
+    text = out.read_text(encoding="utf-8")
+    assert "| UDF | python | SQL | Java | Rust |" in text
+    assert "'Rust': {'unavailable': 1}" in text
+    section = text.split("## plus_one\n", 1)[1].split("## ", 1)[0]
+    assert "**SQL (" in section and "**Java (" in section
+    assert "**Rust (coco)**: unavailable: BackendError: timed out" in section
+
+
 def test_perf_lines_unit(tmp_path):
     micro = tmp_path / "micro.csv"
     micro.write_text(MICRO_CSV_HEADER + "\n" + MICRO_CSV_ROWS, encoding="utf-8")

@@ -39,7 +39,7 @@ from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 from ai_udf_transpile.backends import ai_backend  # noqa: E402
 from ai_udf_transpile.backends.base import BackendDecline, BackendError  # noqa: E402
 from ai_udf_transpile.backends.bytecode import BytecodeBackend  # noqa: E402
-from ai_udf_transpile.catalog import CacheRow  # noqa: E402
+from ai_udf_transpile.catalog import CacheRow, infra_failure  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
 from ai_udf_transpile.sandbox import make_sandbox  # noqa: E402
 from ai_udf_transpile.targets import KIND_GPU_KERNEL, KIND_JAVA_UDF, KIND_RUST, NO_RUST_SUFFIX  # noqa: E402
@@ -389,10 +389,17 @@ def _bench_suffix(kind: str, b: dict[str, str]) -> str:
     parts = []
     if b.get("transpiled_rows_per_second"):
         where = ", Comet native" if kind == "rust" else ""
-        speedup = f"{b['transpiled_speedup_vs_python']}x vs python" if b.get("transpiled_speedup_vs_python") else "no python baseline"
+        speedup = (
+            f"{b['transpiled_speedup_vs_python']}x vs python"
+            if b.get("transpiled_speedup_vs_python")
+            else "no python baseline"
+        )
         parts.append(f"{_fmt_rate(b['transpiled_rows_per_second'])} rows/s ({speedup}{where})")
     if b.get("comet_rows_per_second") and kind != "rust":
-        parts.append(f"comet {_fmt_rate(b['comet_rows_per_second'])} rows/s ({b.get('comet_speedup_vs_python') or '?'}x vs python)")
+        parts.append(
+            f"comet {_fmt_rate(b['comet_rows_per_second'])} rows/s "
+            f"({b.get('comet_speedup_vs_python') or '?'}x vs python)"
+        )
     return " · ".join(parts)
 
 
@@ -403,6 +410,8 @@ def _target_section(kind: str, entry: tuple[CacheRow, dict[str, str]] | None) ->
     row, bench = entry
     lines = _ai_section(row)
     lines[0] = lines[0].replace("**AI (", f"**{label} (", 1).replace(")**: failed:", ")**: rejected:", 1)
+    if infra_failure(row):
+        lines[0] = lines[0].replace(")**: rejected:", ")**: unavailable:", 1)
     if row.status == "success":
         lines[0] += " — accepted"
         if suffix := _bench_suffix(kind, bench):
@@ -416,6 +425,8 @@ def _verdict(entry: tuple[CacheRow, dict[str, str]] | None) -> str:
     if entry is None:
         return "-"
     row, bench = entry
+    if infra_failure(row):
+        return "unavailable"
     if row.status != "success":
         return "rejected" if row.status == "failed" else row.status
     rate = bench.get("transpiled_rows_per_second")
@@ -440,7 +451,9 @@ def dump_targets(spark, targets_dir: str, out_path: str, backend: str) -> int:
             keys.setdefault(key, row)
     ordered = sorted(keys.values(), key=lambda r: (_function_name(r.source_text), r.udf_key))
     tally = {
-        KIND_LABELS[k]: dict(Counter("accepted" if r.status == "success" else "rejected" for r, _ in rows.values()))
+        KIND_LABELS[k]: dict(
+            Counter("accepted" if r.status == "success" else _verdict((r, {})) for r, _ in rows.values())
+        )
         for k, rows in by_kind.items()
     }
     lines = [
@@ -454,7 +467,8 @@ def dump_targets(spark, targets_dir: str, out_path: str, backend: str) -> int:
         "",
         "Every UDF is asked for each rewrite kind separately (SQL, Java, Rust), so one",
         "can be accepted while another is rejected; a rejection carries the reason and",
-        "the rejected candidate when the model produced one. Accepted means the",
+        "the rejected candidate when the model produced one. Unavailable means the",
+        "backend failed before a candidate could be assessed. Accepted means the",
         "Hypothesis gate and the reconstruction smoke test passed. Perf is the local",
         "single-node `bench_catalog.py` run over each kind's own catalog (rows/s,",
         "speedup vs the interpreted python UDF); Rust only runs inside Comet, so its",
@@ -478,10 +492,21 @@ def dump_targets(spark, targets_dir: str, out_path: str, backend: str) -> int:
         for row in ordered:
             name = _function_name(row.source_text) or row.udf_key[:12]
             entries = {k: by_kind.get(k, {}).get(row.udf_key) for k in KIND_LABELS}
-            lines += [f"## {name}", "", "```python", row.source_text, "```", "", f"- **types**: {', '.join(row.input_types)} -> {row.return_type}"]
+            lines += [
+                f"## {name}",
+                "",
+                "```python",
+                row.source_text,
+                "```",
+                "",
+                f"- **types**: {', '.join(row.input_types)} -> {row.return_type}",
+            ]
             for _, b in filter(None, entries.values()):
                 if b.get("python_rows_per_second"):
-                    lines.append(f"- **perf (catalog bench)**: interpreted python {_fmt_rate(b['python_rows_per_second'])} rows/s")
+                    lines.append(
+                        "- **perf (catalog bench)**: interpreted python "
+                        f"{_fmt_rate(b['python_rows_per_second'])} rows/s"
+                    )
                     break
             lines.append("")
             lines += _safe("built-in static (AST)", lambda r=row: _builtin_result(r))
@@ -502,7 +527,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sqlite", default="target/examples_transpiled.sqlite", help="catalog sqlite path")
     parser.add_argument("--out", default="docs/EXAMPLES_TRANSPILED.md", help="markdown output path")
-    parser.add_argument("--targets-dir", help="dir of per-kind catalogs from fill_targets.py: dump SQL/Java/Rust side by side")
+    parser.add_argument(
+        "--targets-dir", help="dir of per-kind catalogs from fill_targets.py: dump SQL/Java/Rust side by side"
+    )
     parser.add_argument(
         "--backend",
         help="backend every AI row came from (default: $AI_UDF_TRANSPILE_BACKEND, else auto)",
@@ -523,8 +550,13 @@ def main() -> int:
         print(exc, file=sys.stderr)
         return 1
     if args.targets_dir:
-        spark = SparkSession.builder.master("local[1]").appName("ai-udf-transpile-dump").config(
-            "spark.ui.enabled", "false").config("spark.sql.ansi.enabled", "true").getOrCreate()
+        spark = (
+            SparkSession.builder.master("local[1]")
+            .appName("ai-udf-transpile-dump")
+            .config("spark.ui.enabled", "false")
+            .config("spark.sql.ansi.enabled", "true")
+            .getOrCreate()
+        )
         try:
             return dump_targets(spark, args.targets_dir, args.out, args.backend)
         finally:

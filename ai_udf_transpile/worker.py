@@ -22,7 +22,13 @@ from ai_udf_transpile.backends.base import BackendDecline
 from ai_udf_transpile.catalog import Catalog, configured_tolerance, open_catalog, publish_verified
 from ai_udf_transpile.rapids import offered_abi, verify_result
 from ai_udf_transpile.sandbox import make_sandbox
-from ai_udf_transpile.targets import KIND_GPU_KERNEL, KIND_RUST, NO_RUST_SUFFIX, TranspileResult
+from ai_udf_transpile.targets import (
+    KIND_GPU_KERNEL,
+    KIND_JAVA_UDF,
+    KIND_RUST,
+    NO_RUST_SUFFIX,
+    TranspileResult,
+)
 from ai_udf_transpile.verify import (
     hypothesis_check,
     rejected_rewrite,
@@ -127,13 +133,18 @@ def process_row(
             with make_sandbox(
                 job,
                 inputs=conf.get_value(conf.AI_REPRESENTATION, spark),
-                gpu_kernel=offered_abi(spark, job.input_types, job.return_type),
+                gpu_kernel=(
+                    offered_abi(spark, job.input_types, job.return_type)
+                    if KIND_JAVA_UDF in job.targets
+                    else None
+                ),
             ) as sandbox:
                 result = backend.run(job, sandbox)
         model = result.model
+        kind = KIND_JAVA_UDF if result.kind == KIND_GPU_KERNEL else result.kind
         unasked = (
             f"answered {result.kind}, but only {job.targets} were asked for"
-            if origin != "human" and result.kind not in (*job.targets, KIND_GPU_KERNEL)
+            if origin != "human" and kind not in job.targets
             else None
         )
         rejected = rejected_rewrite(result) or _rust_refusal(spark, result, row) or unasked
