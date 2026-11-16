@@ -17,6 +17,8 @@
 # `SPARK_HOME="$(examples/setup_spark.sh --spark 4.3 --print-home)"` works.
 
 set -euo pipefail
+# fetch_* run inside $(...); without this a failure there is ignored.
+shopt -s inherit_errexit 2>/dev/null || true  # bash >= 4.4; the steps that matter also check explicitly
 
 usage() {
   cat <<'EOF'
@@ -163,7 +165,7 @@ fetch_ref() {
     git -C "$home" remote add origin "$REPO_URL"
   fi
   log "fetching $ref from $REPO_URL"
-  git -C "$home" fetch -q --depth=1 origin "$ref"
+  git -C "$home" fetch -q --depth=1 origin "$ref" || error "could not fetch $ref from $REPO_URL"
   local sha
   sha="$(git -C "$home" rev-parse FETCH_HEAD)"
   if [ "$REBUILD" -eq 0 ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ]; then
@@ -177,8 +179,15 @@ fetch_ref() {
   rm -f "$stamp"
   # Same module set as CI: enough for a classic pyspark session with the
   # transpiler hook, without building every connector.
-  (cd "$home" && MAVEN_OPTS="${MAVEN_OPTS:--Xmx4g -XX:ReservedCodeCacheSize=1g}" \
-    ./build/mvn -T1C -DskipTests -Phadoop-3 package -pl sql/core,assembly -am) >&2
+  # -DskipTests still compiles test sources (the modules depend on each
+  # other's test jars), so a branch whose tests do not compile cannot be
+  # packaged; pin an earlier SHA with --spark <sha> until upstream fixes it.
+  local build_log="$home/.ai_udf_transpile_build.log"
+  if ! (cd "$home" && MAVEN_OPTS="${MAVEN_OPTS:--Xmx4g -XX:ReservedCodeCacheSize=1g}" \
+    ./build/mvn -T1C -DskipTests -Phadoop-3 package -pl sql/core,assembly -am) >"$build_log" 2>&1; then
+    grep -E '\[ERROR\]' "$build_log" | head -n 8 >&2 || true
+    error "Spark build of $ref @ ${sha:0:12} failed (full log: $build_log)"
+  fi
   echo "$sha" >"$stamp"
   echo "$home"
 }
