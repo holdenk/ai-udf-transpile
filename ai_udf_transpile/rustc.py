@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build a Rust row function into a Comet native UDF and register it.
 
+**Very new.** This target, and the Comet native UDF API under it, are days
+old and lightly exercised: expect sharp edges, especially off a laptop.
+
 The ``rust`` target runs inside Apache DataFusion Comet's native execution:
 Comet loads a ``cdylib`` built against its ``comet-udf-sdk`` and calls it on
 Arrow arrays, with no JVM or Python hop per row (Comet 1.2+,
@@ -25,7 +28,12 @@ Two properties shape everything else in this module:
 * **The library must exist at the same path on every executor.** Builds land
   in a content-addressed cache directory; they are served on ``local``
   masters, or anywhere once ``rust.sharedBuildDir`` says that directory is
-  cluster-visible.
+  cluster-visible. Comet is handed an absolute path and does not ship the
+  file. ``SparkContext.addFile`` / ``spark.files`` would not fix that by
+  itself: those land in a per-executor temp directory (under
+  ``SparkFiles.getRootDirectory()``), so the driver's path still would not
+  exist on executors. Hence the guard in :func:`rust_unservable`: without
+  local mode or the shared-directory promise, Rust is never offered.
 """
 
 from __future__ import annotations

@@ -7,6 +7,14 @@ evidence for a direction, not a promise about your cluster.
 
 ## Unreleased
 
+### Rust target docs: distribution and maturity (2026-11-16)
+
+Docs only. The Rust target is now flagged as very new (local masters only
+so far). The README and `rustc.py` spell out why `addFile` / `spark.files`
+does not distribute the library: Comet takes an absolute path, and those
+land in a per-executor temp directory. On a cluster, use a shared mount for
+`rust.buildDir` plus `rust.sharedBuildDir=true`.
+
 ### Prefill: extract UDFs from scripts into the catalog (2026-11-13)
 
 `python -m ai_udf_transpile.prefill PATH...` parses (never imports) Python
