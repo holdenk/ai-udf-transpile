@@ -15,6 +15,17 @@ does not distribute the library: Comet takes an absolute path, and those
 land in a per-executor temp directory. On a cluster, use a shared mount for
 `rust.buildDir` plus `rust.sharedBuildDir=true`.
 
+### Benchmarks: run against the 4.3 release or a branch-4.x build (2026-11-16)
+
+`examples/setup_spark.sh --spark 4.3|branch-4.x|REF` fetches the Spark to
+benchmark against: a release is the Apache binary tarball (sha512-checked,
+cached), a git ref is a shallow clone built like CI and rebuilt only when
+the ref moves. `run_demos.sh --spark SPEC` runs it first, records what ran
+in a `spark.txt` beside the CSVs, and `--graph-dir` keeps per-bench PNGs out
+of `docs/`, so a 4.3 run and a branch-4.x run sit side by side.
+`setup_comet.sh` now accepts a binary release (no `pom.xml`) by reading
+the version from `jars/spark-core_*.jar`.
+
 ### Prefill: extract UDFs from scripts into the catalog (2026-11-13)
 
 `python -m ai_udf_transpile.prefill PATH...` parses (never imports) Python

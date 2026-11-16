@@ -17,7 +17,7 @@ usage() {
 Usage: examples/setup_comet.sh [options]
 
 Options:
-  --spark-home PATH        Spark checkout/build root (default: $SPARK_HOME or ~/spark)
+  --spark-home PATH        Spark checkout/build root or unpacked release (default: $SPARK_HOME or ~/spark)
   --comet-home PATH        Comet clone/build root (default: $COMET_HOME or ~/datafusion-comet)
   --ref REF                Comet git ref to checkout (default: main)
   --profile PROFILE        Override Comet Spark profile (spark-3.4|spark-3.5|spark-4.0|spark-4.1|spark-4.2)
@@ -159,7 +159,14 @@ while [ $# -gt 0 ]; do
 done
 
 [ -d "$SPARK_HOME_ARG" ] || error "spark home does not exist: $SPARK_HOME_ARG"
-[ -f "$SPARK_HOME_ARG/pom.xml" ] || error "spark pom missing: $SPARK_HOME_ARG/pom.xml"
+# A source checkout has a pom; a binary release (examples/setup_spark.sh
+# --spark 4.3) only has jars, whose names carry the same two facts.
+SPARK_CORE_JAR=""
+if [ ! -f "$SPARK_HOME_ARG/pom.xml" ]; then
+  SPARK_CORE_JAR="$(ls "$SPARK_HOME_ARG"/jars/spark-core_*.jar 2>/dev/null | head -n1)"
+  [ -n "$SPARK_CORE_JAR" ] \
+    || error "no pom.xml and no jars/spark-core_*.jar under $SPARK_HOME_ARG"
+fi
 
 require_cmd git
 require_cmd make
@@ -179,6 +186,12 @@ if [ -z "$PYTHON_BIN" ]; then
   fi
 fi
 
+if [ -n "$SPARK_CORE_JAR" ]; then
+  # spark-core_2.13-4.3.0.jar -> "4.3 2.13"
+  _jar="$(basename "$SPARK_CORE_JAR" .jar)"
+  SPARK_SCALA="$(echo "$_jar" | sed -nE 's/^spark-core_([0-9]+\.[0-9]+)-.*$/\1/p')"
+  SPARK_MINOR="$(echo "$_jar" | sed -nE 's/^spark-core_[0-9.]+-([0-9]+\.[0-9]+).*$/\1/p')"
+else
 read -r SPARK_MINOR SPARK_SCALA <<EOF
 $("$PYTHON_BIN" - "$SPARK_HOME_ARG/pom.xml" <<'PY'
 import re
@@ -213,8 +226,9 @@ print(minor, scala)
 PY
 )
 EOF
+fi
 
-[ -n "$SPARK_MINOR" ] || error "could not detect Spark version from $SPARK_HOME_ARG/pom.xml"
+[ -n "$SPARK_MINOR" ] || error "could not detect Spark version from $SPARK_HOME_ARG"
 if [ -z "$SPARK_SCALA" ]; then
   warn "could not detect scala.binary.version from Spark pom; defaulting to 2.13"
   SPARK_SCALA="2.13"
