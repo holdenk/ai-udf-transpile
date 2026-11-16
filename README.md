@@ -58,7 +58,7 @@ A working experiment, not a dependency:
 - **Except the opt-in `rust` target.** A Rust rewrite runs only inside
   Comet's native execution; a query whose operator Comet does not take
   fails instead of falling back to Python — including any query that puts a
-  Rust-served UDF beside a still-interpreted Python UDF. Off by default; read
+  Rust-served UDF beside a still-interpreted Python UDF. Very new, off by default; read
   [Rust target](#rust-target-comet-native-udfs-opt-in) before turning it on.
 
 ## Install
@@ -257,6 +257,11 @@ AI CLI on PATH.
 
 ## Rust target: Comet native UDFs (opt-in)
 
+> **Very, very new.** This target landed on 2026-11-12, on top of a Comet API
+> that is itself experimental upstream. It has been run on local masters and
+> not yet on a real cluster. Treat it as a preview: expect breaking changes,
+> and keep it off for anything you care about.
+
 [Apache DataFusion Comet](https://datafusion.apache.org/comet/) 1.2+ can load
 a scalar UDF written in Rust from a shared library and run it inside its
 native pipeline, on Arrow arrays, with no JVM or Python hop per row
@@ -376,8 +381,13 @@ fallback; until then this target trades the plugin's safety for speed.
   `double`, `float`, `boolean`, `string`, `binary`. No arrays, maps,
   timestamps or decimals yet.
 - `local` masters only, unless `rust.sharedBuildDir=true` promises that
-  `rust.buildDir` is the same path on every executor (Comet does not
-  distribute the library).
+  `rust.buildDir` is the same path on every executor. Comet registers the
+  library by absolute path and does not distribute it, and `--files` /
+  `spark.files` / `SparkContext.addFile` do not help on their own: they land
+  in a per-executor temp directory, not at the driver's path. On a cluster,
+  point `rust.buildDir` at a mount every node sees at the same path (NFS,
+  EFS, a shared volume in Kubernetes) and set `rust.sharedBuildDir=true`.
+  Without that the guard simply never offers Rust there; nothing breaks.
 - A session that cannot run a cached Rust row (no Comet, `rust` not in its
   targets, a non-local master) looks it up again under a `+no-rust` twin
   key, which the worker fills with a SQL or Java rewrite only. Until that
