@@ -80,6 +80,7 @@ def main() -> int:
     rows = sorted(sources.values(), key=lambda r: (_function_name(r.source_text), r.udf_key))
     if args.only:
         rows = [r for r in rows if _function_name(r.source_text) in args.only]
+    source_samples = {r.udf_key: src.samples_for(r.udf_key) for r in rows}
     src.close()
     if not rows:
         print("no matching UDF sources", file=sys.stderr)
@@ -125,6 +126,7 @@ def main() -> int:
                     closure_fingerprint=row.closure_fingerprint,
                     captures=dict(row.captures),
                 )
+            catalog.record_samples(row.udf_key, source_samples[row.udf_key])
             if not catalog.claim(row.udf_key, getattr(backend, "name", "unknown")):
                 print(f"[{i}/{len(rows)}] {name}: claim failed", file=sys.stderr)
                 failed = True

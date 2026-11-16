@@ -296,6 +296,15 @@ def _ai_section(row: CacheRow) -> list[str]:
     return [f"- **AI ({label})**: status={row.status}{tail}"]
 
 
+def _write_doc(out_path: str, lines: list[str]) -> None:
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=path.parent, prefix=f".{path.name}.") as directory:
+        temporary = Path(directory) / path.name
+        temporary.write_text("\n".join(lines), encoding="utf-8")
+        os.replace(temporary, path)
+
+
 def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[str, dict[str, str]]) -> int:
     spark.conf.set(TRANSPILE_CONF, "true")
     spark.conf.set(PY_TRANSPLIERS_CONF, "catalyst")
@@ -355,8 +364,7 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
     finally:
         spark.conf.set(TRANSPILE_CONF, "false")
         spark.conf.unset(PY_TRANSPLIERS_CONF)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(out_path).write_text("\n".join(lines), encoding="utf-8")
+    _write_doc(out_path, lines)
     print(f"wrote {out_path} ({len(rows)} rows)")
     return 0
 
@@ -435,10 +443,8 @@ def _verdict(entry: tuple[CacheRow, dict[str, str]] | None) -> str:
 
 def dump_targets(spark, targets_dir: str, out_path: str, backend: str) -> int:
     """One section per UDF: python, the two non-AI transpilers, then SQL / Java / Rust each."""
-    spark.conf.set(TRANSPILE_CONF, "true")
-    spark.conf.set(PY_TRANSPLIERS_CONF, "catalyst")
     by_kind = _load_targets(targets_dir)
-    if not by_kind:
+    if not any(by_kind.values()):
         print(f"no per-target catalogs under {targets_dir}", file=sys.stderr)
         return 1
     bad = _bad_backend_rows([r for rows in by_kind.values() for r, _ in rows.values()], backend)
@@ -474,6 +480,8 @@ def dump_targets(spark, targets_dir: str, out_path: str, backend: str) -> int:
         "`bench_catalog.py` run over each kind's own catalog (rows/s,",
         "speedup vs the interpreted python UDF); Rust only runs inside Comet, so its",
         "number is Comet's. No perf = not benched, or python raises on the bench sample.",
+        "Java listings retain the model's source; Janino fallback can accept generic",
+        "declarations that the JDK compiler rejects.",
         "",
         "| UDF | python | SQL | Java | Rust |",
         "|---|---|---|---|---|",
@@ -489,6 +497,8 @@ def dump_targets(spark, targets_dir: str, out_path: str, backend: str) -> int:
         cells = [_verdict(by_kind.get(k, {}).get(row.udf_key)) for k in KIND_LABELS]
         lines.append(f"| [{name}](#{name.lower()}) | {py or '-'} | " + " | ".join(cells) + " |")
     lines.append("")
+    spark.conf.set(TRANSPILE_CONF, "true")
+    spark.conf.set(PY_TRANSPLIERS_CONF, "catalyst")
     try:
         for row in ordered:
             name = _function_name(row.source_text) or row.udf_key[:12]
@@ -518,8 +528,7 @@ def dump_targets(spark, targets_dir: str, out_path: str, backend: str) -> int:
     finally:
         spark.conf.set(TRANSPILE_CONF, "false")
         spark.conf.unset(PY_TRANSPLIERS_CONF)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(out_path).write_text("\n".join(lines), encoding="utf-8")
+    _write_doc(out_path, lines)
     print(f"wrote {out_path} ({len(ordered)} UDFs)")
     return 0
 

@@ -31,7 +31,9 @@ for kind in catalyst java_udf rust; do
   echo "##### $kind: fill #####"
   "$PYTHON" -u examples/fill_targets.py --target "$kind" --out "$DIR/$kind.sqlite" "$@" || { echo "$kind fill failed"; FAILED=1; }
   echo "##### $kind: bench #####"
-  "$PYTHON" -u examples/bench_catalog.py --sqlite "$DIR/$kind.sqlite" --csv "$DIR/${kind}_bench.csv" \
+  rm -f "$DIR/${kind}_bench.csv"
+  "$PYTHON" -u examples/bench_catalog.py --strict-comet \
+    --sqlite "$DIR/$kind.sqlite" --csv "$DIR/${kind}_bench.csv" \
     || { echo "$kind bench failed"; FAILED=1; }
 done
 # A partial (--only) or failed run must not replace the committed doc.

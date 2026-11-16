@@ -246,6 +246,29 @@ def test_dump_targets_shows_each_kind_and_marks_backend_errors_unavailable(spark
     assert "**Rust (coco)**: unavailable: BackendError: timed out" in section
 
 
+def test_empty_target_catalog_preserves_existing_document(spark, tmp_path):
+    targets = tmp_path / "targets"
+    targets.mkdir()
+    SqliteCatalog(targets / "catalyst.sqlite").close()
+    out = tmp_path / "dump.md"
+    out.write_text("existing document", encoding="utf-8")
+    assert _load_dump_module().dump_targets(spark, str(targets), str(out), "coco") == 1
+    assert out.read_text(encoding="utf-8") == "existing document"
+
+
+def test_failed_write_preserves_existing_document(tmp_path, monkeypatch):
+    out = tmp_path / "dump.md"
+    out.write_text("existing document", encoding="utf-8")
+
+    def failed_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", failed_write)
+    with pytest.raises(OSError, match="disk full"):
+        _load_dump_module()._write_doc(str(out), ["replacement"])
+    assert out.read_text(encoding="utf-8") == "existing document"
+
+
 def test_perf_lines_unit(tmp_path):
     micro = tmp_path / "micro.csv"
     micro.write_text(MICRO_CSV_HEADER + "\n" + MICRO_CSV_ROWS, encoding="utf-8")
