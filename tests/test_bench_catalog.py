@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -16,16 +17,77 @@ import pytest
 
 pytest.importorskip("pyspark")
 
-from pyspark.sql.types import LongType  # noqa: E402
+from pyspark.sql.types import DoubleType, LongType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
-from ai_udf_transpile import enable, shutdown  # noqa: E402
+from ai_udf_transpile import (  # noqa: E402
+    enable,
+    shutdown,
+)
 from ai_udf_transpile.backends.fake import PLUS_ONE_RS, always_decline, plus_one  # noqa: E402
-from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
+from ai_udf_transpile.targets import TranspileResult  # noqa: E402
+from ai_udf_transpile.transpiler import _pin_session, get_catalog  # noqa: E402
 
 pytestmark = pytest.mark.spark
 
 BENCH = Path(__file__).resolve().parents[1] / "examples" / "bench_catalog.py"
+
+
+def parse_number(text: str) -> float:
+    return float(text)
+
+
+def test_strict_comet_allows_a_sample_on_which_both_arms_raise(spark, sqlite_path, tmp_path):
+    jar = os.environ.get("AI_UDF_TRANSPILE_TEST_COMET_JAR", "")
+    if not jar or not Path(jar).is_file() or not shutil.which("cargo"):
+        pytest.skip("needs Comet and cargo")
+    session = spark.newSession()
+    enable(session, sqlite_path=sqlite_path, inline_worker=False)
+    try:
+        _pin_session(session)
+        session.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+        UserDefinedFunction(parse_number, DoubleType())
+        catalog = get_catalog()
+        key = catalog._conn.execute("SELECT udf_key FROM cache").fetchone()[0]
+        assert catalog.claim(key, "coco")
+        catalog.mark_success(
+            key,
+            TranspileResult(
+                kind="rust",
+                rust_source=(
+                    "pub fn udf(x: Option<&str>) -> Result<Option<f64>, String> { "
+                    "x.map(|s| s.parse::<f64>()).transpose().map_err(|e| e.to_string()) }"
+                ),
+            ),
+            origin="coco",
+        )
+    finally:
+        shutdown()
+        _pin_session(spark)
+    out = tmp_path / "bench.csv"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(BENCH),
+            "--sqlite",
+            sqlite_path,
+            "--rows",
+            "10",
+            "--rounds",
+            "1",
+            "--csv",
+            str(out),
+            "--strict-comet",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env={**os.environ, "AI_UDF_TRANSPILE_COMET_JAR": jar},
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    row = next(csv.DictReader(out.open()))
+    assert row["python_rows_per_second"] == row["transpiled_rows_per_second"] == ""
+    assert "neither arm runs on the sample" in proc.stdout
 
 
 def _settled(catalog, statuses=("success", "failed"), timeout=60) -> None:

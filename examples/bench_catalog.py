@@ -293,8 +293,10 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
                     f"{name:24} {prefix}={entry[f'{prefix}_rows_per_second']:>10}"
                     f" ({entry[f'{prefix}_speedup_vs_python'] or '-'}x vs python, Comet native)"
                 )
-            elif rust:
+            elif rust and row.udf_key in py_secs:
                 rust_failures.append(name)
+            elif rust:
+                print(f"{name}: neither arm runs on the sample; not benched")
         if args.strict_comet and rust_failures:
             raise RuntimeError(f"Rust benchmarks failed for: {', '.join(rust_failures)}")
     finally:
