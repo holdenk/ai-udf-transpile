@@ -2,7 +2,7 @@
 """Fallback-chain backend: sub-backends in order, first candidate wins.
 
 When ``backend="ensemble"`` the worker tries each configured sub-backend
-(coco, cursor, ...) on the same UDF until one produces a rewrite.  A
+(coco, claude, ...) on the same UDF until one produces a rewrite.  A
 decline falls through to the next sub-backend; so does a transient error
 (auth, rate limit, crash) -- later sub-backends never run once one
 answers.  All declined => BackendDecline (the models saw it and said no);

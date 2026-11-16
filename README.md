@@ -208,7 +208,7 @@ source — an honest stand-in for "the model only has the bytecode".
 `backend=ensemble` is a fallback chain: each configured sub-backend gets the
 UDF until one produces a rewrite; a decline or a transient error (auth, rate
 limit, crash) falls through to the next, and later sub-backends never run
-once one answers. Default chain `coco,cursor` -- CoCo answers, cursor picks
+once one answers. Default chain `coco,claude` -- CoCo answers, Claude picks
 up the rows CoCo cannot. Configure it with
 `spark.sql.experimental.aiUdfTranspile.ensembleBackends`:
 

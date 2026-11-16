@@ -87,7 +87,7 @@ DEFAULTS: dict[str, str] = {
     BINARY_CLAUDE: "claude",
     # first available binary on PATH wins when backend=auto
     AUTO_BACKEND_PRIORITY: "coco,pi,claude,codex,cursor",
-    ENSEMBLE_BACKENDS: "coco,cursor",
+    ENSEMBLE_BACKENDS: "coco,claude",
     MAX_EXAMPLES: "20",
     AI_REPRESENTATION: "source",
     PARTY_ON_STRINGS: "false",

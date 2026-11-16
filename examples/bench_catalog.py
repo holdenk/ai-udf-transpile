@@ -8,9 +8,9 @@ for all of it.
   python examples/bench_catalog.py --sqlite target/examples_transpiled.sqlite
   python examples/bench_catalog.py --sqlite ... --csv out.csv --rows 100000
 
-Fail-open by function: one benign sample value per input type, and any
-function whose interpreted arm raises on it (kms_encrypt, ...) is skipped
-loudly rather than given numbers.
+Fail-open by function: one benign sample value per input type. A function
+whose interpreted arm raises on it (kms_encrypt, ...) gets no python number
+and no speedup, said loudly; a served rewrite still gets its own rows/s.
 
 When $AI_UDF_TRANSPILE_COMET_JAR (or $COMET_JAR) points at a Comet jar, a
 second session runs the served SQL under Comet's native acceleration too,
@@ -176,6 +176,19 @@ def _plans_python(df, udf) -> bool:
         return False  # planning errors surface in _time_arm, as before
 
 
+def _session(app: str, extra: dict[str, str] | None = None) -> SparkSession:
+    builder = (
+        SparkSession.builder.master("local[*]")
+        .appName(app)
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "1")
+        .config("spark.sql.ansi.enabled", "true")
+    )
+    for key, value in (extra or {}).items():
+        builder = builder.config(key, value)
+    return builder.getOrCreate()
+
+
 def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], comet_jar: str) -> None:
     """The same served SQL, executed natively by Comet, in a fresh JVM: the jar
     must be on the driver classpath at launch, so the first session's gateway
@@ -190,24 +203,22 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
             proc.terminate()
     SparkContext._gateway = None
     SparkContext._jvm = None
-    spark = (
-        SparkSession.builder.master("local[*]")
-        .appName("ai-udf-transpile-bench-catalog-comet")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "1")
-        .config("spark.sql.ansi.enabled", "true")
-        .config("spark.jars", comet_jar)
-        .config("spark.driver.extraClassPath", comet_jar)
-        .config("spark.executor.extraClassPath", comet_jar)
-        .config("spark.plugins", "org.apache.spark.CometPlugin")
-        .config("spark.comet.enabled", "true")
-        # Without this the extension disables itself on session start.
-        .config("spark.comet.shuffle.enabled", "false")
-        .config("spark.memory.offHeap.enabled", "true")
-        .config("spark.memory.offHeap.size", "1g")
-        .getOrCreate()
+    spark = _session(
+        "ai-udf-transpile-bench-catalog-comet",
+        {
+            "spark.jars": comet_jar,
+            "spark.driver.extraClassPath": comet_jar,
+            "spark.executor.extraClassPath": comet_jar,
+            "spark.plugins": "org.apache.spark.CometPlugin",
+            "spark.comet.enabled": "true",
+            # Without this the extension disables itself on session start.
+            "spark.comet.shuffle.enabled": "false",
+            "spark.memory.offHeap.enabled": "true",
+            "spark.memory.offHeap.size": "1g",
+        },
     )
     scratch = tempfile.mkdtemp(prefix="bench-catalog-comet-")
+    rust_failures = []
     try:
         enable(spark, sqlite_path=args.sqlite, inline_worker=False)
         spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
@@ -238,10 +249,15 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
                     rustc.compile_rust(spark, row.impl_source or "", row.input_types, row.return_type)
                 except Exception as exc:
                     print(f"{name}: rust library did not build ({type(exc).__name__}: {exc})")
+                    rust_failures.append(name)
                     continue
             values = _values_for(row.input_types)
             try:
                 func = _import_function(row.source_text, name)
+            except Exception as exc:
+                print(f"{name}: import failed ({type(exc).__name__}); not benched under Comet")
+                continue
+            try:
                 # Comet has no native LocalTableScan, and an all-literal frame
                 # would constant-fold the UDF away; a parquet scan is a real leaf.
                 path = f"{scratch}/{row.udf_key}"
@@ -252,13 +268,19 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
                 df = spark.read.parquet(path)
             except Exception as exc:
                 print(f"{name}: no comet frame for sample ({type(exc).__name__})")
+                if rust:
+                    rust_failures.append(name)
                 continue
             udf = UserDefinedFunction(func, _parse_datatype_string(row.return_type))
             if not udf.transpiled:
+                if rust:
+                    rust_failures.append(name)
                 continue
             arm = df.select(udf(*[f"arg{i}" for i in range(len(row.input_types))]))
             if "CometProject" not in arm._jdf.queryExecution().executedPlan().toString():
                 print(f"{name}: comet fell back to Spark -- no native number")
+                if rust:
+                    rust_failures.append(name)
                 continue
             comet_secs = _time_arm(df, udf, args.rounds)
             if comet_secs:
@@ -271,6 +293,12 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
                     f"{name:24} {prefix}={entry[f'{prefix}_rows_per_second']:>10}"
                     f" ({entry[f'{prefix}_speedup_vs_python'] or '-'}x vs python, Comet native)"
                 )
+            elif rust and row.udf_key in py_secs:
+                rust_failures.append(name)
+            elif rust:
+                print(f"{name}: neither arm runs on the sample; not benched")
+        if args.strict_comet and rust_failures:
+            raise RuntimeError(f"Rust benchmarks failed for: {', '.join(rust_failures)}")
     finally:
         spark.conf.set(TRANSPILE_CONF, "false")
         shutdown()
@@ -284,11 +312,17 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=100_000, help="rows per function")
     parser.add_argument("--rounds", type=int, default=3, help="timed rounds (min wins)")
     parser.add_argument("--csv", help="results CSV")
+    parser.add_argument("--strict-comet", action="store_true", help="fail if Comet cannot be benchmarked")
     args = parser.parse_args()
     if not args.sqlite:
         parser.error("need --sqlite or $AI_UDF_TRANSPILE_SQLITE (the filled catalog to bench)")
     if not Path(args.sqlite).exists():
         print(f"no catalog at {args.sqlite}", file=sys.stderr)
+        return 1
+
+    comet_jar = os.environ.get("AI_UDF_TRANSPILE_COMET_JAR") or os.environ.get("COMET_JAR") or ""
+    if args.strict_comet and not Path(comet_jar).is_file():
+        print("strict Comet benchmark needs an existing $COMET_JAR", file=sys.stderr)
         return 1
 
     catalog = SqliteCatalog(Path(args.sqlite))
@@ -300,14 +334,7 @@ def main() -> int:
         print(f"{args.sqlite} has zero rows", file=sys.stderr)
         return 1
 
-    spark = (
-        SparkSession.builder.master("local[*]")
-        .appName("ai-udf-transpile-bench-catalog")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "1")
-        .config("spark.sql.ansi.enabled", "true")
-        .getOrCreate()
-    )
+    spark = _session("ai-udf-transpile-bench-catalog")
     # Cache hits only: no backend needed (and none consulted -- a CI env that
     # sets AI_UDF_TRANSPILE_BACKEND=fake must not break this, and a version
     # mismatch must not let a worker fire AI calls or write to the catalog
@@ -390,7 +417,7 @@ def main() -> int:
     shutdown()
     spark.stop()
 
-    comet_jar = os.environ.get("AI_UDF_TRANSPILE_COMET_JAR") or os.environ.get("COMET_JAR") or ""
+    comet_failed = False
     if comet_jar and not Path(comet_jar).exists():
         print(f"comet jar {comet_jar} not found; skipping comet arm", file=sys.stderr)
         comet_jar = ""
@@ -399,6 +426,7 @@ def main() -> int:
             _comet_phase(args, rows, out, py_secs, comet_jar)
         except Exception as exc:  # fail open: the python/transpiled numbers still land
             print(f"comet arm failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            comet_failed = True
 
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
@@ -409,7 +437,7 @@ def main() -> int:
 
     if _IMPORT_DIR is not None:
         shutil.rmtree(_IMPORT_DIR, ignore_errors=True)
-    return 0
+    return int(args.strict_comet and comet_failed)
 
 
 if __name__ == "__main__":

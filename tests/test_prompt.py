@@ -66,3 +66,14 @@ def test_sandbox_inlines_the_job_as_data(tmp_path):
     # The source contains a triple-backtick run, so the fence has to grow.
     assert "````" in text
     assert (root / "udf.py").read_text(encoding="utf-8").startswith("def f")
+
+
+def test_single_target_job_pins_its_kind():
+    from ai_udf_transpile.sandbox import pinned_prompt
+    from ai_udf_transpile.targets import TranspileJob
+
+    def job(*targets):
+        return TranspileJob("k", "", [], [], [], "int", targets=list(targets))
+
+    assert "ONLY a Java UDF (`OUT.java`)" in pinned_prompt(job("java_udf"))
+    assert pinned_prompt(job("catalyst", "java_udf")) == ""

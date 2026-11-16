@@ -1637,3 +1637,20 @@ def test_deeply_nested_source_gets_a_verdict_not_an_exception():
     source = _udf("Ok(x)").replace("Ok(x)", "let a = " + "vec![" * 3000 + "0" + "]" * 3000 + "; Ok(x)")
     rejected = rejected_rewrite(TranspileResult(kind=KIND_RUST, rust_source=source))
     assert rejected is None or isinstance(rejected, str)
+
+
+class _SqlBackend:
+    name = "stub"
+
+    def run(self, job, sandbox):
+        return TranspileResult(kind="catalyst", sql="_udf_param_0 + 1", model="stub-1")
+
+
+def test_worker_rejects_a_kind_the_job_did_not_ask_for(tmp_path, monkeypatch):
+    monkeypatch.setitem(conf._RUNTIME, conf.TARGETS, "java_udf")
+    cat = _pending(tmp_path)
+    verified = []
+    process_row(cat, cat.get("k"), _SqlBackend(), spark=None, verify_fn=lambda **k: verified.append(1))
+    row = cat.get("k")
+    assert row.status == "failed" and not verified
+    assert "answered catalyst, but only ['java_udf'] were asked for" in row.error

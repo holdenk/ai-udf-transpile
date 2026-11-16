@@ -39,7 +39,7 @@ BACKENDS = {
     "codex": conf.DEFAULTS[conf.BINARY_CODEX],
     "ensemble": "ensemble",
 }
-ENSEMBLE_BINARIES = (conf.DEFAULTS[conf.BINARY_COCO], conf.DEFAULTS[conf.BINARY_CURSOR])
+ENSEMBLE_BINARIES = (conf.DEFAULTS[conf.BINARY_COCO], conf.DEFAULTS[conf.BINARY_CLAUDE])
 
 
 def _skip_unavailable(backend):

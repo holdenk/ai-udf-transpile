@@ -40,6 +40,31 @@ def rust_prompt(signature: str) -> str:
     return text.replace("@@SIGNATURE@@", signature)
 
 
+_PINNED = {
+    "catalyst": "Spark SQL (`OUT.sql`)",
+    "java_udf": "a Java UDF (`OUT.java`)",
+    "rust": "a Rust row function (`OUT.rs`)",
+}
+
+
+def pinned_prompt(job: TranspileJob, gpu_kernel: Any = None) -> str:
+    """A job asked for exactly one rewrite kind says so, last, over any stated preference."""
+    if len(job.targets) != 1 or job.targets[0] not in _PINNED:
+        return ""
+    only = _PINNED[job.targets[0]]
+    kernel = (
+        "The Java UDF may also include the optional CUDA kernel (`OUT.cu`) offered above.\n"
+        if job.targets == ["java_udf"] and gpu_kernel is not None
+        else ""
+    )
+    return (
+        f"\n\n## This job accepts ONLY {only}\n\n"
+        "Ignore any stated preference for another kind, even where the UDF could be "
+        "expressed in it: any other output is rejected. If it cannot be done in the "
+        "accepted kind, print `DECLINE`.\n" + kernel
+    )
+
+
 def _types_payload(job: TranspileJob) -> dict:
     payload = {
         "param_names": job.param_names,
@@ -140,6 +165,7 @@ def write_sandbox(
 
         arg = job.param_names[0] if job.param_names else "a"
         body = body.rstrip() + "\n\n" + kernel_prompt(gpu_kernel, arg)
+    body = body.rstrip() + pinned_prompt(job, gpu_kernel)
     (root / "PROMPT.md").write_text(body.rstrip() + "\n" + job_appendix(job, inputs), encoding="utf-8")
     mode = representation(inputs)
     if mode in (SOURCE, SOURCE_PLUS_BYTECODE):
