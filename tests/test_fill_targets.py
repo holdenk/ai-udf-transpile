@@ -54,6 +54,44 @@ def test_fill_reports_infrastructure_errors(tmp_path, monkeypatch, error, exit_c
     output.close()
 
 
+@pytest.mark.spark
+def test_fill_rejects_a_rewrite_that_only_matches_null_strings(spark, tmp_path, monkeypatch):
+    from ai_udf_transpile.targets import TranspileResult
+
+    spec = importlib.util.spec_from_file_location("fill_targets", ROOT / "examples/fill_targets.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source = tmp_path / "source.sqlite"
+    out = tmp_path / "out.sqlite"
+    cat = SqliteCatalog(source)
+    cat.insert_pending(
+        udf_key="k",
+        source_text="def length(s: str) -> int:\n    return 0 if s is None else len(s)\n",
+        param_names=["s"],
+        input_types=["string"],
+        input_categories=["string"],
+        return_type="bigint",
+        spark_version=spark.version,
+        closure_fingerprint="",
+        captures={},
+    )
+    cat.close()
+    backend = SimpleNamespace(
+        name="coco", run=lambda *a: TranspileResult(kind="catalyst", sql="0", model="stub")
+    )
+    monkeypatch.setattr(module, "_session", lambda *a: spark)
+    monkeypatch.setattr(spark, "stop", lambda: None)
+    monkeypatch.setattr(module, "get_backend", lambda **k: backend)
+    monkeypatch.setattr(
+        sys, "argv", ["fill_targets.py", "--target", "catalyst", "--source", str(source), "--out", str(out)]
+    )
+    assert module.main() == 0
+    cat = SqliteCatalog(out)
+    row = cat.get("k")
+    assert row.status == "failed" and "mismatch" in row.error
+    cat.close()
+
+
 def test_regeneration_propagates_dump_failure(tmp_path):
     spark = tmp_path / "spark"
     (spark / "python/lib").mkdir(parents=True)

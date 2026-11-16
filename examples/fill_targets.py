@@ -95,6 +95,7 @@ def main() -> int:
     spark = _session(f"ai-udf-transpile-fill-{args.target}", extra)
     catalog = enable(spark, sqlite_path=str(out), inline_worker=False)
     conf.set_value(conf.TARGETS, args.target, spark)
+    conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
     conf.set_value(
         conf.INPUT_CATEGORIES, ",".join(sorted({c for r in rows for c in r.input_categories})), spark
     )
