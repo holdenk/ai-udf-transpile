@@ -393,6 +393,10 @@ fallback; until then this target trades the plugin's safety for speed.
   point `rust.buildDir` at a mount every node sees at the same path (NFS,
   EFS, a shared volume in Kubernetes) and set `rust.sharedBuildDir=true`.
   Without that the guard simply never offers Rust there; nothing breaks.
+  *Future:* most clusters have HDFS, not NFS. Comet resolves the path on
+  each executor, so shipping the `.so` with `addFile` and registering a
+  relative `./lib….so` path may work without a shared mount
+  ([#16](https://github.com/holdenk/ai-udf-transpile/issues/16)).
 - A session that cannot run a cached Rust row (no Comet, `rust` not in its
   targets, a non-local master) looks it up again under a `+no-rust` twin
   key, which the worker fills with a SQL or Java rewrite only. Until that
