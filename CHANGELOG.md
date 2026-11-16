@@ -26,6 +26,28 @@ of `docs/`, so a 4.3 run and a branch-4.x run sit side by side.
 `setup_comet.sh` now accepts a binary release (no `pom.xml`) by reading
 the version from `jars/spark-core_*.jar`.
 
+### Verification: narrow-int and decimal inputs, gate tests, docs (2026-11-16)
+
+**Correct rewrites of `int` / `smallint` / `tinyint` / `decimal` UDFs no
+longer fail verification.** The Hypothesis gate drew int32 values for
+`smallint`/`tinyint` columns, ran the int64 built-ins (2^31, 2^53, ...)
+against `int` columns, and built `decimal` columns as `bigint`. Spark
+refused those rows, which read as "sql raised" while Python returned, so
+`CAST(x AS BIGINT) + 1` for an `int` input was rejected. Draws and
+built-ins now stay inside each column's range, each narrow type's own
+min/max are added as built-ins (where `int + 1` or `tinyint * tinyint`
+overflows under ANSI), and decimals are drawn exactly at `(p, s)` with
+built-in halves and extremes. Return-range checks cover the narrow ints and
+decimal precision too.
+
+New tests check the gate itself: `tests/test_property_inputs.py`
+property-tests the generators (this caught `st.decimals` drawing `-1E20`
+for `decimal(38,18)` by rounding in the 28-digit default context), and
+`tests/test_property_mutants.py` asserts that each correct rewrite
+verifies and each mutant is killed by a deterministic example. How
+verification works, and its blind spots:
+[docs/PROPERTY_TESTING.md](docs/PROPERTY_TESTING.md).
+
 ### Prefill: extract UDFs from scripts into the catalog (2026-11-13)
 
 `python -m ai_udf_transpile.prefill PATH...` parses (never imports) Python

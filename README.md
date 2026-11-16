@@ -31,7 +31,8 @@ A working experiment, not a dependency:
   not "faithful". String columns are not invented: a string may hold a
   date, JSON, or a number. Set
   `spark.sql.experimental.aiUdfTranspile.partyOnStrings` to generate
-  string values anyway. And for service-calling UDFs the gate is only as
+  string values anyway. What is generated, how rows are judged, and how
+  the gate itself is tested: [docs/PROPERTY_TESTING.md](docs/PROPERTY_TESTING.md). And for service-calling UDFs the gate is only as
   strong as the verification env: with the service unreachable, a
   NULL-guarded function (return None on NULL, call the service otherwise)
   supplies the one successful python eval the vacuous-pass guard needs,
@@ -801,6 +802,12 @@ export COMET_HOME=/path/to/datafusion-comet            # the checkout the jar wa
 export AI_UDF_TRANSPILE_TEST_COMET_JAR=/path/to/comet-spark-spark4.x_2.13-<version>.jar
 pytest tests/test_rust_target.py tests/test_rust_udf_comet.py
 ```
+
+The verifier is tested too: `tests/test_property_inputs.py` (no JVM)
+property-tests its input generators, and `tests/test_property_mutants.py`
+checks that each correct rewrite verifies and each plausible wrong one is
+rejected by a deterministic example. See
+[docs/PROPERTY_TESTING.md](docs/PROPERTY_TESTING.md#how-we-test-the-tester).
 
 CI's pytest uses `backend=fake` with a handful of annotated fixtures
 (`plus_one`, `is_none_branch`, `both_positive`, `greet`). Live

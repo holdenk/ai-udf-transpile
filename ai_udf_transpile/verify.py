@@ -1201,6 +1201,83 @@ def load_python_udf(
     return callables[-1]
 
 
+# Value range of each integral input type. Draws and built-in examples stay
+# inside it: a value the column cannot hold is not an input the UDF can ever
+# see, and createDataFrame rejects it -- which used to surface as "sql
+# raised" and reject every rewrite of an int / smallint / tinyint UDF.
+_INT_INPUT_RANGES = {
+    "tinyint": (-(2**7), 2**7 - 1),
+    "byte": (-(2**7), 2**7 - 1),
+    "smallint": (-(2**15), 2**15 - 1),
+    "short": (-(2**15), 2**15 - 1),
+    "int": (-(2**31), 2**31 - 1),
+    "integer": (-(2**31), 2**31 - 1),
+    "bigint": (-(2**63), 2**63 - 1),
+    "long": (-(2**63), 2**63 - 1),
+}
+
+_DECIMAL_TYPE = re.compile(r"^decimal\s*(?:\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?$")
+
+
+def _decimal_shape(spark_type: str) -> Optional[tuple[int, int]]:
+    """(precision, scale) of a decimal type spelling; Spark's (10, 0) when bare."""
+    m = _DECIMAL_TYPE.match(spark_type.strip().lower())
+    if not m:
+        return None
+    precision = int(m.group(1)) if m.group(1) else 10
+    scale = int(m.group(2)) if m.group(2) else 0
+    if not 1 <= precision <= 38 or scale > precision:
+        return None
+    return precision, scale
+
+
+def _decimal_bound(precision: int, scale: int):
+    """Largest magnitude a decimal(precision, scale) column holds."""
+    from decimal import Decimal
+
+    # Built from a string: exact at any precision. Arithmetic would round in
+    # the default 28-digit context and overshoot decimal(38, s).
+    return Decimal(f"{10**precision - 1}E-{scale}")
+
+
+def _int_examples_for(stype: str) -> list[int]:
+    """Built-in integers that fit the input column, plus its own edges."""
+    from ai_udf_transpile.sampling import BUILTIN_INT_EXAMPLES
+
+    lo, hi = _INT_INPUT_RANGES[stype]
+    examples = [n for n in BUILTIN_INT_EXAMPLES if lo <= n <= hi]
+    # Each narrow type's own edges: where a rewrite's arithmetic overflows
+    # the input type (ANSI int + 1) but python's unbounded int does not.
+    for edge in (lo, hi):
+        if edge not in examples:
+            examples.append(edge)
+    return examples
+
+
+def _decimal_examples_for(stype: str) -> list:
+    """Built-in decimals that fit the column exactly: signs, halves (banker's
+    rounding), and the type's own extremes."""
+    from decimal import Decimal, localcontext
+
+    shape = _decimal_shape(stype)
+    if shape is None:
+        return []
+    precision, scale = shape
+    bound = _decimal_bound(precision, scale)
+    quantum = Decimal(f"1E-{scale}")
+    out: list = []
+    with localcontext() as ctx:
+        ctx.prec = 60  # past decimal(38, s); the default 28 cannot quantize there
+        for text in ("0", "1", "-1", "0.5", "-0.5", "2.5", "-2.5", "0.01", "-0.01"):
+            value = Decimal(text)
+            exact = value.quantize(quantum)
+            if exact != value or exact.copy_abs() > bound:
+                continue  # not representable at this scale / precision
+            out.append(exact)
+    out.extend([bound, bound.copy_negate()])
+    return list(dict.fromkeys(out))
+
+
 def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
     from hypothesis import strategies as st
 
@@ -1210,10 +1287,26 @@ def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
         # diverges (the prompt's own floor(x / y) trick); int32-only draws
         # never differentially test it.
         return st.one_of(st.none(), st.integers(min_value=-(2**63), max_value=2**63 - 1))
-    if t in {"int", "integer", "smallint", "tinyint", "byte", "short"}:
-        return st.one_of(st.none(), st.integers(min_value=-(2**31), max_value=2**31 - 1))
+    if t in _INT_INPUT_RANGES:
+        lo, hi = _INT_INPUT_RANGES[t]
+        return st.one_of(st.none(), st.integers(min_value=lo, max_value=hi))
     if t.startswith("decimal"):
-        return st.one_of(st.none(), st.decimals(allow_nan=False, allow_infinity=False, places=4))
+        shape = _decimal_shape(t)
+        if shape is None:
+            raise VerifyFailed(f"unsupported input type for verify: {spark_type}")
+        precision, scale = shape
+        from decimal import Decimal
+
+        # An unscaled integer shifted by the scale: every draw is exactly
+        # representable in the column, so python and sql see the same value,
+        # and integers() biases toward the 0 / +-max edges. st.decimals is
+        # not used: it rounds its bounds in the 28-digit default context and
+        # draws -1E20 for decimal(38,18), which the column cannot hold.
+        unscaled = 10**precision - 1
+        return st.one_of(
+            st.none(),
+            st.integers(min_value=-unscaled, max_value=unscaled).map(lambda n: Decimal(f"{n}E-{scale}")),
+        )
     if t in {"double", "float"}:
         return st.one_of(
             st.none(),
@@ -1319,6 +1412,11 @@ def _spark_type(simple: str):
     if t.startswith("map<") and t.endswith(">"):
         key_t, _, val_t = t[4:-1].partition(",")
         return MapType(_spark_type(key_t), _spark_type(val_t))
+    shape = _decimal_shape(t)
+    if shape is not None:
+        from pyspark.sql.types import DecimalType
+
+        return DecimalType(*shape)
     if t.startswith("array<") and t.endswith(">"):
         from pyspark.sql.types import ArrayType
 
@@ -1346,7 +1444,7 @@ def _spark_type(simple: str):
         "boolean": BooleanType(),
         "bool": BooleanType(),
         "binary": BinaryType(),
-    }.get(t, LongType() if t.startswith("decimal") else StringType())
+    }.get(t, StringType())
 
 
 # One Spark job per example dominates verify time. A hundred rows in one
@@ -1649,10 +1747,7 @@ def _rust_udf_expr(
     return rustc.call_expr(compiled.name, input_types)
 
 
-_INT_RETURN_RANGES = {
-    "int": (-(2**31), 2**31 - 1),
-    "bigint": (-(2**63), 2**63 - 1),
-}
+_INT_RETURN_RANGES = _INT_INPUT_RANGES
 
 
 def _representable(value: Any, return_type: str) -> bool:
@@ -1663,9 +1758,21 @@ def _representable(value: Any, return_type: str) -> bool:
     column can hold), so the value is out of contract: the sql side may do
     anything there, including raise ANSI overflow on the final cast.
     """
-    rng = _INT_RETURN_RANGES.get(return_type)
+    t = return_type.strip().lower()
+    rng = _INT_RETURN_RANGES.get(t)
     if rng is not None and isinstance(value, int) and not isinstance(value, bool):
         return rng[0] <= value <= rng[1]
+    shape = _decimal_shape(t)
+    if shape is not None:
+        from decimal import Decimal, InvalidOperation
+
+        if isinstance(value, (int, Decimal)) and not isinstance(value, bool):
+            try:
+                # Spark rounds the scale (HALF_UP) and fails or nulls on
+                # integer digits past precision - scale.
+                return Decimal(value).copy_abs() < Decimal(10 ** (shape[0] - shape[1]))
+            except (InvalidOperation, ValueError):
+                return False
     return True
 
 
@@ -1845,7 +1952,6 @@ def hypothesis_check(
             BUILTIN_ARRAY_EXAMPLES,
             BUILTIN_BOOL_EXAMPLES,
             BUILTIN_DOUBLE_EXAMPLES,
-            BUILTIN_INT_EXAMPLES,
             BUILTIN_MAP_EXAMPLES,
             BUILTIN_NESTED_ARRAY_EXAMPLES,
             BUILTIN_STRING_EXAMPLES,
@@ -1867,9 +1973,12 @@ def hypothesis_check(
             if stype == "string" and party_on_strings:
                 for text in BUILTIN_STRING_EXAMPLES:
                     examples.append(tuple(text if j == i else None for j in range(arity)))
-            elif stype in {"bigint", "long", "int", "integer", "smallint", "tinyint"}:
-                for n in BUILTIN_INT_EXAMPLES:
+            elif stype in _INT_INPUT_RANGES:
+                for n in _int_examples_for(stype):
                     examples.append(tuple(n if j == i else None for j in range(arity)))
+            elif stype.startswith("decimal"):
+                for d in _decimal_examples_for(stype):
+                    examples.append(tuple(d if j == i else None for j in range(arity)))
             elif stype in {"double", "float"}:
                 for n in BUILTIN_DOUBLE_EXAMPLES:
                     examples.append(tuple(n if j == i else None for j in range(arity)))
@@ -1904,8 +2013,10 @@ def hypothesis_check(
                 stype = spark_type.strip().lower()
                 if stype == "string":
                     per_param.append(list(CROSS_STRING_EXAMPLES) if party_on_strings else [None])
-                elif stype in {"bigint", "long", "int", "integer", "smallint", "tinyint"}:
-                    per_param.append(list(BUILTIN_INT_EXAMPLES))
+                elif stype in _INT_INPUT_RANGES:
+                    per_param.append(_int_examples_for(stype))
+                elif stype.startswith("decimal"):
+                    per_param.append(_decimal_examples_for(stype) or [None])
                 elif stype in {"double", "float"}:
                     per_param.append(list(BUILTIN_DOUBLE_EXAMPLES))
                 elif stype.startswith("map<"):
