@@ -20,7 +20,8 @@ Targets **classic Spark master** (the `AbstractTranspiler` hook landed for
 
 A working experiment, not a dependency:
 
-- **The hook itself is unreleased.** Targets Spark master (4.3+); Spark's
+- **The hook itself is brand new.** First released in Spark 4.3.0;
+  `branch-4.x` and master carry fixes and wider static coverage. Spark's
   ANSI path skips array-return UDFs before the `ai` transpiler ever runs
   (SPARK-55206).
 - **Verification is value-equality, not proof.** Hypothesis samples inputs
@@ -65,12 +66,24 @@ A working experiment, not a dependency:
 
 ```bash
 pip install -e ".[dev]"
-export SPARK_HOME=/path/to/spark-master   # package-only build, tests skipped
+export SPARK_HOME=/path/to/spark-4.3+     # a 4.3 release, or a package-only build of branch-4.x / master
 export PYTHONPATH="$SPARK_HOME/python:$(ls $SPARK_HOME/python/lib/py4j-*-src.zip | head -n1)"
 ```
 
-PyPI PySpark is not used for integration tests until 4.3+ is the pinned
-target; CI builds Spark from `apache/spark@master` with `-DskipTests`.
+`examples/setup_spark.sh` fetches either flavor and writes those exports
+for you: a release is the Apache binary tarball (sha512-checked, cached
+under `~/.cache/ai_udf_transpile/spark`), a git ref is a shallow clone built
+the way CI builds it, and only rebuilt when the ref moves:
+
+```bash
+examples/setup_spark.sh --spark 4.3 --write-env-file .spark-env && source .spark-env
+```
+
+```bash
+examples/setup_spark.sh --spark branch-4.x --write-env-file .spark-env && source .spark-env
+```
+
+CI still builds Spark from a pinned `apache/spark` SHA with `-DskipTests`.
 
 ## Usage
 
@@ -610,6 +623,27 @@ second command re-plots that one too:
 examples/run_demos.sh --bench --csv bench_micro.csv   # or: python examples/bench_micro.py --csv bench_micro.csv
 python examples/bench_graph.py bench_micro.csv docs/bench_perf.png
 ```
+
+To compare the released 4.3 against the tip of `branch-4.x` (where static
+coverage moves first), pass `--spark` to `run_demos.sh`. It runs
+`setup_spark.sh` first, and each run gets its own directory: the aggregate
+graph rolls up one directory, `--graph-dir` keeps the per-bench PNGs out of
+`docs/`, and a `spark.txt` beside the CSVs records the release, or the ref
+and SHA, that produced them. Catalog rows are keyed on `spark.version`, so
+the two runs can share one `AI_UDF_TRANSPILE_SQLITE` without serving each
+other's rewrites.
+
+```bash
+examples/run_demos.sh --spark 4.3 --all-benches --csv questionable_benchmark_results/spark-4.3/micro.csv --graph-dir questionable_benchmark_results/spark-4.3
+```
+
+```bash
+examples/run_demos.sh --spark branch-4.x --all-benches --csv questionable_benchmark_results/branch-4.x/micro.csv --graph-dir questionable_benchmark_results/branch-4.x
+```
+
+A released Spark has no `pom.xml`; `setup_comet.sh` reads the version and
+Scala binary from its `jars/spark-core_*.jar` instead, so `--rust-accel`
+works against either flavor.
 
 The static-path benches get the same graphs — `bench_graph.py` sniffs the
 CSV schema, so the `bench_bytecode_vs_static.py` table (python, built-in

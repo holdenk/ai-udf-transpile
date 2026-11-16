@@ -15,6 +15,15 @@
 #   examples/run_demos.sh --dump                  # + dump $AI_UDF_TRANSPILE_SQLITE to docs/EXAMPLES_TRANSPILED.md
 #   examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
 #
+# Which Spark: $SPARK_HOME (default ~/spark), or --spark to fetch/build one
+# first via examples/setup_spark.sh -- a release (4.3: the Apache binary
+# tarball) or a git ref (branch-4.x, master, a SHA: built from source):
+#   examples/run_demos.sh --spark 4.3 --all-benches --csv questionable_benchmark_results/spark-4.3/micro.csv --graph-dir questionable_benchmark_results/spark-4.3
+#   examples/run_demos.sh --spark branch-4.x --all-benches --csv questionable_benchmark_results/branch-4.x/micro.csv --graph-dir questionable_benchmark_results/branch-4.x
+# Give each Spark its own --csv directory: the aggregate graph rolls up a
+# directory, and a spark.txt there records what ran. --graph-dir (default
+# docs/) is where the per-bench PNGs go.
+#
 # Never the fake backend: that is a test fixture. examples/regen_examples_doc.sh
 # is the two-pass CoCo run that regenerates the doc.
 #
@@ -23,35 +32,6 @@ set -u -o pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-
-SPARK_HOME="${SPARK_HOME:-$HOME/spark}"
-if [ ! -f "$SPARK_HOME/python/pyspark/sql/transpile.py" ]; then
-  echo "error: $SPARK_HOME has no transpile surface; set SPARK_HOME to a packaged Spark master" >&2
-  exit 1
-fi
-export SPARK_HOME
-
-# py4j ships as a versioned zip; glob it instead of pinning a version.
-PY4J_ZIP="$(ls "$SPARK_HOME"/python/lib/py4j-*-src.zip 2>/dev/null | head -n1)"
-if [ -z "$PY4J_ZIP" ]; then
-  echo "error: no py4j-*-src.zip under $SPARK_HOME/python/lib (need a package build)" >&2
-  exit 1
-fi
-export PYTHONPATH="$SPARK_HOME/python:$PY4J_ZIP${PYTHONPATH:+:$PYTHONPATH}"
-
-# Workers must run the driver's interpreter (cloudpickle shares bytecode).
-PYTHON="${PYTHON:-$REPO_ROOT/.venv/bin/python}"
-if [ ! -x "$PYTHON" ]; then
-  echo "error: $PYTHON not executable; set PYTHON to an interpreter with the dev deps" >&2
-  exit 1
-fi
-export PYSPARK_PYTHON="$PYTHON"
-export PYSPARK_DRIVER_PYTHON="$PYTHON"
-
-# This box exports AWS creds; their mere presence makes Spark resolve the
-# local hostname, which fails here. Genuinely unset -- empty is not enough.
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-export SPARK_LOCAL_IP=127.0.0.1 SPARK_LOCAL_HOSTNAME=localhost
 
 LIVE=0
 BENCH=0
@@ -72,6 +52,8 @@ COMET_TIMING_CSV=""
 RUST_ACCEL=0
 RUST_PRESET="comet"
 RUST_CONF=()
+SPARK_SPEC=""
+GRAPH_DIR="docs"
 while [ $# -gt 0 ]; do
   case "$1" in
     --live) LIVE=1 ;;
@@ -90,6 +72,16 @@ while [ $# -gt 0 ]; do
       BENCH_ALL=1
       ;;
     --dump) DUMP=1 ;;
+    --spark)
+      [ $# -ge 2 ] || { echo "error: --spark needs a release (4.3) or git ref (branch-4.x)" >&2; exit 2; }
+      SPARK_SPEC="$2"
+      shift
+      ;;
+    --graph-dir)
+      [ $# -ge 2 ] || { echo "error: --graph-dir needs a path" >&2; exit 2; }
+      GRAPH_DIR="$2"
+      shift
+      ;;
     # Passed through to bench_micro.py; implies --bench (only the bench reads it).
     --csv)
       [ $# -ge 2 ] || { echo "error: --csv needs a path" >&2; exit 2; }
@@ -131,6 +123,57 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+SPARK_LABEL=""
+if [ -n "$SPARK_SPEC" ]; then
+  SPARK_HOME="$(examples/setup_spark.sh --spark "$SPARK_SPEC" --print-home)" || {
+    echo "error: could not set up Spark '$SPARK_SPEC'" >&2
+    exit 1
+  }
+  SPARK_LABEL="$SPARK_SPEC"
+fi
+SPARK_HOME="${SPARK_HOME:-$HOME/spark}"
+if [ ! -f "$SPARK_HOME/python/pyspark/sql/transpile.py" ]; then
+  echo "error: $SPARK_HOME has no transpile surface; set SPARK_HOME to a Spark 4.3+ (or pass --spark 4.3 / --spark branch-4.x)" >&2
+  exit 1
+fi
+export SPARK_HOME
+
+# py4j ships as a versioned zip; glob it instead of pinning a version.
+PY4J_ZIP="$(ls "$SPARK_HOME"/python/lib/py4j-*-src.zip 2>/dev/null | head -n1)"
+if [ -z "$PY4J_ZIP" ]; then
+  echo "error: no py4j-*-src.zip under $SPARK_HOME/python/lib (need a package build or a release)" >&2
+  exit 1
+fi
+export PYTHONPATH="$SPARK_HOME/python:$PY4J_ZIP${PYTHONPATH:+:$PYTHONPATH}"
+
+# Workers must run the driver's interpreter (cloudpickle shares bytecode).
+PYTHON="${PYTHON:-$REPO_ROOT/.venv/bin/python}"
+if [ ! -x "$PYTHON" ]; then
+  echo "error: $PYTHON not executable; set PYTHON to an interpreter with the dev deps" >&2
+  exit 1
+fi
+export PYSPARK_PYTHON="$PYTHON"
+export PYSPARK_DRIVER_PYTHON="$PYTHON"
+
+# This box exports AWS creds; their mere presence makes Spark resolve the
+# local hostname, which fails here. Genuinely unset -- empty is not enough.
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+export SPARK_LOCAL_IP=127.0.0.1 SPARK_LOCAL_HOSTNAME=localhost
+
+# What the benches ran against: the release line, or ref + SHA for a build.
+SPARK_DESC="$SPARK_HOME"
+if [ -f "$SPARK_HOME/RELEASE" ]; then
+  SPARK_DESC="$(head -n1 "$SPARK_HOME/RELEASE") [$SPARK_HOME]"
+elif [ -d "$SPARK_HOME/.git" ]; then
+  _ref="${SPARK_LABEL:-$(git -C "$SPARK_HOME" rev-parse --abbrev-ref HEAD 2>/dev/null)}"
+  SPARK_DESC="$_ref @ $(git -C "$SPARK_HOME" rev-parse HEAD 2>/dev/null) [$SPARK_HOME]"
+fi
+echo "Spark: $SPARK_DESC"
+if [ -n "$CSV" ]; then
+  mkdir -p "$(dirname "$CSV")"
+  echo "$SPARK_DESC" >"$(dirname "$CSV")/spark.txt"
+fi
 
 # All-bench runs keep plain and Comet micro results in separate CSVs.
 if [ "$ALL_BENCHES" -eq 1 ] && [ "$RUST_ACCEL" -eq 0 ] \
@@ -242,11 +285,12 @@ if [ "$BENCH_ALL" -eq 1 ]; then
 fi
 
 if [ "$ALL_BENCHES" -eq 1 ] && [ -n "$CSV" ]; then
-  [ -f "$CSV" ] && run_demo "graph: micro" examples/bench_graph.py "$CSV" docs/bench_perf.png
+  mkdir -p "$GRAPH_DIR"
+  [ -f "$CSV" ] && run_demo "graph: micro" examples/bench_graph.py "$CSV" "$GRAPH_DIR/bench_perf.png"
   if [ "$RUST_ACCEL" -eq 1 ] && [ "$RUST_PRESET" = "comet" ] && [ -f "$MICRO_COMET_CSV" ]; then
-    run_demo "graph: micro (comet)" examples/bench_graph.py "$MICRO_COMET_CSV" docs/bench_perf_comet.png
+    run_demo "graph: micro (comet)" examples/bench_graph.py "$MICRO_COMET_CSV" "$GRAPH_DIR/bench_perf_comet.png"
   fi
-  [ -f "$BYTECODE_CSV" ] && run_demo "graph: bytecode" examples/bench_graph.py "$BYTECODE_CSV" docs/bench_bytecode.png
+  [ -f "$BYTECODE_CSV" ] && run_demo "graph: bytecode" examples/bench_graph.py "$BYTECODE_CSV" "$GRAPH_DIR/bench_bytecode.png"
   run_demo "graph: aggregate" examples/bench_graph_aggregate.py "$(dirname "$CSV")" --png "$(dirname "$CSV")/bench_aggregate.png"
 fi
 
