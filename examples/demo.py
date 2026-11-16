@@ -281,6 +281,8 @@ def main() -> int:
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     # greet/upper/zfill raise on NULL, and those parameters are text.
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
+    # Opt in to real-row sampling (off by default) for the sampling section below.
+    conf.set_value(conf.SAMPLING, "true", spark)
 
     print("=== WORKING CASES (Hypothesis-verified) ===")
     df = spark.createDataFrame([(1,), (41,), (None,)], ["x"])

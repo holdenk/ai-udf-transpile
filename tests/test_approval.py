@@ -304,6 +304,40 @@ def test_cli_list(tmp_path):
     assert "concat" in text.lower() or "_udf_param_0" in text
 
 
+def test_sampling_is_off_by_default():
+    assert conf.DEFAULTS[conf.SAMPLING] == "false"
+
+
+def test_cli_calls_out_missing_samples(tmp_path):
+    path, keys = _parked(tmp_path)
+    out = io.StringIO()
+    assert approve.main(["--sqlite-path", path, "--list"], out=out) == 0
+    text = out.getvalue()
+    assert f"warning: {len(keys)} of {len(keys)} rewrite(s) have no sampled real inputs" in text
+    assert text.count("NO REAL INPUT ROWS SAMPLED") == len(keys)
+    assert "aiUdfTranspile.sampling=true" in text
+
+
+def test_cli_shows_samples_instead_of_warning(tmp_path):
+    path, keys = _parked(tmp_path, n=1)
+    cat = SqliteCatalog(path)
+    cat.record_samples(keys[0], [["bo"]])
+    cat.close()
+    out = io.StringIO()
+    assert approve.main(["--sqlite-path", path, "--list"], out=out) == 0
+    text = out.getvalue()
+    assert "NO REAL INPUT ROWS SAMPLED" not in text
+    assert "warning:" not in text
+    assert "['bo']" in text
+
+
+def test_no_samples_warning_skips_unsampleable_types():
+    assert not approve._sampleable(["bigint", "double"])
+    assert approve._sampleable(["bigint", "map<string,string>"])
+    assert approve._sampleable(["array<string>"])
+    assert approve._sampleable(["timestamp"])
+
+
 def test_cli_approve_and_reject_by_prefix(tmp_path):
     path, keys = _parked(tmp_path)
     out = io.StringIO()

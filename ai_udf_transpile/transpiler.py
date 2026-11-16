@@ -209,7 +209,7 @@ def _maybe_wrap_sampling(spark: Any, key: str, in_cats: list[str]) -> None:
     if spark is None or not ({"string", "map", "timestamp", "array"} & set(in_cats)):
         return
     try:
-        if not conf.get_bool(conf.SAMPLING, spark, True):
+        if not conf.get_bool(conf.SAMPLING, spark, conf.DEFAULTS[conf.SAMPLING] == "true"):
             return
         if conf.get_value(conf.CATALOG, spark, conf.DEFAULTS[conf.CATALOG]).strip().lower() != "sqlite":
             return

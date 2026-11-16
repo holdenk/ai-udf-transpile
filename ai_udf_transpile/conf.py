@@ -43,6 +43,9 @@ MODEL_CODEX = PREFIX + "model.codex"
 AUTO_BACKEND_PRIORITY = PREFIX + "autoBackendPriority"
 ENSEMBLE_BACKENDS = PREFIX + "ensembleBackends"
 INPUT_CATEGORIES = PREFIX + "inputCategories"
+# Opt-in: wrap the UDF on a cache miss so executors record real argument rows
+# into the SQLite catalog for verification. Off by default because it ships
+# production values into the catalog file. See README "Real-row sampling".
 SAMPLING = PREFIX + "sampling"
 MAX_SAMPLES = PREFIX + "maxSamples"
 WRITEBACK_TABLE = PREFIX + "writebackTable"
@@ -95,7 +98,7 @@ DEFAULTS: dict[str, str] = {
     MAX_RETRIES: "3",
     FAIL_COOLDOWN: "86400",
     INPUT_CATEGORIES: "numeric,string,bool,binary",
-    SAMPLING: "true",
+    SAMPLING: "false",
     MAX_SAMPLES: "8",
     # Empty = local SQLite only. When set, verified success rows are appended
     # to this parquet/iceberg table once writebackThreshold staged rows
