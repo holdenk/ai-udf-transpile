@@ -1791,6 +1791,34 @@ def _representable(value: Any, return_type: str) -> bool:
     return True
 
 
+_MAX_EXPLICIT_EXAMPLES = 160
+
+
+def _diagonal_combos(sizes: list[int]) -> Iterator[tuple[int, ...]]:
+    """Index tuples of the product of ``range(n) for n in sizes``, lazily, in
+    ``(sum(c), c)`` order: by index sum, then lexicographically within a sum."""
+    if any(n <= 0 for n in sizes):
+        return
+    if not sizes:
+        yield ()
+        return
+    # tail_max[i]: the largest index sum positions i.. can reach.
+    tail_max = [0] * (len(sizes) + 1)
+    for i in range(len(sizes) - 1, -1, -1):
+        tail_max[i] = tail_max[i + 1] + sizes[i] - 1
+
+    def with_sum(i: int, remaining: int) -> Iterator[tuple[int, ...]]:
+        if i == len(sizes) - 1:
+            yield (remaining,)
+            return
+        for v in range(max(0, remaining - tail_max[i + 1]), min(sizes[i] - 1, remaining) + 1):
+            for tail in with_sum(i + 1, remaining - v):
+                yield (v, *tail)
+
+    for total in range(tail_max[0] + 1):
+        yield from with_sum(0, total)
+
+
 def _within_tolerance(py_value: Any, sql_value: Any, tolerance: float) -> bool:
     """Exact match, or absolute numeric distance within ``tolerance``.
 
@@ -2024,8 +2052,8 @@ def hypothesis_check(
             # 5 arrays x 5 arrays = 2500 for a 4-param UDF), so enumerate
             # diagonally (by index sum): every param's values appear within
             # the first few combos instead of being truncated lexicographically.
-            import itertools
-
+            # Generated lazily and cut at the cap: eight decimal params alone
+            # are 11**8 combos, far too many to build and sort first.
             per_param: list[list] = []
             for spark_type in input_types:
                 stype = spark_type.strip().lower()
@@ -2049,13 +2077,11 @@ def hypothesis_check(
                     per_param.append(list(BUILTIN_TIMESTAMP_EXAMPLES))
                 else:
                     per_param.append([None])
-            index_combos = sorted(
-                itertools.product(*(range(len(p)) for p in per_param)),
-                key=lambda c: (sum(c), c),
-            )
-            for combo in index_combos:
+            for combo in _diagonal_combos([len(p) for p in per_param]):
+                if len(examples) >= _MAX_EXPLICIT_EXAMPLES:
+                    break
                 examples.append(tuple(per_param[i][idx] for i, idx in enumerate(combo)))
-        return examples[:160]
+        return examples[:_MAX_EXPLICIT_EXAMPLES]
 
     check = _run
     for ex in _explicit_examples():

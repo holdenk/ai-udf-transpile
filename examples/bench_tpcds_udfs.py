@@ -374,6 +374,9 @@ def main() -> int:
     # The worker polls slowly during seeding so a pending row is never
     # claimed before its samples land.
     conf.set_value(conf.POLL_INTERVAL, "60", spark)
+    # Real-row sampling is off by default; without it these seeds record
+    # nothing and the "::" parsers have no evidence beyond the built-ins.
+    conf.set_value(conf.SAMPLING, "true", spark)
     for name, func, rtype, cols, _sql in PATTERNS:
         seed_udf = UserDefinedFunction(func, rtype)
         seed = _frame(spark, name, cols, 8)

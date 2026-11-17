@@ -302,3 +302,17 @@ def test_decimal_return_fits_only_after_rounding_to_the_scale():
     assert _representable(Decimal("1.23456"), "decimal(10,2)")  # extra scale that rounds in range
     assert not _representable(Decimal("NaN"), "decimal(10,2)")
     assert not _representable(10**400, "decimal(38,18)")
+
+
+def test_diagonal_combos_match_the_sorted_product_lazily():
+    import itertools
+
+    from ai_udf_transpile.verify import _diagonal_combos
+
+    for sizes in ([], [1], [3], [2, 3], [4, 1, 3], [3, 3, 3, 2]):
+        expected = sorted(itertools.product(*(range(n) for n in sizes)), key=lambda c: (sum(c), c))
+        assert list(_diagonal_combos(sizes)) == expected
+    assert list(_diagonal_combos([2, 0])) == []
+    # Eight 11-value params: 214M combos, but taking the first few is instant.
+    first = list(itertools.islice(_diagonal_combos([11] * 8), 160))
+    assert len(first) == 160 and first[0] == (0,) * 8
