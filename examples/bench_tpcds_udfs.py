@@ -25,14 +25,16 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pyspark.sql import SparkSession  # noqa: E402
+from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
 from pyspark.sql.types import BooleanType, DoubleType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
@@ -73,6 +75,7 @@ from ai_udf_transpile.backends.fake import (  # noqa: E402
     udfb_extractmonth,
     udfb_extractyear,
 )
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
@@ -267,7 +270,7 @@ FRAME_EXPRS: dict[str, dict[str, str]] = {
 }
 
 
-def _frame(spark, pattern: str, cols: list[tuple[str, str]], n: int):
+def _frame(spark: SparkSession, pattern: str, cols: list[tuple[str, str]], n: int) -> DataFrame:
     exprs = FRAME_EXPRS.get(pattern, {})
     base = spark.range(0, n, numPartitions=PARTITIONS).toDF("x")
     sel = []
@@ -291,13 +294,15 @@ def _substitute(sql: str, cols: list[str]) -> str:
     return sql
 
 
-def noop_seconds(df) -> float:
+def noop_seconds(df: DataFrame) -> float:
     start = time.perf_counter()
     df.write.format("noop").mode("overwrite").save()
     return time.perf_counter() - start
 
 
-def wait_for_catalog(catalog, source_text, timeout=900):
+def wait_for_catalog(
+    catalog: SqliteCatalog, source_text: str, timeout: float = 900
+) -> sqlite3.Row | tuple[Any, ...]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with catalog._lock:
@@ -332,9 +337,9 @@ def main() -> int:
     print(f"=== TPC-DS UDF BENCHMARK ({rows:,} rows, min of {args.rounds} rounds) ===\n")
 
     # Build one cached frame per distinct column signature.
-    frames: dict[tuple, object] = {}
+    frames: dict[tuple[str, tuple[tuple[str, str], ...]], DataFrame] = {}
 
-    def get_frame(cols: list[tuple[str, str]], name: str):
+    def get_frame(cols: list[tuple[str, str]], name: str) -> DataFrame:
         key = (name, tuple(cols))
         if key not in frames:
             frames[key] = _frame(spark, name, cols, rows)
@@ -369,6 +374,9 @@ def main() -> int:
     # The worker polls slowly during seeding so a pending row is never
     # claimed before its samples land.
     conf.set_value(conf.POLL_INTERVAL, "60", spark)
+    # Real-row sampling is off by default; without it these seeds record
+    # nothing and the "::" parsers have no evidence beyond the built-ins.
+    conf.set_value(conf.SAMPLING, "true", spark)
     for name, func, rtype, cols, _sql in PATTERNS:
         seed_udf = UserDefinedFunction(func, rtype)
         seed = _frame(spark, name, cols, 8)
@@ -395,7 +403,7 @@ def main() -> int:
         assert ai_udfs[name].transpiled, f"{name} did not transpile"
 
     # -- Benchmark: interleave arms so warmup is fair.
-    arms: list[tuple[str, object]] = []
+    arms: list[tuple[str, DataFrame]] = []
     for name, _func, _rtype, cols, _sql in PATTERNS:
         df = get_frame(cols, name)
         col_names = [c[0] for c in cols]

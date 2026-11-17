@@ -14,15 +14,13 @@ from ai_udf_transpile.catalog import (
     MISS,
     WAIT,
     CacheRow,
-    cooldown_active,
     dumps,
-    infra_failure,
+    failure_retry_blocked,
     iso_now,
     loads_dict,
     loads_list,
     provisional_visible,
     rejection_error,
-    retries_exhausted,
     tolerance_serves,
 )
 from ai_udf_transpile.targets import TranspileResult
@@ -184,9 +182,7 @@ class SqliteCatalog:
             if row.status in {"pending", "running"}:
                 return WAIT, row
             if row.status == "failed":
-                # Infra failures retry immediately (MAX_RETRIES still bounds);
-                # declines and bad rewrites wait out the cooldown.
-                if (cooldown_active(row, spark) and not infra_failure(row)) or retries_exhausted(row, spark):
+                if failure_retry_blocked(row, spark):
                     return WAIT, row
                 now = iso_now()
                 self._conn.execute(

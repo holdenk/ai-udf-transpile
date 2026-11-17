@@ -18,18 +18,28 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any, Callable, Optional, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pyspark.sql import SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
-from pyspark.sql.types import ArrayType, BooleanType, IntegerType, LongType, StringType  # noqa: E402
+from pyspark.sql.types import (  # noqa: E402
+    ArrayType,
+    BooleanType,
+    DataType,
+    IntegerType,
+    LongType,
+    StringType,
+)
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, register_impl, shutdown  # noqa: E402
 from ai_udf_transpile.backends import ai_backend  # noqa: E402
+from ai_udf_transpile.catalog import CacheRow, Catalog  # noqa: E402
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
-from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
+from ai_udf_transpile.transpiler import get_catalog, served_kind  # noqa: E402
 
 
 def plus_one(x: int) -> int:
@@ -143,9 +153,9 @@ def zfill3(s: str) -> str:
     return s.zfill(3)
 
 
-def backwards_java(name: str) -> str:
-    # The Java-UDF twin: same body as a catalyst reverse() would cover, but
-    # the def name maps to the java fixture -- one key, one rewrite kind.
+def backwards(name: str) -> str:
+    # SQL reverse() covers this; the demo pins the targets conf to java_udf
+    # to show the Java UDF target on the same function.
     if name is None:
         return None
     return name[::-1]
@@ -225,18 +235,30 @@ def always_decline(x: int) -> int:
 _TIMEOUTS: list[str] = []
 
 
-def gave_up(func) -> bool:
+# What served_kind() names, for the printed label.
+_KIND_LABELS = {
+    "catalyst": "Catalyst SQL",
+    "java_udf": "Java UDF",
+    "gpu_kernel": "Java UDF + CUDA",
+    "rust": "Rust UDF",
+}
+
+
+def gave_up(func: Callable[..., Any]) -> bool:
     """The backend already failed func; failed rows cool down instead of re-queueing."""
     catalog = get_catalog()
-    catalog = getattr(catalog, "_staging", catalog)  # write-back wraps the sqlite catalog
-    with catalog._lock:
-        row = catalog._conn.execute(
+    # write-back wraps the sqlite catalog
+    sqlite_catalog = cast(SqliteCatalog, getattr(catalog, "_staging", catalog))
+    with sqlite_catalog._lock:
+        row = sqlite_catalog._conn.execute(
             "SELECT status FROM cache WHERE source_text = ?", (canonical_source_from_func(func),)
         ).fetchone()
     return row is not None and row[0] == "failed"
 
 
-def wait_transpiled(desc, func, rtype, timeout=900):
+def wait_transpiled(
+    desc: str, func: Callable[..., Any], rtype: DataType, timeout: float = 900
+) -> UserDefinedFunction:
     """Poll a fresh UDF until the cache hit transpiles it; return the last UDF.
 
     A timeout is recorded so main() can exit non-zero (run_demos.sh keys on it).
@@ -251,7 +273,7 @@ def wait_transpiled(desc, func, rtype, timeout=900):
     return udf
 
 
-def wait_for_status(catalog, key, want, timeout=900):
+def wait_for_status(catalog: Catalog, key: str, want: str, timeout: float = 900) -> Optional[CacheRow]:
     deadline = time.time() + timeout
     while time.time() < deadline:
         row = catalog.get(key)
@@ -277,10 +299,12 @@ def main() -> int:
         tempfile.mkdtemp(prefix="ai-udf-demo-"), "cache.sqlite"
     )
     enable(spark, sqlite_path=sqlite, backend=ai_backend(spark), inline_worker=True)
-    catalog = get_catalog()
+    catalog = cast(SqliteCatalog, get_catalog())
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     # greet/upper/zfill raise on NULL, and those parameters are text.
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
+    # Opt in to real-row sampling (off by default) for the sampling section below.
+    conf.set_value(conf.SAMPLING, "true", spark)
 
     print("=== WORKING CASES (Hypothesis-verified) ===")
     df = spark.createDataFrame([(1,), (41,), (None,)], ["x"])
@@ -435,9 +459,14 @@ def main() -> int:
 
     print()
     print("=== JAVA UDF TARGET (compiled on the driver, Hypothesis-verified) ===")
-    bw = wait_transpiled("bw not transpiled", backwards_java, StringType())
+    conf.set_value(conf.TARGETS, "java_udf", spark)  # only a Java UDF is asked for, or accepted
+    bw = wait_transpiled("bw not transpiled", backwards, StringType())
+    conf.set_value(conf.TARGETS, conf.DEFAULTS[conf.TARGETS], spark)
     bw_rows = [r[0] for r in names.select(bw("name")).collect()]
-    print(f"backwards_java: transpiled={bool(bw.transpiled)} results={bw_rows} (Java UDF from cache)")
+    # Labeled by what was served, not by the targets conf: the cache key has
+    # no kind, so an earlier run may have left a SQL rewrite for backwards.
+    bw_kind = _KIND_LABELS.get(served_kind(bw) or "", "not served")
+    print(f"backwards: transpiled={bool(bw.transpiled)} results={bw_rows} ({bw_kind} from cache)")
 
     b = wait_transpiled("b not transpiled", both_positive, BooleanType())
     pairs = spark.createDataFrame([(1, 2), (-1, 2)], ["a", "b"])
@@ -528,6 +557,7 @@ def main() -> int:
     found = cur.fetchone()
     if found:
         row = wait_for_status(catalog, found[0], "failed")
+        assert row is not None  # found[0] was just read from the cache table
         print(
             f"always_decline: status={row.status} origin={row.origin} backend={row.backend} "
             f"error={row.error!r} (declined -> failed, cooldown applies)"
@@ -557,6 +587,7 @@ def main() -> int:
         print(f"kms_encrypt: status={prior.status} origin=human (registered by an earlier run)")
     elif found:
         row = wait_for_status(catalog, found[0], "failed")
+        assert row is not None  # found[0] was just read from the cache table
         print(
             f"kms_encrypt (boto3 KMS per row): status={row.status} origin={row.origin} "
             f"backend={row.backend} error={row.error!r} (declined -> failed, cooldown applies)"

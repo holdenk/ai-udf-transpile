@@ -133,7 +133,7 @@ def _run_dump(sqlite_path: Path, out: Path, *extra: str) -> subprocess.Completed
     )
 
 
-def test_dump_writes_all_three_paths(spark, tmp_path):
+def test_dump_writes_every_transpiled_path(spark, tmp_path):
     sqlite_path = tmp_path / "catalog.sqlite"
     _fill_catalog(sqlite_path)
     out = tmp_path / "dump.md"
@@ -143,6 +143,8 @@ def test_dump_writes_all_three_paths(spark, tmp_path):
     assert "## plus_one" in text
     assert "CAST(+(_udf_param_0, 1) AS BIGINT)" in text  # built-in static
     assert "(_udf_param_0 + 1)" in text  # bytecode -> SQL
+    assert "bytecode → Java eval" in text
+    assert "ai_udf.Bc" in text
     assert "declined: unsupported bytecode: CONTAINS_OP" in text  # has_item
     assert "java UDF" in text
     assert "public class Backwards" in text
@@ -209,13 +211,23 @@ TPCDS_CSV = (
     "common_c2f,False,1000,1000000,5000000,4000000,4.0,5.0,coco,auto\n"
     "tpcds_safe_ratio,True,1000,900000,4500000,900000,1.0,5.0,coco,auto\n"
 )
+BYTECODE_CSV = (
+    "function,static_converted,static_correct,bytecode_static_correct,java_eval_correct,"
+    "python_rows_per_second,static_rows_per_second,bytecode_static_rows_per_second,"
+    "java_eval_rows_per_second,static_speedup_vs_python,bytecode_static_speedup_vs_python,"
+    "java_eval_speedup_vs_python\n"
+    "plus_one,True,True,True,True,2000000,3500000,7000000,2500000,1.8,3.5,1.3\n"
+)
 CATALOG_CSV = (
-    "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+    "function,rows,python_rows_per_second,static_rows_per_second,static_speedup_vs_python,"
+    "bytecode_static_rows_per_second,bytecode_static_speedup_vs_python,"
+    "java_eval_rows_per_second,java_eval_speedup_vs_python,transpiled_rows_per_second,"
     "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
     "status,target_kind,backend,model\n"
-    "has_item,1000,2000000,6000000,3.0,9000000,4.5,success,catalyst,ensemble,coco/auto\n"
-    "plus_two,1000,1500000,,,,,failed,,human,\n"
-    "kms_encrypt,1000,,,,,,failed,,ensemble,coco/auto\n"
+    "has_item,1000,2000000,3000000,1.5,4000000,2.0,1000000,0.5,6000000,3.0,"
+    "9000000,4.5,success,catalyst,ensemble,coco/auto\n"
+    "plus_two,1000,1500000,2500000,1.7,,,,,,,,,failed,,human,\n"
+    "kms_encrypt,1000,,,,,,,,,,,,failed,,ensemble,coco/auto\n"
 )
 
 
@@ -278,13 +290,14 @@ def test_perf_lines_unit(tmp_path):
     assert perf["plus_one"] == {
         "top": "- **perf (micro bench)**: interpreted python 2.0M rows/s",
         "static": "3.0M rows/s (1.5x vs python)",
-        "ai": "8.0M rows/s (4.0x vs python)",
+        "bytecode": "",
+        "java_eval": "",
+        "ai": "",
+        # One function, each kind filled separately: keyed by the kind it was served as.
+        "ai:catalyst": "8.0M rows/s (4.0x vs python)",
+        "ai:java_udf": "4.0M rows/s (2.0x vs python)",
     }
-    assert perf["plus_one_java"] == {
-        "top": "- **perf (micro bench)**: interpreted python 2.0M rows/s",
-        "static": "",
-        "ai": "4.0M rows/s (2.0x vs python)",
-    }
+    assert "plus_one_java" not in perf
     # always_decline: the fallback perf is the top line's story; no rewrite was served
     assert perf["always_decline"]["top"].endswith("interpreted python 1.0M rows/s")
     assert perf["always_decline"]["static"] == ""
@@ -292,16 +305,20 @@ def test_perf_lines_unit(tmp_path):
     assert perf["common_c2f"] == {
         "top": "- **perf (tpcds bench)**: interpreted python 1.0M rows/s · native vanilla 5.0M (5.0x)",
         "static": "",
+        "bytecode": "",
+        "java_eval": "",
         "ai": "4.0M rows/s (4.0x vs python)",
     }
     assert perf["tpcds_safe_ratio"]["ai"] == ""  # declined: python fallback serves, no suffix
-    # catalog CSV: coverage bench, one row per cached function
+    # catalog CSV: every transpiled arm survives, including static on a failed AI row
     cat = tmp_path / "catalog.csv"
     cat.write_text(CATALOG_CSV, encoding="utf-8")
     perf = _load_dump_module()._perf_lines([str(cat)])
     assert perf["has_item"] == {
         "top": "- **perf (catalog bench)**: interpreted python 2.0M rows/s",
-        "static": "",
+        "static": "3.0M rows/s (1.5x vs python)",
+        "bytecode": "4.0M rows/s (2.0x vs python)",
+        "java_eval": "1.0M rows/s (0.5x vs python)",
         "ai": "6.0M rows/s (3.0x vs python) · comet 9.0M rows/s (4.5x vs python)",
     }
     # bench_fhi_udfs.py writes the same schema and names itself in a bench column
@@ -338,8 +355,9 @@ def test_perf_lines_unit(tmp_path):
     assert _load_dump_module()._perf_lines([str(arms)])["f"]["ai"] == "1.5M rows/s (1.5x vs python)"
     # python-only row (no transpiled arm served) keeps the top, no ai suffix
     assert perf["plus_two"]["ai"] == ""
+    assert perf["plus_two"]["static"] == "2.5M rows/s (1.7x vs python)"
     assert perf["plus_two"]["top"].endswith("interpreted python 1.5M rows/s")
-    # skipped function (python raises on the sample): no entry at all
+    # skipped function (no arm produced a rate): no entry at all
     assert "kms_encrypt" not in perf
     # python-skipped but transpiled-measured: the rate survives, labeled
     widg = tmp_path / "widg.csv"
@@ -353,6 +371,8 @@ def test_perf_lines_unit(tmp_path):
     assert perf["widget_name"] == {
         "top": "",
         "static": "",
+        "bytecode": "",
+        "java_eval": "",
         "ai": "885k rows/s (no python baseline)",
     }
     # a rust rewrite's number is Comet's, labeled as such, with no comet suffix
@@ -405,7 +425,7 @@ def test_perf_lines_unit(tmp_path):
     )
     perf = dump._perf_lines([str(keyed), str(micro)])
     assert dump._perf_for(perf, "plus_one", "kplus")["static"] == "3.0M rows/s (1.5x vs python)"  # micro won
-    # micro: a rust twin gets its own section key, like the java twin
+    # micro: the rust arm is keyed by kind on the function itself
     rust_micro = tmp_path / "rust_micro.csv"
     rust_micro.write_text(
         "function,kinds,regular_rows_per_second,transpiled_static_rows_per_second,"
@@ -418,12 +438,23 @@ def test_perf_lines_unit(tmp_path):
         encoding="utf-8",
     )
     perf = _load_dump_module()._perf_lines([str(rust_micro)])
-    assert perf["edit_distance_rust"]["ai"] == "2.0M rows/s (20.0x vs python, Comet native)"
-    assert "edit_distance_java" not in perf
+    assert perf["edit_distance"]["ai:rust"] == "2.0M rows/s (20.0x vs python, Comet native)"
+    assert perf["edit_distance"]["ai:catalyst"] == "9.0M rows/s (90.0x vs python)"
+    assert "ai:java_udf" not in perf["edit_distance"]
+    assert "edit_distance_rust" not in perf
     # merge precedence: later files take over per function with their deeper arms
     perf = _load_dump_module()._perf_lines([str(cat), str(micro)])
     assert perf["has_item"]["top"].endswith("interpreted python 2.0M rows/s")  # catalog-only
     assert perf["plus_one"]["static"] == "3.0M rows/s (1.5x vs python)"  # micro wins
+    # Later files replace only arms they measured; bytecode/Java eval survive micro.
+    bc = tmp_path / "bytecode.csv"
+    bc.write_text(BYTECODE_CSV, encoding="utf-8")
+    perf = _load_dump_module()._perf_lines([str(cat), str(bc), str(micro)])
+    assert perf["has_item"]["top"].endswith("interpreted python 2.0M rows/s")
+    assert perf["plus_one"]["top"].endswith("interpreted python 2.0M rows/s")
+    assert perf["plus_one"]["static"] == "3.0M rows/s (1.5x vs python)"
+    assert perf["plus_one"]["bytecode"] == "7.0M rows/s (3.5x vs python)"
+    assert perf["plus_one"]["java_eval"] == "2.5M rows/s (1.3x vs python)"
 
 
 def test_perf_lines_missing_csv_is_fatal(tmp_path):
@@ -436,8 +467,17 @@ def test_dump_writes_perf_bullets(spark, tmp_path):
     _fill_catalog(sqlite_path)
     micro = tmp_path / "micro.csv"
     micro.write_text(MICRO_CSV_HEADER + "\n" + MICRO_CSV_ROWS, encoding="utf-8")
+    bytecode = tmp_path / "bytecode.csv"
+    bytecode.write_text(BYTECODE_CSV, encoding="utf-8")
     out = tmp_path / "dump.md"
-    proc = _run_dump(sqlite_path, out, "--perf-csv", str(micro))
+    proc = _run_dump(
+        sqlite_path,
+        out,
+        "--perf-csv",
+        str(bytecode),
+        "--perf-csv",
+        str(micro),
+    )
     assert proc.returncode == 0, proc.stderr[-2000:]
     text = out.read_text(encoding="utf-8")
     plus_one = text.split("## plus_one")[1].split("## ")[0]
@@ -449,6 +489,9 @@ def test_dump_writes_perf_bullets(spark, tmp_path):
         "- **built-in static (AST)**: `Column<'CAST(+(_udf_param_0, 1) AS BIGINT)'>`"
         " — 3.0M rows/s (1.5x vs python)" in plus_one
     )
+    assert "- **bytecode → SQL**: `(_udf_param_0 + 1)` — 7.0M rows/s (3.5x vs python)" in plus_one
+    assert "bytecode → Java eval" in plus_one
+    assert " — 2.5M rows/s (1.3x vs python)" in plus_one
     assert (
         "- **AI (coco / coco-model)**: `_udf_param_0 + 1`"
         " (attempt_count=1, hypothesis_passed=True) — 8.0M rows/s (4.0x vs python)" in plus_one
@@ -459,3 +502,93 @@ def test_dump_writes_perf_bullets(spark, tmp_path):
     # not benched -> no perf anywhere
     backwards = text.split("## backwards")[1].split("## ")[0]
     assert "perf" not in backwards
+
+
+def test_micro_kind_rates_reach_both_catalog_twins(tmp_path):
+    """An only-Rust catalog CSV binds the name entry to the Rust row's key; the
+    micro bench's per-kind rates must still reach the Java twin."""
+    dump = _load_dump_module()
+    only_rust = tmp_path / "only_rust.csv"
+    only_rust.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,udf_key\n"
+        "edit_distance,1000,300000,6000000,20.0,,,success,rust,claude,m,krust\n",
+        encoding="utf-8",
+    )
+    micro = tmp_path / "micro.csv"
+    micro.write_text(
+        "function,kinds,regular_rows_per_second,transpiled_static_rows_per_second,"
+        "transpiled_ai_catalyst_rows_per_second,transpiled_ai_java_rows_per_second,"
+        "transpiled_ai_rust_rows_per_second,static_speedup_vs_regular,ai_catalyst_speedup_vs_regular,"
+        "ai_java_speedup_vs_regular,ai_rust_speedup_vs_regular,transpile_succeeded_static,"
+        "transpile_succeeded_ai_catalyst,transpile_succeeded_ai_java,transpile_succeeded_ai_rust,"
+        "ai_backend,ai_model\n"
+        "edit_distance,java+rust,100000,,,500000,2000000,,,5.0,20.0,False,False,True,True,claude,m\n",
+        encoding="utf-8",
+    )
+    perf = dump._perf_lines([str(only_rust), str(micro)])
+    twin = dump._perf_for(perf, "edit_distance", "kjava")
+    assert twin["ai:java_udf"] == "500k rows/s (5.0x vs python)"
+    assert "ai" not in twin  # the catalog's generic (Rust) rate stays bound to its own row
+    rust = dump._perf_for(perf, "edit_distance", "krust")
+    assert rust["ai"].endswith("Comet native)")
+    assert rust["ai:rust"] == "2.0M rows/s (20.0x vs python, Comet native)"
+
+
+def test_a_later_catalog_schema_csv_keeps_arms_it_did_not_measure(tmp_path):
+    dump = _load_dump_module()
+    cat = tmp_path / "catalog.csv"
+    cat.write_text(CATALOG_CSV, encoding="utf-8")
+    fhi = tmp_path / "fhi.csv"
+    fhi.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,status,target_kind,backend,model,bench\n"
+        "has_item,1000,2000000,7000000,3.5,success,catalyst,ensemble,coco/auto,fhi\n",
+        encoding="utf-8",
+    )
+    perf = dump._perf_lines([str(cat), str(fhi)])
+    assert perf["has_item"]["static"] == "3.0M rows/s (1.5x vs python)"  # catalog's, kept
+    assert perf["has_item"]["ai"].startswith("7.0M rows/s (3.5x vs python)")  # fhi's, newer
+
+
+def test_a_new_key_does_not_inherit_another_rows_ai_rate(tmp_path):
+    dump = _load_dump_module()
+    head = (
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,udf_key\n"
+    )
+    rust = tmp_path / "rust.csv"
+    rust.write_text(head + "collatz_steps,1000,300000,6000000,20.0,,,success,rust,claude,m,krust\n")
+    java = tmp_path / "java.csv"
+    java.write_text(head + "collatz_steps,1000,300000,,,,,failed,java_udf,claude,m,kjava\n")
+    perf = dump._perf_lines([str(rust), str(java)])
+    assert not dump._perf_for(perf, "collatz_steps", "kjava").get("ai")  # the Rust rate stays on krust
+    assert dump._perf_for(perf, "collatz_steps", "krust")["ai"].endswith("Comet native)")
+
+
+def test_the_comet_micro_csv_contributes_only_its_rust_arm(tmp_path):
+    dump = _load_dump_module()
+    header = (
+        "function,kinds,regular_rows_per_second,transpiled_static_rows_per_second,"
+        "transpiled_ai_catalyst_rows_per_second,transpiled_ai_java_rows_per_second,"
+        "transpiled_ai_rust_rows_per_second,static_speedup_vs_regular,ai_catalyst_speedup_vs_regular,"
+        "ai_java_speedup_vs_regular,ai_rust_speedup_vs_regular,transpile_succeeded_static,"
+        "transpile_succeeded_ai_catalyst,transpile_succeeded_ai_java,transpile_succeeded_ai_rust,"
+        "ai_backend,ai_model\n"
+    )
+    plain = tmp_path / "bench.csv"
+    plain.write_text(
+        header + "plus_one,catalyst+java,1000000,,4000000,2000000,,,4.0,2.0,,False,True,True,False,c,m\n"
+    )
+    comet = tmp_path / "bench_comet.csv"
+    comet.write_text(
+        header + "plus_one,catalyst+java+rust,900000,,9000000,8000000,5000000,"
+        ",10.0,8.9,5.6,False,True,True,True,c,m\n"
+    )
+    perf = dump._perf_lines([str(plain), str(comet)])["plus_one"]
+    assert perf["ai:catalyst"] == "4.0M rows/s (4.0x vs python)"  # plain run's, not Comet's
+    assert perf["ai:java_udf"] == "2.0M rows/s (2.0x vs python)"
+    assert perf["top"].endswith("interpreted python 1.0M rows/s")
+    assert perf["ai:rust"] == "5.0M rows/s (5.6x vs python, Comet native)"

@@ -12,15 +12,13 @@ from ai_udf_transpile.catalog import (
     MISS,
     WAIT,
     CacheRow,
-    cooldown_active,
     dumps,
-    infra_failure,
+    failure_retry_blocked,
     iso_now,
     loads_dict,
     loads_list,
     provisional_visible,
     rejection_error,
-    retries_exhausted,
     tolerance_serves,
 )
 from ai_udf_transpile.targets import TranspileResult
@@ -73,7 +71,7 @@ def _row_from_spark(rec: Any) -> CacheRow:
     as_dict = rec.asDict() if hasattr(rec, "asDict") else dict(rec)
     hyp = as_dict.get("hypothesis_passed")
     binary = as_dict.get("impl_binary")
-    if binary is not None and not isinstance(binary, (bytes, bytearray, type(None))):
+    if binary is not None and not isinstance(binary, bytes):
         binary = bytes(binary)
     return CacheRow(
         udf_key=as_dict["udf_key"],
@@ -212,9 +210,7 @@ class DeltaCatalog:
             return WAIT, row
         if row.status == "failed":
             session = spark if spark is not None else self.spark
-            # Infra failures retry immediately (MAX_RETRIES still bounds);
-            # declines and bad rewrites wait out the cooldown.
-            if (cooldown_active(row, session) and not infra_failure(row)) or retries_exhausted(row, session):
+            if failure_retry_blocked(row, session):
                 return WAIT, row
             now = iso_now()
             self.spark.sql(

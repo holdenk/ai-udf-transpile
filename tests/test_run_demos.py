@@ -8,12 +8,200 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 
 
 def test_scripts_parse():
-    for script in ("run_demos.sh", "regen_examples_doc.sh"):
+    for script in ("run_demos.sh", "regen_examples_doc.sh", "setup_spark.sh", "setup_comet.sh"):
         subprocess.run(["bash", "-n", str(EXAMPLES / script)], check=True)
+
+
+def _fake_release(cache, version="4.3.0"):
+    """An unpacked binary release, as setup_spark.sh leaves it in its cache."""
+    home = cache / f"spark-{version}-bin-hadoop3"
+    (home / "python" / "pyspark" / "sql").mkdir(parents=True)
+    (home / "python" / "pyspark" / "sql" / "transpile.py").write_text("")
+    (home / "python" / "lib").mkdir()
+    (home / "python" / "lib" / "py4j-test-src.zip").write_bytes(b"")
+    (home / "jars").mkdir()
+    (home / "jars" / f"spark-core_2.13-{version}.jar").write_bytes(b"PK")
+    (home / "RELEASE").write_text(f"Spark {version} (git revision abc) built for Hadoop 3\n")
+    return home
+
+
+def _logging_python(tmp_path):
+    python = tmp_path / "python"
+    python.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "$RUN_LOG"\n')
+    python.chmod(0o755)
+    return python
+
+
+def test_setup_spark_reuses_a_cached_release(tmp_path):
+    home = _fake_release(tmp_path)
+    env_file = tmp_path / "spark.env"
+    proc = subprocess.run(
+        [
+            str(EXAMPLES / "setup_spark.sh"),
+            "--spark",
+            "4.3.0",
+            "--cache-dir",
+            str(tmp_path),
+            "--write-env-file",
+            str(env_file),
+            "--print-home",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(home)
+    exports = env_file.read_text()
+    assert f'SPARK_HOME="{home}"' in exports
+    assert "py4j-test-src.zip" in exports
+
+
+def _fake_spark_repo(tmp_path, mvn_body):
+    """A local 'apache/spark' whose build/mvn is a stub, so the ref path runs offline."""
+    repo = tmp_path / "upstream"
+    (repo / "python" / "pyspark" / "sql").mkdir(parents=True)
+    (repo / "python" / "pyspark" / "sql" / "transpile.py").write_text("")
+    (repo / "python" / "lib").mkdir()
+    (repo / "python" / "lib" / "py4j-test-src.zip").write_bytes(b"")
+    (repo / "build").mkdir()
+    mvn = repo / "build" / "mvn"
+    mvn.write_text("#!/usr/bin/env bash\n" + mvn_body)
+    mvn.chmod(0o755)
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run(["git", "init", "-q", "-b", "branch-4.x", str(repo)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "init"], check=True)
+    return repo
+
+
+def _setup_ref(tmp_path, repo):
+    return subprocess.run(
+        [
+            str(EXAMPLES / "setup_spark.sh"),
+            "--spark",
+            "branch-4.x",
+            "--repo",
+            f"file://{repo}",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--print-home",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.skipif(
+    subprocess.run(["bash", "-c", "command -v git java"], capture_output=True).returncode != 0,
+    reason="needs git and java",
+)
+def test_setup_spark_ref_build_failure_is_fatal(tmp_path):
+    repo = _fake_spark_repo(tmp_path, 'echo "[ERROR] tests do not compile"; exit 1\n')
+    proc = _setup_ref(tmp_path, repo)
+    assert proc.returncode != 0
+    assert proc.stdout == ""
+    assert "tests do not compile" in proc.stderr
+    assert "build of branch-4.x" in proc.stderr
+
+
+@pytest.mark.skipif(
+    subprocess.run(["bash", "-c", "command -v git java"], capture_output=True).returncode != 0,
+    reason="needs git and java",
+)
+def test_setup_spark_ref_builds_once_per_sha(tmp_path):
+    repo = _fake_spark_repo(tmp_path, f'echo built >> "{tmp_path}/builds"\n')
+    first = _setup_ref(tmp_path, repo)
+    assert first.returncode == 0, first.stderr
+    assert first.stdout.strip() == str(tmp_path / "cache" / "src-branch-4.x")
+    second = _setup_ref(tmp_path, repo)
+    assert second.returncode == 0, second.stderr
+    assert "already built" in second.stderr
+    assert (tmp_path / "builds").read_text().count("built") == 1
+
+
+def test_setup_spark_refuses_a_release_without_the_hook(tmp_path):
+    home = _fake_release(tmp_path, "4.2.1")
+    (home / "python" / "pyspark" / "sql" / "transpile.py").unlink()
+    proc = subprocess.run(
+        [str(EXAMPLES / "setup_spark.sh"), "--spark", "4.2.1", "--cache-dir", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 2
+    assert "transpile.py" in proc.stderr
+
+
+def test_run_demos_spark_flag_picks_the_release_and_records_it(tmp_path):
+    cache = tmp_path / "cache"
+    home = _fake_release(cache)
+    log = tmp_path / "calls.log"
+    out = tmp_path / "bench" / "spark-4.3"
+    graphs = tmp_path / "graphs"
+    drop = ("SPARK_HOME", "COMET_JAR", "AI_UDF_TRANSPILE_COMET_JAR")
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    proc = subprocess.run(
+        [
+            str(EXAMPLES / "run_demos.sh"),
+            "--spark",
+            "4.3.0",
+            "--all-benches",
+            "--csv",
+            str(out / "micro.csv"),
+            "--graph-dir",
+            str(graphs),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **env,
+            "AI_UDF_TRANSPILE_SPARK_CACHE": str(cache),
+            "PYTHON": str(_logging_python(tmp_path)),
+            "RUN_LOG": str(log),
+            "AI_UDF_TRANSPILE_SQLITE": str(tmp_path / "catalog.sqlite"),
+        },
+    )
+    # The fake python writes no CSVs, so the graph steps that need one are
+    # skipped; what matters is which Spark ran and where outputs would land.
+    assert f"Spark: Spark 4.3.0 (git revision abc) built for Hadoop 3 [{home}]" in proc.stdout
+    assert (out / "spark.txt").read_text().startswith("Spark 4.3.0")
+    calls = log.read_text().splitlines()
+    assert any("bench_micro.py" in c for c in calls)
+    assert graphs.is_dir()
+
+
+def test_setup_comet_reads_version_from_release_jars(tmp_path):
+    for cmd in ("git", "make", "java"):
+        if subprocess.run(["bash", "-c", f"command -v {cmd}"], capture_output=True).returncode:
+            pytest.skip(f"{cmd} not installed")
+    home = _fake_release(tmp_path)
+    comet = tmp_path / "comet"
+    subprocess.run(["git", "init", "-q", str(comet)], check=True)
+    proc = subprocess.run(
+        [
+            str(EXAMPLES / "setup_comet.sh"),
+            "--spark-home",
+            str(home),
+            "--comet-home",
+            str(comet),
+            "--skip-build",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "Spark detected: 4.3 (scala 2.13)" in proc.stdout
 
 
 def test_all_benches_flag_is_wired():
@@ -34,8 +222,10 @@ def test_all_benches_flag_is_wired():
     assert demos.index("examples/bench_fhi_udfs.py") < demos.index("examples/bench_catalog.py")
     # ...which only happens with the live arm on: the pinned arms fill nothing.
     assert "examples/bench_fhi_udfs.py --ai" in demos
-    # One CSV per bench: micro and bytecode must not share a path.
+    # One CSV per bench: micro and bytecode must not share a path, and the
+    # bytecode arms must reach the generated examples document.
     assert "BYTECODE_CSV" in demos
+    assert 'DUMP_ARGS+=(--perf-csv "$BYTECODE_CSV")' in demos
     regen = (EXAMPLES / "regen_examples_doc.sh").read_text()
     assert "--all-benches" in regen
     # Pass 1 is the fill: a bench left out of it only gets cache misses in pass 2's doc.

@@ -524,48 +524,6 @@ def udfb_converttoeuro(amount: float, currency: str) -> float:
     return amount / rates[currency]
 
 
-# Java-UDF twins for the bench: same body, different def name, so the
-# canonical source maps to a DIFFERENT catalog key -- one key, one rewrite.
-# The bench measures a catalyst arm and a java arm for the same computation.
-def plus_one_java(x: int) -> int:
-    return x + 1
-
-
-def backwards_java(name: str) -> str:
-    if name is None:
-        return None
-    return name[::-1]
-
-
-def zfill3_java(s: str) -> str:
-    return s.zfill(3)
-
-
-def edit_distance_java(a: str, b: str) -> int:
-    if a is None or b is None:
-        return -1
-    prev = list(range(len(b) + 1))
-    for i in range(1, len(a) + 1):
-        cur = [i] + [0] * len(b)
-        for j in range(1, len(b) + 1):
-            cost = 0 if a[i - 1] == b[j - 1] else 1
-            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
-        prev = cur
-    return prev[len(b)]
-
-
-# Rust twins, same idea: a distinct def name is a distinct catalog key, so
-# the same computation can be served as SQL, Java and Rust side by side.
-def plus_one_rust(x: int) -> int:
-    return x + 1
-
-
-def backwards_rust(name: str) -> str:
-    if name is None:
-        return None
-    return name[::-1]
-
-
 def collatz_steps(n: int) -> int:
     # A data-dependent loop: no Spark SQL form, the case Rust (or Java) is for.
     if n is None or n < 1:
@@ -658,7 +616,7 @@ PLUS_ONE_JAVA = """package ai_udf;
 
 import org.apache.spark.sql.api.java.UDF1;
 
-public class PlusOneJava implements UDF1<Object, Object> {
+public class PlusOne implements UDF1<Object, Object> {
     @Override
     public Object call(Object x) {
         // python raises on None: a null here is "python raise + sql value", allowed.
@@ -676,7 +634,7 @@ ZFILL3_JAVA = """package ai_udf;
 
 import org.apache.spark.sql.api.java.UDF1;
 
-public class Zfill3Java implements UDF1<Object, Object> {
+public class Zfill3 implements UDF1<Object, Object> {
     @Override
     public Object call(Object v) {
         // python raises on None: a null here is "python raise + sql value", allowed.
@@ -717,7 +675,7 @@ EDIT_DISTANCE_JAVA = """package ai_udf;
 
 import org.apache.spark.sql.api.java.UDF2;
 
-public class EditDistanceJava implements UDF2<Object, Object, Object> {
+public class EditDistance implements UDF2<Object, Object, Object> {
     private static int[] toCodePoints(String s) {
         int n = s.codePointCount(0, s.length());
         int[] out = new int[n];
@@ -810,34 +768,12 @@ FIXTURES: dict[str, TranspileResult] = {
         "x -> date_format(x, 'yyyy-MM-dd HH:mm:ss')) END"
     ),
     canonical_source_from_func(backwards): _result("reverse(_udf_param_0)"),
-    canonical_source_from_func(backwards_java): TranspileResult(
-        kind=KIND_JAVA_UDF,
-        java_source=BACKWARDS_JAVA,
-        class_name="ai_udf.Backwards",
-    ),
-    canonical_source_from_func(plus_one_rust): TranspileResult(kind=KIND_RUST, rust_source=PLUS_ONE_RS),
-    canonical_source_from_func(backwards_rust): TranspileResult(kind=KIND_RUST, rust_source=BACKWARDS_RS),
     canonical_source_from_func(collatz_steps): TranspileResult(kind=KIND_RUST, rust_source=COLLATZ_STEPS_RS),
     canonical_source_from_func(low_bits_set): TranspileResult(
         kind=KIND_GPU_KERNEL,
         java_source=LOW_BITS_JAVA,
         class_name="ai_udf.LowBits",
         entry=LOW_BITS_CUDA,
-    ),
-    canonical_source_from_func(plus_one_java): TranspileResult(
-        kind=KIND_JAVA_UDF,
-        java_source=PLUS_ONE_JAVA,
-        class_name="ai_udf.PlusOneJava",
-    ),
-    canonical_source_from_func(zfill3_java): TranspileResult(
-        kind=KIND_JAVA_UDF,
-        java_source=ZFILL3_JAVA,
-        class_name="ai_udf.Zfill3Java",
-    ),
-    canonical_source_from_func(edit_distance_java): TranspileResult(
-        kind=KIND_JAVA_UDF,
-        java_source=EDIT_DISTANCE_JAVA,
-        class_name="ai_udf.EditDistanceJava",
     ),
     # In-UDFs check old in the first list and new in the second; Out-UDFs swap.
     canonical_source_from_func(BSPIn): _result(
@@ -985,6 +921,57 @@ FIXTURES: dict[str, TranspileResult] = {
 }
 
 
+# Extra fixtures for UDFs whose FIXTURES entry is SQL: the same computation as
+# a Java UDF or a Rust row function. The fake answers with the most preferred
+# kind the job accepts (SQL, then Rust, then Java -- the order the prompt asks
+# a real model for), so pinning `targets` to one kind gets that kind's rewrite
+# of the SAME function. That is how the bench and the tests reach every arm
+# without renamed copies of a UDF.
+ALTERNATES: dict[str, list[TranspileResult]] = {
+    canonical_source_from_func(plus_one): [
+        TranspileResult(kind=KIND_JAVA_UDF, java_source=PLUS_ONE_JAVA, class_name="ai_udf.PlusOne"),
+        TranspileResult(kind=KIND_RUST, rust_source=PLUS_ONE_RS),
+    ],
+    canonical_source_from_func(backwards): [
+        TranspileResult(kind=KIND_JAVA_UDF, java_source=BACKWARDS_JAVA, class_name="ai_udf.Backwards"),
+        TranspileResult(kind=KIND_RUST, rust_source=BACKWARDS_RS),
+    ],
+    canonical_source_from_func(zfill3): [
+        TranspileResult(kind=KIND_JAVA_UDF, java_source=ZFILL3_JAVA, class_name="ai_udf.Zfill3"),
+    ],
+    canonical_source_from_func(edit_distance): [
+        TranspileResult(kind=KIND_JAVA_UDF, java_source=EDIT_DISTANCE_JAVA, class_name="ai_udf.EditDistance"),
+    ],
+}
+
+# Lower is preferred. A gpu_kernel is a java_udf that also carries a kernel.
+_PREFERENCE = {KIND_CATALYST: 0, KIND_RUST: 1, KIND_JAVA_UDF: 2, KIND_GPU_KERNEL: 2}
+
+
+def _accepted_kind(kind: str) -> str:
+    return KIND_JAVA_UDF if kind == KIND_GPU_KERNEL else kind
+
+
+def fixtures_for(source_text: str) -> list[TranspileResult]:
+    """Every fixture for one canonical source, most preferred kind first."""
+    found = [FIXTURES[source_text]] if source_text in FIXTURES else []
+    found.extend(ALTERNATES.get(source_text, []))
+    return sorted(found, key=lambda r: _PREFERENCE.get(r.kind, len(_PREFERENCE)))
+
+
+def _pick(source_text: str, targets: list[str]) -> TranspileResult:
+    found = fixtures_for(source_text)
+    if not found:
+        raise BackendDecline(f"no fake fixture for source {source_text!r}")
+    for result in found:
+        if _accepted_kind(result.kind) in targets:
+            return result
+    # Rust is only on offer where the session can build and run it, and a real
+    # model is not shown a kind the job does not ask for either.
+    kinds = sorted({r.kind for r in found})
+    raise BackendDecline(f"fake fixture is {', '.join(kinds)}, which this job does not accept ({targets})")
+
+
 class FakeBackend:
     name = "fake"
 
@@ -998,13 +985,7 @@ class FakeBackend:
             key = canonical_source_text(job.source_text)
         except Exception:
             key = (job.source_text or "").strip()
-        result = FIXTURES.get(key)
-        if result is None:
-            raise BackendDecline(f"no fake fixture for source {key!r}")
-        if result.kind == KIND_RUST and KIND_RUST not in job.targets:
-            # Rust is only on offer where the session can build and run it; a
-            # real model is not shown the Rust rules otherwise either.
-            raise BackendDecline(f"fake fixture is {result.kind}, which this job does not accept")
+        result = _pick(key, job.targets)
         # A fresh object per run: verification stamps build outputs on it.
         result = replace(result)
         if result.rust_source:

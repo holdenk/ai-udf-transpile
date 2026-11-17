@@ -59,19 +59,18 @@ def greet(name: str) -> str:
 def _wait_success(catalog, retrigger, timeout=900):
     """Wait for the row to succeed; on a transient CLI failure, poke it again.
 
-    A BackendError row (CLI crash/empty output) requeues on the next UDF
-    construction, exactly like a user's next query -- so this loop retries
-    like one instead of failing the test on the first hiccup.
+    BackendError rows remain retryable after the initial retry burst and its
+    cooldown, so keep poking exactly like a user's next query instead of
+    treating a transient CLI hiccup as a terminal cache result.
     """
     deadline = time.time() + timeout
-    max_retries = int(conf.DEFAULTS[conf.MAX_RETRIES])
     while time.time() < deadline:
         rows = catalog._conn.execute("SELECT status, target_kind, error, attempt_count FROM cache").fetchall()
         if rows and rows[0][0] == "success":
             return rows[0]
         if rows and rows[0][0] == "failed":
             error = rows[0][2] or ""
-            if error.startswith("BackendError:") and rows[0][3] < max_retries:
+            if error.startswith("BackendError:"):
                 retrigger()
             else:
                 pytest.fail(f"backend row failed: {error}")

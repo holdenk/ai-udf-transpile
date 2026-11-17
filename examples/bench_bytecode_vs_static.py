@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pyspark.sql import SparkSession  # noqa: E402
+from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
 from pyspark.sql.types import BooleanType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
@@ -65,7 +65,7 @@ PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
 PARTITIONS = os.cpu_count() or 16
 
 
-def noop_seconds(df) -> float:
+def noop_seconds(df: DataFrame) -> float:
     start = time.perf_counter()
     df.write.format("noop").mode("overwrite").save()
     return time.perf_counter() - start

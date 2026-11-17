@@ -32,7 +32,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Mapping, Optional, Union
 
 from ai_udf_transpile.keys import (
     BUILTIN_NAMES,
@@ -227,7 +227,9 @@ class _BindingCollector(ast.NodeVisitor):
         self._store(node.target)
         self.generic_visit(node)
 
-    visit_AsyncFor = visit_For
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self._store(node.target)
+        self.generic_visit(node)
 
     def visit_withitem(self, node: ast.withitem) -> None:
         if node.optional_vars is not None:
@@ -282,9 +284,9 @@ def _build_scope(kind: str, node: ast.AST) -> _Scope:
         args = node.args
         for arg in args.posonlyargs + args.args + args.kwonlyargs:
             scope.add(arg.arg, _Binding("param", getattr(arg, "lineno", 0)))
-        for arg in (args.vararg, args.kwarg):
-            if arg is not None:
-                scope.add(arg.arg, _Binding("param", getattr(arg, "lineno", 0)))
+        for extra in (args.vararg, args.kwarg):
+            if extra is not None:
+                scope.add(extra.arg, _Binding("param", getattr(extra, "lineno", 0)))
         body = [node.body] if isinstance(node, ast.Lambda) else node.body
     else:
         body = getattr(node, "body", [])
@@ -453,6 +455,8 @@ def _resolve_capture(name: str, module: _Scope, rebound: set[str]) -> tuple[bool
         # `from xml import dom`: a submodule not loaded by its parent.
         return _capture_value(_safe_import(binding.target), name)
     if binding.kind == "assign":
+        if binding.node is None:
+            raise _Skip(f"captures {name!r}, which is not a literal")
         try:
             value = ast.literal_eval(binding.node)
         except Exception:
@@ -552,14 +556,14 @@ def _is_type_expr(node: ast.AST) -> bool:
         return True
     if isinstance(node, ast.Call):
         parts = dotted_parts(node.func)
-        return bool(parts) and parts[-1].endswith("Type")
+        return bool(parts and parts[-1].endswith("Type"))
     return False
 
 
 # -- the walk -------------------------------------------------------------------
 
 
-def _udf_args(call: ast.Call) -> tuple[Optional[ast.AST], Optional[ast.AST], dict[str, ast.AST]]:
+def _udf_args(call: ast.Call) -> tuple[Optional[ast.expr], Optional[ast.expr], dict[str, ast.expr]]:
     """(f, returnType, kwargs) of a ``udf(...)`` call, either calling convention."""
     kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg}
     positional = list(call.args)
@@ -580,7 +584,7 @@ def _unpacked(call: ast.Call) -> bool:
     return any(kw.arg is None for kw in call.keywords) or any(isinstance(a, ast.Starred) for a in call.args)
 
 
-def _not_static(call: ast.Call, kwargs: dict[str, ast.AST]) -> Optional[str]:
+def _not_static(call: ast.Call, kwargs: Mapping[str, ast.AST]) -> Optional[str]:
     """Why this call's UDF settings cannot be read statically, or None."""
     if _unpacked(call):
         return _UNPACKED
@@ -746,7 +750,11 @@ class _Finder(ast.NodeVisitor):
             if len(found) != 1:
                 return None, f"{name!r} is bound {len(found)} times in its scope"
             binding = found[0]
-            if binding.kind == "def" and id(binding.node) in self._def_stacks:
+            if (
+                binding.kind == "def"
+                and isinstance(binding.node, ast.FunctionDef)
+                and id(binding.node) in self._def_stacks
+            ):
                 return binding.node, ""
             if binding.kind in {"import", "from"}:
                 return None, f"defined in another module ({binding.target or 'relative import'})"

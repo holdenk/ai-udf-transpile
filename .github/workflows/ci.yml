@@ -13,6 +13,10 @@ env:
   # Bump a pin to move CI onto a new engine. The build caches key on the
   # SHA, so a bump means exactly one rebuild, not a rebuild every time
   # upstream moves. These are the SHAs the dev box runs against.
+  # SPARK_REF stays on a master SHA, not branch-4.x: branch-4.x's sql/core
+  # ships arrow-c-data (unshaded org.apache.arrow.c), which shadows the class
+  # the pinned Comet's native UDF path calls with its shaded allocator
+  # (NoSuchMethodError on ArrowArrayStream.allocateNew). Move both pins together.
   SPARK_REF: "10a34a06707851ce0ab0afebee3d6c19cb757f27"
   COMET_REF: "330b29cf1013351cd9d7e93d3d37a6bc0b6d956b"
 
@@ -32,6 +36,8 @@ jobs:
         run: |
           ruff check .
           ruff format --check .
+      - name: Mypy
+        run: mypy
       - name: Unit tests
         env:
           AI_UDF_TRANSPILE_BACKEND: fake
@@ -207,8 +213,11 @@ jobs:
           path: |
             ~/.cargo
             comet/spark/target
-          key: comet-${{ steps.comet.outputs.sha }}-${{ env.SPARK_REF }}-${{ runner.os }}
-          restore-keys: comet-
+          # "portable": built for x86-64-v2, not the build runner's native CPU.
+          # A native libcomet restored onto a runner whose CPU lacks one of
+          # its instructions kills the JVM with SIGILL mid-suite.
+          key: comet-portable-${{ steps.comet.outputs.sha }}-${{ env.SPARK_REF }}-${{ runner.os }}
+          restore-keys: comet-portable-
       - name: Restore Maven repo
         uses: actions/cache@v4
         with:
@@ -222,7 +231,7 @@ jobs:
         run: |
           export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
           ./examples/setup_comet.sh --comet-home comet --spark-home "$SPARK_HOME" \
-            --ref ${{ env.COMET_REF }} --write-env-file comet.env
+            --ref ${{ env.COMET_REF }} --target-cpu x86-64-v2 --write-env-file comet.env
           # comet.env is shell-export format; $GITHUB_ENV wants NAME=value.
           sed 's/^export //; s/"//g' comet.env >> "$GITHUB_ENV"
       - name: Resolve Comet jar (cached path)

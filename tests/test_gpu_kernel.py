@@ -595,11 +595,23 @@ def test_process_row_without_rapids_stores_a_java_udf_and_never_offers_the_kerne
     assert "OUT.cu" not in backend.prompt
 
 
+class _StubbornKernelBackend(_KernelBackend):
+    """Answers with the gpu_kernel fixture whatever the job asked for (the fake itself declines)."""
+
+    def run(self, job, sandbox):
+        from dataclasses import replace
+
+        from ai_udf_transpile.backends.fake import FIXTURES
+
+        self.prompt = (sandbox / "PROMPT.md").read_text()
+        return replace(FIXTURES[job.source_text])
+
+
 def test_process_row_sql_only_rejects_gpu_results_without_verifying(tmp_path, monkeypatch):
     conf.set_value(conf.TARGETS, "catalyst")
     monkeypatch.setattr("ai_udf_transpile.worker.offered_abi", lambda *a: ABI)
     cat = _pending(tmp_path)
-    backend = _KernelBackend()
+    backend = _StubbornKernelBackend()
     verified = []
     process_row(cat, cat.get("k"), backend, verify_fn=lambda **k: verified.append(k))
     assert cat.get("k").status == "failed"

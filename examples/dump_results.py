@@ -2,10 +2,11 @@
 """Dump what every transpiler does to every UDF the examples filled into a
 live sqlite catalog, as markdown.
 
-One section per cached row, in three paths:
+One section per cached row, covering every transpiled path:
 
   built-in static (AST)  Spark's own catalyst transpiler (pyTranspilers=catalyst)
   bytecode -> SQL        the deterministic bytecode backend
+  bytecode -> Java eval  the same bytecode subset in the fixed Java interpreter
   AI (<backend>)         whatever the live backend produced (Hypothesis-verified
                           before it was cached)
 
@@ -29,6 +30,7 @@ import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
+from typing import Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -39,6 +41,7 @@ from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 from ai_udf_transpile.backends import ai_backend  # noqa: E402
 from ai_udf_transpile.backends.base import BackendDecline, BackendError  # noqa: E402
 from ai_udf_transpile.backends.bytecode import BytecodeBackend  # noqa: E402
+from ai_udf_transpile.backends.bytecode_eval import emit_java_eval_source  # noqa: E402
 from ai_udf_transpile.catalog import CacheRow, infra_failure  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
 from ai_udf_transpile.sandbox import make_sandbox  # noqa: E402
@@ -72,7 +75,7 @@ def _bad_backend_rows(rows: list[CacheRow], backend: str) -> list[CacheRow]:
     ]
 
 
-def _safe(label: str, fn) -> list[str]:
+def _safe(label: str, fn: Callable[..., object]) -> list[str]:
     """Run one transpiler path; a crash is a dump finding, not a dump death."""
     try:
         return [f"- **{label}**: `{fn()}`"]
@@ -89,16 +92,35 @@ def _fmt_rate(value: str) -> str:
     return f"{n:.0f}"
 
 
-def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
-    """Section name -> per-arm perf strings, from the bench CSVs.
+def _empty_perf() -> dict[str, str]:
+    return {"top": "", "static": "", "bytecode": "", "java_eval": "", "ai": ""}
 
-    "top" rides under the types line (the interpreted python baseline, plus
-    the native vanilla arm for tpcds patterns); "static" and "ai" are
-    suffixed onto the matching transpiled-path line. Only benched sections
-    get numbers; a declined pattern serves python, so its AI line gets no
-    suffix and the top line tells that story. Files overwrite per function,
-    last one wins: pass the wide bench_catalog CSV first, then the deeper
-    micro/tpcds CSVs whose extra arms (static, vanilla, java) take over.
+
+def _record_perf(perf: dict[str, dict[str, str]], name: str, arms: dict[str, str]) -> None:
+    current = perf.setdefault(name, {})
+    if current.get("udf_key") and arms.get("udf_key") and current["udf_key"] != arms["udf_key"]:
+        # Another catalog row under the same name: the generic AI rate was
+        # measured on the old row and must not be rebound to the new key.
+        # Function-wide arms (python, static, bytecode, micro ai:<kind>) stay.
+        current.pop("ai", None)
+    for arm, value in arms.items():
+        if value or arm not in current:
+            current[arm] = value
+
+
+def _rate_pair(rate: str, speedup: str) -> str:
+    if not rate:
+        return ""
+    detail = f"{speedup}x vs python" if speedup else "no python baseline"
+    return f"{_fmt_rate(rate)} rows/s ({detail})"
+
+
+def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
+    """Section name -> per-arm perf strings, merged without dropping arms.
+
+    Pass the wide catalog CSV first, then bytecode and the deeper micro/TPC-DS
+    CSVs. A later non-empty measurement replaces the same arm; other arms and
+    the Python baseline from earlier files remain intact.
     """
     perf: dict[str, dict[str, str]] = {}
     for path in paths:
@@ -128,37 +150,29 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                 keys = [key] if key else []
                 if names[r["function"]] == 1 or not key:
                     keys.append(r["function"])
-                py_rate = r.get("python_rows_per_second")
-                tx_rate = r.get("transpiled_rows_per_second")
-                if not py_rate and not tx_rate:
-                    continue  # skipped function (python raises on the sample)
-                if not py_rate:
-                    # Interpreted arm could not run on the sample; the
-                    # transpiled rate is still a real measurement.
-                    for k in keys:
-                        perf[k] = {
-                            "top": "",
-                            "static": "",
-                            "ai": f"{_fmt_rate(tx_rate)} rows/s (no python baseline)",
-                            **({"udf_key": key} if key else {}),
-                        }
-                    continue
-                # Same schema, different bench: bench_fhi_udfs.py names itself.
-                bench = r.get("bench") or "catalog"
-                arms = {
-                    "top": f"- **perf ({bench} bench)**: interpreted python {_fmt_rate(py_rate)} rows/s",
-                    "static": "",
-                    "ai": "",
-                }
-                if tx_rate and r["status"] == "success":
-                    # A rust rewrite's only arm is Comet's: say where it ran.
-                    where = ", Comet native" if r.get("target_kind") == "rust" else ""
-                    arms["ai"] = (
-                        f"{_fmt_rate(tx_rate)} rows/s ({r['transpiled_speedup_vs_python']}x vs python{where})"
+                arms = _empty_perf()
+                py_rate = r.get("python_rows_per_second", "")
+                bench = r.get("bench") or "catalog"  # bench_fhi_udfs.py names itself
+                if py_rate:
+                    arms["top"] = (
+                        f"- **perf ({bench} bench)**: interpreted python {_fmt_rate(py_rate)} rows/s"
                     )
-                comet = r.get("comet_rows_per_second")
+                for arm, prefix in (
+                    ("static", "static"),
+                    ("bytecode", "bytecode_static"),
+                    ("java_eval", "java_eval"),
+                    ("ai", "transpiled"),
+                ):
+                    arms[arm] = _rate_pair(
+                        r.get(f"{prefix}_rows_per_second", ""), r.get(f"{prefix}_speedup_vs_python", "")
+                    )
+                if r["status"] != "success":
+                    arms["ai"] = ""
+                elif r.get("target_kind") == "rust" and arms["ai"]:
+                    # A rust rewrite's only arm is Comet's: say where it ran.
+                    arms["ai"] = arms["ai"].replace("x vs python", "x vs python, Comet native")
+                comet = r.get("comet_rows_per_second", "")
                 if comet and arms["ai"] and r.get("comet_speedup_vs_python"):
-                    # The same served SQL, executed natively by Comet.
                     arms["ai"] += (
                         f" · comet {_fmt_rate(comet)} rows/s ({r['comet_speedup_vs_python']}x vs python)"
                     )
@@ -170,55 +184,73 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     arms["ai"] += " · comet (catalog bench) " + prev_ai.split(" · comet ", 1)[1]
                 if key:
                     arms["udf_key"] = key
-                for k in keys:
-                    perf[k] = dict(arms)
+                if any(arms.values()):
+                    for k in keys:
+                        # Merged, not replaced: a later CSV of this schema (fhi
+                        # after catalog) must not blank arms it did not measure.
+                        _record_perf(perf, k, arms)
+        elif "java_eval_rows_per_second" in rows[0]:  # bench_bytecode_vs_static CSV
+            for r in rows:
+                arms = _empty_perf()
+                py_rate = r.get("python_rows_per_second", "")
+                if py_rate:
+                    arms["top"] = (
+                        f"- **perf (bytecode bench)**: interpreted python {_fmt_rate(py_rate)} rows/s"
+                    )
+                for arm, prefix in (
+                    ("static", "static"),
+                    ("bytecode", "bytecode_static"),
+                    ("java_eval", "java_eval"),
+                ):
+                    arms[arm] = _rate_pair(
+                        r.get(f"{prefix}_rows_per_second", ""), r.get(f"{prefix}_speedup_vs_python", "")
+                    )
+                _record_perf(perf, r["function"], arms)
         elif "kinds" in rows[0]:  # bench_micro wide CSV
+            # The --rust-accel run (run_demos names it *_comet.csv) measured its
+            # python/static/SQL/Java arms under Comet: only its Rust arm, which
+            # exists nowhere else, is taken from it.
+            comet_run = "comet" in Path(path).stem
             for r in rows:
                 py = _fmt_rate(r["regular_rows_per_second"])
                 top = f"- **perf (micro bench)**: interpreted python {py} rows/s"
-                arms: dict[str, str] = {"top": top, "static": "", "ai": ""}
+                arms = _empty_perf()
+                arms["top"] = top
                 static = r.get("transpiled_static_rows_per_second")
                 if static:
                     arms["static"] = (
                         f"{_fmt_rate(static)} rows/s ({r['static_speedup_vs_regular']}x vs python)"
                     )
-                catalyst = r.get("transpiled_ai_catalyst_rows_per_second")
-                if catalyst and r["transpile_succeeded_ai_catalyst"] == "True":
-                    arms["ai"] = (
-                        f"{_fmt_rate(catalyst)} rows/s ({r['ai_catalyst_speedup_vs_regular']}x vs python)"
-                    )
-                perf[r["function"]] = arms
-                java = r.get("transpiled_ai_java_rows_per_second")
-                if java:
-                    perf[r["function"] + "_java"] = {
-                        "top": top,
-                        "static": "",
-                        "ai": f"{_fmt_rate(java)} rows/s ({r['ai_java_speedup_vs_regular']}x vs python)",
-                    }
-                rust = r.get("transpiled_ai_rust_rows_per_second")
-                if rust:
-                    perf[r["function"] + "_rust"] = {
-                        "top": top,
-                        "static": "",
-                        "ai": (
-                            f"{_fmt_rate(rust)} rows/s"
-                            f" ({r['ai_rust_speedup_vs_regular']}x vs python, Comet native)"
-                        ),
-                    }
+                # Every AI arm is the same function, each kind filled with
+                # targets pinned to it: keyed by kind, so a catalog row gets
+                # the number for the rewrite it actually holds.
+                for kind, column, where in (
+                    ("catalyst", "ai_catalyst", ""),
+                    ("java_udf", "ai_java", ""),
+                    ("rust", "ai_rust", ", Comet native"),
+                ):
+                    rate = r.get(f"transpiled_{column}_rows_per_second")
+                    if rate and r.get(f"transpile_succeeded_{column}") == "True":
+                        speedup = r[f"{column}_speedup_vs_regular"]
+                        arms[f"ai:{kind}"] = f"{_fmt_rate(rate)} rows/s ({speedup}x vs python{where})"
+                if comet_run:
+                    arms = {"ai:rust": arms["ai:rust"]} if "ai:rust" in arms else {}
+                if arms:
+                    _record_perf(perf, r["function"], arms)
         elif "declined" in rows[0]:  # bench_tpcds CSV
             for r in rows:
-                top = (
+                arms = _empty_perf()
+                arms["top"] = (
                     f"- **perf (tpcds bench)**: interpreted python"
                     f" {_fmt_rate(r['python_rows_per_second'])} rows/s · native vanilla"
                     f" {_fmt_rate(r['vanilla_rows_per_second'])} ({r['vanilla_speedup_vs_python']}x)"
                 )
-                ai = ""
                 if r["declined"] != "True":
-                    ai = (
+                    arms["ai"] = (
                         f"{_fmt_rate(r['transpiled_rows_per_second'])} rows/s"
                         f" ({r['transpiled_speedup_vs_python']}x vs python)"
                     )
-                perf[r["function"]] = {"top": top, "static": "", "ai": ai}
+                _record_perf(perf, r["function"], arms)
     return perf
 
 
@@ -231,8 +263,14 @@ def _perf_for(perf: dict[str, dict[str, str]], name: str, udf_key: str) -> dict[
     then only this row's own keyed entry, if any, applies.
     """
     p = perf.get(name) or {}
-    if not p or (p.get("udf_key") and p["udf_key"] != udf_key):
-        p = perf.get(udf_key) or {}
+    if not p:
+        return perf.get(udf_key) or {}
+    if p.get("udf_key") and p["udf_key"] != udf_key:
+        # The micro bench's per-kind rates (ai:<kind>) belong to the function,
+        # not to one catalog row; dump() picks the one for the kind this row
+        # was served as, so a Rust rate never lands on a Java twin.
+        per_kind = {k: v for k, v in p.items() if k.startswith("ai:")}
+        return {**(perf.get(udf_key) or {}), **per_kind}
     return p
 
 
@@ -242,6 +280,7 @@ def _builtin_result(row: CacheRow) -> str:
         path = Path(tmp) / "udf.py"
         path.write_text("from __future__ import annotations\n" + row.source_text, encoding="utf-8")
         spec = importlib.util.spec_from_file_location("dump_row", path)
+        assert spec is not None and spec.loader is not None  # a .py path always gets a source loader
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         udf = UserDefinedFunction(getattr(module, name), _parse_datatype_string(row.return_type))
@@ -250,11 +289,19 @@ def _builtin_result(row: CacheRow) -> str:
     return "  |  ".join(str(sql) for sql in udf.transpiled)
 
 
-def _bytecode_result(row: CacheRow) -> str:
+def _bytecode_result(row: CacheRow) -> Optional[str]:
     job = row.as_job()
     try:
         with make_sandbox(job) as sandbox:
             return BytecodeBackend().run(job, sandbox).sql
+    except BackendDecline as exc:
+        return f"declined: {exc}"
+
+
+def _java_eval_result(row: CacheRow) -> str:
+    try:
+        emitted = emit_java_eval_source(row.source_text)
+        return f"{emitted.class_name} (fixed BytecodeEval interpreter)"
     except BackendDecline as exc:
         return f"declined: {exc}"
 
@@ -305,7 +352,9 @@ def _write_doc(out_path: str, lines: list[str]) -> None:
         os.replace(temporary, path)
 
 
-def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[str, dict[str, str]]) -> int:
+def dump(
+    spark: SparkSession, rows: list[CacheRow], out_path: str, backend: str, perf: dict[str, dict[str, str]]
+) -> int:
     spark.conf.set(TRANSPILE_CONF, "true")
     spark.conf.set(PY_TRANSPLIERS_CONF, "catalyst")
     by_status = dict(Counter(row.status for row in rows))
@@ -318,11 +367,11 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
         f"{len(rows)} rows, by status: {by_status}.",
         "Regenerate with `examples/regen_examples_doc.sh`.",
         "Perf bullets are the local single-node benches (bench_catalog.py for",
-        "every cached function, bench_micro.py / bench_tpcds_udfs.py for the",
-        "deeper arms): interpreted python rows/s at the top of each section,",
-        "and each transpiled arm's rows/s at the end of its own line -- with a",
-        "comet arm when the catalog bench ran against a Comet build; no perf",
-        "= not benched or the interpreted arm raises on the bench sample.",
+        "every cached function, bench_bytecode_vs_static.py / bench_micro.py /",
+        "bench_tpcds_udfs.py for deeper arms): interpreted python rows/s at the",
+        "top of each section, and every transpiled arm's rows/s on its own line",
+        "-- with a comet arm when configured. No perf suffix means that arm was",
+        "not benched, declined, or failed; a missing Python baseline is labeled.",
         "Rust rewrites (the opt-in `rust` target) run only inside Comet, so",
         "their one number is Comet's and says so.",
         "",
@@ -350,15 +399,24 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
                 "",
             ]
             static_lines = _safe("built-in static (AST)", lambda r=row: _builtin_result(r))
-            # No perf suffix on an error or a failed row: a stale CSV must
-            # not put a happy rate next to a crash or a decline.
-            if p.get("static") and not static_lines[0].startswith("- **built-in static (AST)**: error"):
+            # No perf suffix on an error or a decline: a stale CSV must not put
+            # a happy rate next to a rewrite that was not actually produced.
+            if p.get("static") and not any(x in static_lines[0] for x in ("error:", "declined")):
                 static_lines[0] += f" — {p['static']}"
             lines += static_lines
-            lines += _safe("bytecode → SQL", lambda r=row: _bytecode_result(r))
+            bytecode_lines = _safe("bytecode → SQL", lambda r=row: _bytecode_result(r))
+            if p.get("bytecode") and not any(x in bytecode_lines[0] for x in ("error:", "declined")):
+                bytecode_lines[0] += f" — {p['bytecode']}"
+            lines += bytecode_lines
+            java_eval_lines = _safe("bytecode → Java eval", lambda r=row: _java_eval_result(r))
+            if p.get("java_eval") and not any(x in java_eval_lines[0] for x in ("error:", "declined")):
+                java_eval_lines[0] += f" — {p['java_eval']}"
+            lines += java_eval_lines
             ai_lines = _ai_section(row)
-            if p.get("ai") and row.status == "success":
-                ai_lines[0] += f" — {p['ai']}"
+            served = KIND_JAVA_UDF if row.target_kind == KIND_GPU_KERNEL else row.target_kind
+            ai_perf = p.get(f"ai:{served}") or p.get("ai")
+            if ai_perf and row.status == "success":
+                ai_lines[0] += f" — {ai_perf}"
             lines += ai_lines
             lines.append("")
     finally:
@@ -441,7 +499,7 @@ def _verdict(entry: tuple[CacheRow, dict[str, str]] | None) -> str:
     return f"{_fmt_rate(rate)}/s" if rate else "accepted"
 
 
-def dump_targets(spark, targets_dir: str, out_path: str, backend: str) -> int:
+def dump_targets(spark: SparkSession, targets_dir: str, out_path: str, backend: str) -> int:
     """One section per UDF: python, the two non-AI transpilers, then SQL / Java / Rust each."""
     by_kind = _load_targets(targets_dir)
     if not any(by_kind.values()):
@@ -549,7 +607,7 @@ def main() -> int:
         action="append",
         default=[],
         metavar="PATH",
-        help="bench CSV to pull per-function perf bullets from (micro and/or tpcds); repeatable",
+        help="bench CSV to pull per-arm perf bullets from; repeatable",
     )
     args = parser.parse_args()
     if args.backend:

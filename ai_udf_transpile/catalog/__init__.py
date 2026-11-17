@@ -9,7 +9,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Protocol
+from typing import Any, Iterator, Optional, Protocol
 
 from ai_udf_transpile import conf
 from ai_udf_transpile.targets import (
@@ -39,7 +39,7 @@ def provisional_visible() -> bool:
 
 
 @contextmanager
-def expose_provisional():
+def expose_provisional() -> Iterator[None]:
     previous = provisional_visible()
     _provisional.on = True
     try:
@@ -312,12 +312,20 @@ def retries_exhausted(row: CacheRow, spark: Any = None) -> bool:
 
 
 def infra_failure(row: CacheRow) -> bool:
-    """A ``BackendError`` row (CLI crash/timeout/empty output) is transient.
-
-    Retry it as soon as a claim is free, bounded by MAX_RETRIES; declines and
-    bad rewrites keep the long cooldown because retrying them is spent money.
-    """
+    """A ``BackendError`` row (CLI crash/timeout/empty output) is transient."""
     return (row.error or "").startswith("BackendError:")
+
+
+def failure_retry_blocked(row: CacheRow, spark: Any = None) -> bool:
+    """Whether a failed row must wait before its next backend attempt.
+
+    Transient infrastructure errors retry immediately during the initial
+    MAX_RETRIES burst, then again after each cooldown. Declines and bad
+    rewrites stop retrying once that burst is exhausted.
+    """
+    if infra_failure(row):
+        return retries_exhausted(row, spark) and cooldown_active(row, spark)
+    return cooldown_active(row, spark) or retries_exhausted(row, spark)
 
 
 def open_catalog(spark: Any = None, *, sqlite_path: Optional[str] = None) -> Catalog:
@@ -328,7 +336,8 @@ def open_catalog(spark: Any = None, *, sqlite_path: Optional[str] = None) -> Cat
         path = sqlite_path or conf.get_value(conf.SQLITE_PATH, spark, "")
         if not path:
             raise ValueError("sqlite catalog requires spark.sql.experimental.aiUdfTranspile.sqlitePath")
-        catalog: Catalog = SqliteCatalog(path)
+        sqlite = SqliteCatalog(path)
+        catalog: Catalog = sqlite
         table = conf.get_value(conf.WRITEBACK_TABLE, spark, conf.DEFAULTS[conf.WRITEBACK_TABLE]).strip()
         if table:
             if spark is None:
@@ -342,7 +351,7 @@ def open_catalog(spark: Any = None, *, sqlite_path: Optional[str] = None) -> Cat
                 threshold = conf.get_int(
                     conf.WRITEBACK_THRESHOLD, spark, int(conf.DEFAULTS[conf.WRITEBACK_THRESHOLD])
                 )
-                catalog = WritebackCatalog(catalog, spark, table, fmt.strip().lower(), threshold)
+                catalog = WritebackCatalog(sqlite, spark, table, fmt.strip().lower(), threshold)
         return catalog
     if kind == "delta":
         from ai_udf_transpile.catalog.delta import DeltaCatalog

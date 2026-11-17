@@ -216,6 +216,7 @@ def _record_samples(spark, sqlite_path):
     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     conf.set_value(conf.PARTY_ON_STRINGS, "true")
+    conf.set_value(conf.SAMPLING, "true")
     df = spark.createDataFrame([(s[0], s[1]) for s in SCATTER_SAMPLES], ["start", "duration"])
     sampling_udf = UserDefinedFunction(scatter_to_seconds, ArrayType(StringType()))
     df.select(sampling_udf("start", "duration")).collect()

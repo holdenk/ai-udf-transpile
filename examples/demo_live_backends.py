@@ -20,14 +20,16 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any, Callable, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pyspark.sql import SparkSession  # noqa: E402
-from pyspark.sql.types import LongType, StringType  # noqa: E402
+from pyspark.sql.types import DataType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
 
 BACKEND_BINARIES = {
@@ -47,7 +49,9 @@ def greet(name: str) -> str:
     return "hi " + name
 
 
-def wait_for_transpile(func, rtype, timeout=900):
+def wait_for_transpile(
+    func: Callable[..., Any], rtype: DataType, timeout: float = 900
+) -> tuple[UserDefinedFunction, bool]:
     """Re-create the UDF until the catalog hit flips transpiled=True."""
     deadline = time.time() + timeout
     udf = UserDefinedFunction(func, rtype)
@@ -59,13 +63,13 @@ def wait_for_transpile(func, rtype, timeout=900):
     return udf, False
 
 
-def run_backend(spark, backend: str) -> dict:
+def run_backend(spark: SparkSession, backend: str) -> dict[str, Any]:
     sqlite = os.path.join(tempfile.mkdtemp(prefix=f"ai-udf-live-{backend}-"), "cache.sqlite")
     enable(spark, sqlite_path=sqlite, backend=backend, inline_worker=True)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
-    catalog = get_catalog()
-    out = {"backend": backend}
+    catalog = cast(SqliteCatalog, get_catalog())
+    out: dict[str, Any] = {"backend": backend}
 
     df = spark.createDataFrame([(41,), (None,)], ["x"])
     names = spark.createDataFrame([("bo",), (None,)], ["name"])

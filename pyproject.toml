@@ -32,6 +32,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "ruff>=0.8",
+    "mypy>=1.10",
     # Regenerates the README perf graph from the bench CSV (bench_graph.py).
     "matplotlib>=3.8",
     # The kms_encrypt fixture is the canonical untranspilable UDF. With boto3
@@ -65,6 +66,30 @@ extend-exclude = ["questionable_benchmark_results", "docs/EXAMPLES_TRANSPILED.md
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["ai_udf_transpile", "examples"]
+explicit_package_bases = true
+# PySpark comes from $SPARK_HOME, not PyPI, so it is often not importable here.
+ignore_missing_imports = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_unused_ignores = true
+exclude = ["questionable_benchmark_results/"]
+
+# The fixture UDFs' source text is their catalog key and their annotations are
+# what Spark's type detection reads: `-> str` on a body that returns None is
+# the point, not a bug. Nothing else is relaxed there.
+[[tool.mypy.overrides]]
+module = ["ai_udf_transpile.backends.fake", "ai_udf_transpile.backends.fhi_udfs"]
+disable_error_code = ["return-value", "return", "var-annotated", "no-untyped-def"]
+
+# Same for the demos' sample UDFs (`t: datetime` is the module on purpose,
+# `untyped(x)` demonstrates an untyped UDF, loop UDFs return None).
+[[tool.mypy.overrides]]
+module = ["examples.demo", "examples.demo_rust_udf", "demo", "demo_rust_udf"]
+disable_error_code = ["return-value", "valid-type", "var-annotated", "attr-defined", "no-untyped-def"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

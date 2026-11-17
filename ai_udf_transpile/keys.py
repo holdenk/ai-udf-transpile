@@ -11,7 +11,7 @@ import inspect
 import json
 import sys
 import textwrap
-from types import FunctionType, ModuleType
+from types import FrameType, FunctionType, ModuleType
 from typing import Any, Callable, Optional
 
 ALLOWED_LITERAL_TYPES = (int, float, bool, str, bytes, type(None))
@@ -52,7 +52,7 @@ def decorator_callee(decorator: ast.AST) -> ast.AST:
 
 def is_pyspark_udf_qualname(qualname: Optional[str]) -> bool:
     """``pyspark.sql.functions.udf`` and friends; never ``pandas_udf``."""
-    return bool(qualname) and qualname.startswith("pyspark.") and qualname.rsplit(".", 1)[-1] == "udf"
+    return qualname is not None and qualname.startswith("pyspark.") and qualname.rsplit(".", 1)[-1] == "udf"
 
 
 def strip_udf_decorators(
@@ -118,7 +118,7 @@ def _is_allowed_literal(value: Any) -> bool:
 
 def _is_stdlib_module(mod: ModuleType) -> bool:
     name = (getattr(mod, "__name__", "") or "").split(".")[0]
-    stdlib = getattr(sys, "stdlib_module_names", frozenset())
+    stdlib: frozenset[str] = getattr(sys, "stdlib_module_names", frozenset())
     return bool(name) and name in stdlib
 
 
@@ -188,7 +188,7 @@ def free_names(function_ast: ast.FunctionDef, public_params: list[str]) -> set[s
         def visit_arg(self, node: ast.arg) -> None:
             return  # skip arg.annotation
 
-        def _visit_function(self, node: ast.AST) -> None:
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
             for dec in node.decorator_list:
                 self.visit(dec)
             self.visit(node.args)  # arg nodes skip annotations; defaults visited
@@ -296,7 +296,7 @@ def udf_key(
 
 def func_from_spark_stack() -> Optional[Any]:
     """Best-effort: Spark's ``_transpile_func`` holds ``func`` in a parent frame."""
-    frame = sys._getframe(1)
+    frame: Optional[FrameType] = sys._getframe(1)
     while frame is not None:
         if frame.f_code.co_name == "_transpile_func" and "func" in frame.f_locals:
             return frame.f_locals["func"]

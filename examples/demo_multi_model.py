@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -24,7 +25,7 @@ from pyspark.sql import SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
 
 from ai_udf_transpile.backends import ai_backend, get_backend  # noqa: E402
-from ai_udf_transpile.backends.base import BackendDecline, BackendError  # noqa: E402
+from ai_udf_transpile.backends.base import Backend, BackendDecline, BackendError  # noqa: E402
 from ai_udf_transpile.backends.fake import (  # noqa: E402
     both_positive,
     clean_phone,
@@ -41,10 +42,10 @@ from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 from ai_udf_transpile.model_stats import collect_stats, format_stats_table  # noqa: E402
 from ai_udf_transpile.sandbox import write_sandbox  # noqa: E402
-from ai_udf_transpile.targets import TranspileJob  # noqa: E402
+from ai_udf_transpile.targets import TranspileJob, TranspileResult  # noqa: E402
 
 # (name, func, return_type_str, input_type_strs, input_df_key)
-UDFS = [
+UDFS: list[tuple[str, Callable[..., Any], str, list[str], str]] = [
     ("plus_one", plus_one, "bigint", ["bigint"], "ints"),
     ("is_none_branch", is_none_branch, "bigint", ["bigint"], "ints"),
     ("both_positive", both_positive, "boolean", ["bigint", "bigint"], "pairs"),
@@ -71,7 +72,7 @@ def _available_backends() -> list[str]:
     return [name for name, bin in LIVE_BACKENDS if shutil.which(bin)]
 
 
-def _job_for(func, input_types: list[str], return_type: str) -> TranspileJob:
+def _job_for(func: Callable[..., Any], input_types: list[str], return_type: str) -> TranspileJob:
     src = canonical_source_from_func(func)
     params = list(func.__code__.co_varnames[: func.__code__.co_argcount])
     return TranspileJob(
@@ -85,7 +86,9 @@ def _job_for(func, input_types: list[str], return_type: str) -> TranspileJob:
     )
 
 
-def _try_backend(backend, job, sandbox):
+def _try_backend(
+    backend: Backend, job: TranspileJob, sandbox: Path
+) -> Optional[tuple[str, str, TranspileResult]]:
     """Run one backend in its sandbox; return (name, model, result) or None."""
     name = getattr(backend, "name", "?")
     try:
@@ -98,7 +101,7 @@ def _try_backend(backend, job, sandbox):
         return None
 
 
-def _short(text, width=72):
+def _short(text: Optional[str], width: int = 72) -> str:
     if text is None:
         return "(none)"
     text = " ".join(text.split())

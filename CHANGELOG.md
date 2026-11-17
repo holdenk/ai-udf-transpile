@@ -7,6 +7,106 @@ evidence for a direction, not a promise about your cluster.
 
 ## Unreleased
 
+### CI stays on its Spark master pin; Rust target vs `branch-4.x` (2026-11-17)
+
+The ported move of CI's Spark pin to the `branch-4.x` tip is reverted.
+`branch-4.x`'s `sql/core` ships `arrow-c-data`, whose unshaded
+`org.apache.arrow.c` classes shadow the ones the pinned Comet's native UDF
+path calls with its shaded allocator: every Rust UDF failed with
+`NoSuchMethodError` on `ArrowArrayStream.allocateNew` (the SQL and Java targets
+were fine). The README's Rust section records the conflict; the Spark and Comet
+pins have to move together. `setup_spark.sh --spark branch-4.x` still works for
+the SQL/Java benchmarks.
+
+The Comet job's other failure, also red on main (the test JVM dying with
+`SIGILL` in `libcomet.so`, then hundreds of `ConnectionRefusedError`s), was the
+CI cache: Comet's `make release` compiles with `-Ctarget-cpu=native`, and the
+cached build was restored onto runners whose CPUs lack an instruction the build
+runner had. `setup_comet.sh --target-cpu CPU` builds the same two steps for a
+portable target; CI uses `x86-64-v2` under a new cache key.
+
+### Every target filled separately; no more `*_java` / `*_rust` twin UDFs (2026-11-17)
+
+The bench, demos and tests used to reach the Java and Rust arms through
+renamed copies of a UDF (`plus_one_java`, `backwards_rust`, ...): same body,
+different def name, so a different catalog key that the fake backend mapped
+to another rewrite kind. A real backend never honored that mapping, and the
+copies showed up in the docs as UDFs of their own. They are gone:
+
+- `bench_micro.py` times one function per row and fills each AI kind in its
+  own catalog with `targets` pinned to that kind (`--targets all`, the
+  default, or any list of `catalyst,java_udf,rust`). A kind the backend
+  cannot produce leaves its arm empty with the reason, and the run still
+  writes its CSVs before exiting 1 (`--allow-missing-arms` to exit 0). The
+  CSV schema is unchanged; the timing CSV's `kind` column now names the
+  kind (`catalyst`, `java_udf`, `rust`).
+- `fill_targets.py --target all` runs every kind, each in its own process.
+- The fake backend keeps per-kind fixtures and answers with the most
+  preferred kind the job accepts, declining when it has none.
+- `dump_results.py` attaches a micro-bench number to a catalog row only for
+  the kind that row was served as.
+- Docs: the Rust target is marked as a preview that is not ready for real
+  use, at the top of the README and in its own section; the `targets` conf
+  is documented as what it is (the kinds a backend may answer with; one kind
+  pins it).
+
+### Rust target docs: distribution and maturity (2026-11-16)
+
+Docs only. The Rust target is now flagged as very new (local masters only
+so far). The README and `rustc.py` spell out why `addFile` / `spark.files`
+does not distribute the library: Comet takes an absolute path, and those
+land in a per-executor temp directory. On a cluster, use a shared mount for
+`rust.buildDir` plus `rust.sharedBuildDir=true`.
+
+### Benchmarks: run against the 4.3 release or a branch-4.x build (2026-11-16)
+
+`examples/setup_spark.sh --spark 4.3|branch-4.x|REF` fetches the Spark to
+benchmark against: a release is the Apache binary tarball (sha512-checked,
+cached), a git ref is a shallow clone built like CI and rebuilt only when
+the ref moves. `run_demos.sh --spark SPEC` runs it first, records what ran
+in a `spark.txt` beside the CSVs, and `--graph-dir` keeps per-bench PNGs out
+of `docs/`, so a 4.3 run and a branch-4.x run sit side by side.
+`setup_comet.sh` now accepts a binary release (no `pom.xml`) by reading
+the version from `jars/spark-core_*.jar`.
+
+### Verification: narrow-int and decimal inputs, gate tests, docs (2026-11-16)
+
+**Correct rewrites of `int` / `smallint` / `tinyint` / `decimal` UDFs no
+longer fail verification.** The Hypothesis gate drew int32 values for
+`smallint`/`tinyint` columns, ran the int64 built-ins (2^31, 2^53, ...)
+against `int` columns, and built `decimal` columns as `bigint`. Spark
+refused those rows, which read as "sql raised" while Python returned, so
+`CAST(x AS BIGINT) + 1` for an `int` input was rejected. Draws and
+built-ins now stay inside each column's range, each narrow type's own
+min/max are added as built-ins (where `int + 1` or `tinyint * tinyint`
+overflows under ANSI), and decimals are drawn exactly at `(p, s)` with
+built-in halves and extremes. Return-range checks cover the narrow ints and
+decimal precision too.
+
+New tests check the gate itself: `tests/test_property_inputs.py`
+property-tests the generators (this caught `st.decimals` drawing `-1E20`
+for `decimal(38,18)` by rounding in the 28-digit default context), and
+`tests/test_property_mutants.py` asserts that each correct rewrite
+verifies and each mutant is killed by a deterministic example. How
+verification works, and its blind spots:
+[docs/PROPERTY_TESTING.md](docs/PROPERTY_TESTING.md).
+
+### Real-row sampling is now opt-in (2026-11-16)
+
+`spark.sql.experimental.aiUdfTranspile.sampling` now defaults to `false`.
+Sampling copies real UDF arguments into the SQLite catalog file, which is
+the wrong default for columns holding personal or secret data, and it
+records nothing in cluster mode with a driver-local catalog path anyway.
+Set it to `true` to get the old behaviour; the README has a new
+"Real-row sampling" section on what it captures and when it works.
+
+The approval CLI (`python -m ai_udf_transpile.approve`) now says when a
+parked rewrite with string, map, timestamp or array inputs has no sampled
+rows: a count in a banner at the start of `--list`, `--browse` and the
+interactive review, and a `!! NO REAL INPUT ROWS SAMPLED` note on each
+such row saying how to turn sampling on. Previously only string inputs got
+a one-line note.
+
 ### Prefill: extract UDFs from scripts into the catalog (2026-11-13)
 
 `python -m ai_udf_transpile.prefill PATH...` parses (never imports) Python

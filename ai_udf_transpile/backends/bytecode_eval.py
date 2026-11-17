@@ -119,7 +119,7 @@ def _encode(func_code: types.CodeType, ops: dict[str, int]) -> tuple[list[int], 
     loaded: set[int] = set()
     for ins in kept:
         if ins.opname in {"LOAD_CONST", "RETURN_CONST"}:
-            loaded.add(ins.arg)
+            loaded.add(_oparg(ins))
     consts: list[Any] = []
     for i, val in enumerate(func_code.co_consts):
         consts.append(val if i in loaded else None)
@@ -142,9 +142,9 @@ def _lower_one(
             raise BackendDecline("LOAD_FAST_LOAD_FAST without name")
         return [("OP_LOAD_FAST", _local(nm, names)) for nm in ins.argval]
     if op == "LOAD_CONST":
-        return [("OP_LOAD_CONST", ins.arg)]
+        return [("OP_LOAD_CONST", _oparg(ins))]
     if op == "RETURN_CONST":
-        return [("OP_LOAD_CONST", ins.arg), ("OP_RETURN", 0)]
+        return [("OP_LOAD_CONST", _oparg(ins)), ("OP_RETURN", 0)]
     if op == "RETURN_VALUE":
         return [("OP_RETURN", 0)]
     if op == "POP_TOP":
@@ -185,6 +185,13 @@ def _jump_origin(target_offset: int, kept: list[dis.Instruction]) -> int:
         if ins.offset >= target_offset:
             return i
     raise BackendDecline(f"jump target {target_offset!r} out of range")
+
+
+def _oparg(ins: dis.Instruction) -> int:
+    """The numeric argument of an instruction that always carries one."""
+    if ins.arg is None:
+        raise BackendDecline(f"{ins.opname} without an argument")
+    return ins.arg
 
 
 def _local(name: Any, names: list[str]) -> int:

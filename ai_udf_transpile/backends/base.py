@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
 from ai_udf_transpile.targets import TranspileJob, TranspileResult
 
 
 class BackendDecline(Exception):
     """The backend will not (or cannot) rewrite this UDF."""
+
+    # The model that declined, when the backend knows it (the worker records it).
+    model: Optional[str] = None
 
 
 class BackendError(Exception):

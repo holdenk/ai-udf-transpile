@@ -10,7 +10,7 @@ pytest.importorskip("pyspark")
 from pyspark.sql.types import StringType
 from pyspark.sql.udf import UserDefinedFunction
 
-from ai_udf_transpile import enable
+from ai_udf_transpile import conf, enable
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog
 from ai_udf_transpile.sampling import wrap_for_sampling
 from ai_udf_transpile.targets import KIND_CATALYST, TranspileResult
@@ -90,6 +90,7 @@ def test_samples_captured_end_to_end(spark, sqlite_path):
 
     enable(spark, sqlite_path=sqlite_path, backend="fake", inline_worker=False)
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
+    conf.set_value(conf.SAMPLING, "true")  # opt-in
     udf = UserDefinedFunction(greet, StringType())  # cache miss -> func wrapped
     df = spark.createDataFrame([("bo",), ("holden",), (None,)], ["name"])
     rows = [r[0] for r in df.select(udf("name")).collect()]

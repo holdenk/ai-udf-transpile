@@ -10,6 +10,7 @@ produce lands as a failed row with the reason -- the rejection is the result.
   python examples/fill_targets.py --target catalyst   # SQL
   python examples/fill_targets.py --target java_udf   # Java
   python examples/fill_targets.py --target rust       # needs $COMET_JAR + cargo
+  python examples/fill_targets.py --target all        # each kind in turn, its own process
 
 Resumable: a row that already settled in the per-kind catalog is skipped.
 One function at a time, on purpose.
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -34,7 +36,7 @@ from bench_catalog import _function_name, _session  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.backends import get_backend  # noqa: E402
-from ai_udf_transpile.catalog import infra_failure  # noqa: E402
+from ai_udf_transpile.catalog import CacheRow, infra_failure  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
 from ai_udf_transpile.targets import NO_RUST_SUFFIX  # noqa: E402
 from ai_udf_transpile.worker import process_row  # noqa: E402
@@ -56,15 +58,44 @@ def _comet_confs(jar: str) -> dict[str, str]:
     }
 
 
+def _fill_all(args: argparse.Namespace) -> int:
+    """Every kind, one child process each: a kind's Spark session (Comet's jar
+    for rust) is fixed when its JVM starts, so kinds cannot share one."""
+    failed = 0
+    for kind in KINDS:
+        if kind == "rust" and not (
+            os.environ.get("AI_UDF_TRANSPILE_COMET_JAR") or os.environ.get("COMET_JAR")
+        ):
+            print("##### rust: skipped (no $COMET_JAR; source .comet-env) #####")
+            continue
+        print(f"##### {kind} #####", flush=True)
+        argv = [sys.executable, "-u", __file__, "--target", kind, "--source", args.source]
+        for name in args.only:
+            argv += ["--only", name]
+        if subprocess.run(argv, check=False).returncode != 0:
+            print(f"{kind}: fill failed", file=sys.stderr)
+            failed = 1
+    return failed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True, choices=KINDS)
+    parser.add_argument(
+        "--target",
+        required=True,
+        choices=[*KINDS, "all"],
+        help="the one rewrite kind to ask for; all = each kind separately (rust only with $COMET_JAR)",
+    )
     parser.add_argument(
         "--source", default="target/examples_transpiled.sqlite", help="catalog holding the UDF sources"
     )
     parser.add_argument("--out", help="per-kind catalog (default target/targets/<kind>.sqlite)")
     parser.add_argument("--only", action="append", default=[], help="function name to run (repeatable)")
     args = parser.parse_args()
+    if args.target == "all":
+        if args.out:
+            parser.error("--out names one kind's catalog; with --target all each kind uses its default")
+        return _fill_all(args)
     out = Path(args.out or f"target/targets/{args.target}.sqlite")
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -72,7 +103,7 @@ def main() -> int:
         print(f"no source catalog at {args.source}", file=sys.stderr)
         return 1
     src = SqliteCatalog(Path(args.source))
-    sources: dict[str, object] = {}
+    sources: dict[str, CacheRow] = {}
     for raw in src._conn.execute("SELECT * FROM cache").fetchall():
         row = _row_from_sql(raw)
         if not row.spark_version.endswith(NO_RUST_SUFFIX) and row.origin != "human":

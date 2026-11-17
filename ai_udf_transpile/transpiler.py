@@ -7,8 +7,9 @@ import ast
 import contextlib
 import contextvars
 import logging
+import re
 import weakref
-from typing import Any, List, Optional
+from typing import Any, Iterator, List, Optional
 
 from ai_udf_transpile import conf
 from ai_udf_transpile.catalog import HIT, MISS, Catalog
@@ -67,6 +68,34 @@ def _pin_session(spark: Any) -> None:
             SparkSession._get_j_spark_session_class(jvm).setActiveSession(jspark)
     except Exception:
         logger.debug("could not pin SparkSession to this thread", exc_info=True)
+
+
+# The function names _reconstruct_column registers: javac.verify_function_name
+# ("ai_udf" / "ai_udf_gpu") and rustc's library names ("ai_udf_rs_"). Every
+# such rewrite is served as exactly `CAST(<name>(args) AS <type>)`, so the call
+# is anchored to the head of the expression: the same name inside a SQL
+# rewrite's string literal (or anywhere but the outermost call) is not a match.
+_SERVED_CALL = re.compile(r"^(?:Column<')?CAST\(ai_udf_(rs_|gpu_)?[0-9a-f]{16}\(")
+_SERVED_KINDS = {"rs_": "rust", "gpu_": "gpu_kernel", "": "java_udf"}
+
+
+def served_kind(udf: Any) -> Optional[str]:
+    """The rewrite kind a constructed ``UserDefinedFunction`` actually carries.
+
+    Read from the served expression itself, not the catalog or the targets
+    conf: the cache key has no kind, so a session asking for java_udf can be
+    served a Catalyst rewrite another session filled. None when not
+    transpiled; ``catalyst`` for SQL, or ``java_udf`` / ``gpu_kernel`` /
+    ``rust`` when the expression calls a function this plugin registered.
+    """
+    transpiled = getattr(udf, "transpiled", None)
+    if not transpiled:
+        return None
+    for part in transpiled:
+        found = _SERVED_CALL.match(str(part).strip())
+        if found:
+            return _SERVED_KINDS[found.group(1) or ""]
+    return "catalyst"
 
 
 def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
@@ -150,7 +179,7 @@ _NO_RUST_ROUTING: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 
 @contextlib.contextmanager
-def no_rust_routing():
+def no_rust_routing() -> Iterator[None]:
     """Resolve UDFs to their no-Rust twin key inside the block (the worker's
     smoke test of a twin row must reconstruct that row, not the Rust one)."""
     token = _NO_RUST_ROUTING.set(True)
@@ -209,7 +238,7 @@ def _maybe_wrap_sampling(spark: Any, key: str, in_cats: list[str]) -> None:
     if spark is None or not ({"string", "map", "timestamp", "array"} & set(in_cats)):
         return
     try:
-        if not conf.get_bool(conf.SAMPLING, spark, True):
+        if not conf.get_bool(conf.SAMPLING, spark, conf.DEFAULTS[conf.SAMPLING] == "true"):
             return
         if conf.get_value(conf.CATALOG, spark, conf.DEFAULTS[conf.CATALOG]).strip().lower() != "sqlite":
             return
@@ -226,7 +255,7 @@ def _maybe_wrap_sampling(spark: Any, key: str, in_cats: list[str]) -> None:
         logger.debug("could not wrap UDF for sampling", exc_info=True)
 
 
-def get_transpiler_class() -> type:
+def get_transpiler_class() -> type[Any]:
     global _TRANSPILER_CLS
     if _TRANSPILER_CLS is not None:
         return _TRANSPILER_CLS
@@ -307,7 +336,7 @@ def get_transpiler_class() -> type:
     return AITranspiler
 
 
-def register_transpiler() -> type:
+def register_transpiler() -> type[Any]:
     cls = get_transpiler_class()
     cls.register()
     return cls

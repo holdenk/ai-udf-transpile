@@ -31,6 +31,47 @@ from ai_udf_transpile.catalog import CacheRow
 
 _SAMPLES_SHOWN = 3
 
+NO_SAMPLES_WARNING = (
+    "!! NO REAL INPUT ROWS SAMPLED: verified only on built-in and generated values.\n"
+    "!! Rows are sampled only when a UDF has no catalog row yet, so rerunning it\n"
+    "!! will not add any to this parked rewrite. To check it against real rows,\n"
+    "!! reject it, delete its row from the catalog, set\n"
+    "!! spark.sql.experimental.aiUdfTranspile.sampling=true and run the UDF again."
+)
+
+
+def _sampleable(input_types: list[str]) -> bool:
+    """Input types the sampler captures (mirrors transpiler._maybe_wrap_sampling)."""
+    for t in input_types:
+        t = (t or "").strip().lower()
+        if t in {"string", "timestamp", "timestamp_ntz"} or t.startswith(("map<", "array<")):
+            return True
+    return False
+
+
+def _unsampled(rows: list[CacheRow], catalog: Any) -> int:
+    count = 0
+    for row in rows:
+        if not _sampleable(row.input_types):
+            continue
+        try:
+            if not catalog.samples_for(row.udf_key, limit=1):
+                count += 1
+        except Exception:
+            count += 1
+    return count
+
+
+def _no_samples_banner(rows: list[CacheRow], catalog: Any, out: TextIO) -> None:
+    missing = _unsampled(rows, catalog)
+    if missing:
+        print(
+            f"warning: {missing} of {len(rows)} rewrite(s) have no sampled real inputs; "
+            "real-row sampling is off by default "
+            "(spark.sql.experimental.aiUdfTranspile.sampling=true turns it on)",
+            file=out,
+        )
+
 
 def default_reviewer() -> str:
     for var in ("AI_UDF_TRANSPILE_REVIEWER", "USER", "USERNAME"):
@@ -95,8 +136,8 @@ def describe(row: CacheRow, catalog: Any = None, *, triggers: Any = None) -> str
         if samples:
             lines.append(f"real inputs it was checked on (latest {len(samples)}):")
             lines.extend(f"    {s!r}" for s in samples)
-        elif any(t == "string" for t in row.input_types):
-            lines.append("no sampled real inputs: string columns were checked on NULL/fixed examples only")
+        elif _sampleable(row.input_types):
+            lines.append(NO_SAMPLES_WARNING)
     return "\n".join(lines)
 
 
@@ -128,6 +169,7 @@ def review(
         print("nothing awaiting approval", file=out)
         return counts
     print(f"{len(rows)} rewrite(s) awaiting approval; reviewing as {reviewer}", file=out)
+    _no_samples_banner(rows, catalog, out)
     for index, row in enumerate(rows, 1):
         print(f"\n=== [{index}/{len(rows)}] ===", file=out)
         print(describe(row, catalog, triggers=triggers), file=out)
@@ -183,6 +225,7 @@ def browse(
         print("nothing awaiting approval", file=out)
         return 0
     print(f"{len(rows)} rewrite(s) awaiting approval (read-only; nothing is changed)", file=out)
+    _no_samples_banner(rows, catalog, out)
     seen: set[int] = set()
     index = 0
     show = True
@@ -264,6 +307,8 @@ def main(argv: Optional[list[str]] = None, *, out: TextIO = sys.stdout) -> int:
             rows = catalog.awaiting_approval()
             if not rows:
                 print("nothing awaiting approval", file=out)
+            else:
+                _no_samples_banner(rows, catalog, out)
             for row in rows:
                 print(describe(row, catalog, triggers=triggers), file=out)
                 print(file=out)

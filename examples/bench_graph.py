@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 
 class _Schema:
@@ -100,7 +100,7 @@ def log_png_path(png_path: str) -> Path:
     return path.with_name(f"{path.stem}_log{path.suffix}")
 
 
-def schema_for(header: list[str]) -> _Schema:
+def schema_for(header: Sequence[str]) -> _Schema:
     for schema in (MICRO_SCHEMA, BYTECODE_SCHEMA):
         if schema.sniff_column in header:
             return schema

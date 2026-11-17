@@ -15,7 +15,13 @@ import re
 import textwrap
 import threading
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
+
+if TYPE_CHECKING:
+    from decimal import Decimal
+
+    from hypothesis.strategies import SearchStrategy
+    from pyspark.sql.types import DataType, StructField
 
 logger = logging.getLogger(__name__)
 
@@ -597,7 +603,7 @@ def _rust_std_receiver(before: str, fields: set[str]) -> bool:
     return not tail[i:].strip()
 
 
-def _rust_alias_resolver(scanned: str):
+def _rust_alias_resolver(scanned: str) -> Callable[[str], str]:
     """A function mapping a ``use .. as`` alias (chains included) to the name it renames."""
     aliases = {}
     for use in _RUST_USE.finditer(scanned):
@@ -707,7 +713,7 @@ def _rust_int_expr(text: str) -> float:
     return float(result) if result >= 0 else _RUST_INFINITE
 
 
-def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Optional[str]:
+def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve: Callable[[str], str]) -> Optional[str]:
     """Why the source may need more stack than ``_RUST_STACK_BUDGET``, if it may.
 
     Counts every array type or repeat expression (``[T; N]``, ``[x; N]``,
@@ -766,13 +772,13 @@ def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Option
         else:
             words = [resolve(w) for w in re.findall(r"[A-Za-z_]\w*", elem)]
             local = [w for w in words if w in types]
-            prim = [_RUST_PRIM_SIZE[w] for w in words if w in _RUST_PRIM_SIZE]
+            prim: list[float] = [_RUST_PRIM_SIZE[w] for w in words if w in _RUST_PRIM_SIZE]
             each = max([local_size(w, seen | {w}) for w in local] + prim or [8])
         if each == _RUST_INFINITE:
             return _RUST_INFINITE  # an unsizable element stays unsizable, even times 0
         return n * each
 
-    def occurrences(text: str):
+    def occurrences(text: str) -> Iterator[str]:
         """Every array to count: ``vec![x; n]`` is heap, but an array inside it is not."""
         for i in _rust_top_brackets(text):
             inner = text[i + 1 : _rust_close(text, i)]
@@ -817,7 +823,8 @@ def _rust_close(text: str, i: int) -> int:
 
 def _rust_top_brackets(text: str) -> list[int]:
     """Start of every outermost ``[..]`` in ``text`` (nested ones are their contents)."""
-    out, i = [], 0
+    out: list[int] = []
+    i = 0
     while True:
         i = text.find("[", i)
         if i < 0:
@@ -1034,7 +1041,7 @@ def _rust_recursion(scanned: str) -> Optional[str]:
             if mentions(text, other, fields):
                 edges[name].add(other)
     for node in sorted(names):
-        seen: set[str] = set()
+        seen = set()
         stack = list(edges[node])
         while stack:
             cur = stack.pop()
@@ -1201,7 +1208,84 @@ def load_python_udf(
     return callables[-1]
 
 
-def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
+# Value range of each integral input type. Draws and built-in examples stay
+# inside it: a value the column cannot hold is not an input the UDF can ever
+# see, and createDataFrame rejects it -- which used to surface as "sql
+# raised" and reject every rewrite of an int / smallint / tinyint UDF.
+_INT_INPUT_RANGES = {
+    "tinyint": (-(2**7), 2**7 - 1),
+    "byte": (-(2**7), 2**7 - 1),
+    "smallint": (-(2**15), 2**15 - 1),
+    "short": (-(2**15), 2**15 - 1),
+    "int": (-(2**31), 2**31 - 1),
+    "integer": (-(2**31), 2**31 - 1),
+    "bigint": (-(2**63), 2**63 - 1),
+    "long": (-(2**63), 2**63 - 1),
+}
+
+_DECIMAL_TYPE = re.compile(r"^decimal\s*(?:\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?$")
+
+
+def _decimal_shape(spark_type: str) -> Optional[tuple[int, int]]:
+    """(precision, scale) of a decimal type spelling; Spark's (10, 0) when bare."""
+    m = _DECIMAL_TYPE.match(spark_type.strip().lower())
+    if not m:
+        return None
+    precision = int(m.group(1)) if m.group(1) else 10
+    scale = int(m.group(2)) if m.group(2) else 0
+    if not 1 <= precision <= 38 or scale > precision:
+        return None
+    return precision, scale
+
+
+def _decimal_bound(precision: int, scale: int) -> Decimal:
+    """Largest magnitude a decimal(precision, scale) column holds."""
+    from decimal import Decimal
+
+    # Built from a string: exact at any precision. Arithmetic would round in
+    # the default 28-digit context and overshoot decimal(38, s).
+    return Decimal(f"{10**precision - 1}E-{scale}")
+
+
+def _int_examples_for(stype: str) -> list[int]:
+    """Built-in integers that fit the input column, plus its own edges."""
+    from ai_udf_transpile.sampling import BUILTIN_INT_EXAMPLES
+
+    lo, hi = _INT_INPUT_RANGES[stype]
+    examples = [n for n in BUILTIN_INT_EXAMPLES if lo <= n <= hi]
+    # Each narrow type's own edges: where a rewrite's arithmetic overflows
+    # the input type (ANSI int + 1) but python's unbounded int does not.
+    for edge in (lo, hi):
+        if edge not in examples:
+            examples.append(edge)
+    return examples
+
+
+def _decimal_examples_for(stype: str) -> list:
+    """Built-in decimals that fit the column exactly: signs, halves (banker's
+    rounding), and the type's own extremes."""
+    from decimal import Decimal, localcontext
+
+    shape = _decimal_shape(stype)
+    if shape is None:
+        return []
+    precision, scale = shape
+    bound = _decimal_bound(precision, scale)
+    quantum = Decimal(f"1E-{scale}")
+    out: list = []
+    with localcontext() as ctx:
+        ctx.prec = 60  # past decimal(38, s); the default 28 cannot quantize there
+        for text in ("0", "1", "-1", "0.5", "-0.5", "2.5", "-2.5", "0.01", "-0.01"):
+            value = Decimal(text)
+            exact = value.quantize(quantum)
+            if exact != value or exact.copy_abs() > bound:
+                continue  # not representable at this scale / precision
+            out.append(exact)
+    out.extend([bound, bound.copy_negate()])
+    return list(dict.fromkeys(out))
+
+
+def _strategy_for(spark_type: str, *, party_on_strings: bool = False) -> SearchStrategy[Any]:
     from hypothesis import strategies as st
 
     t = spark_type.strip().lower()
@@ -1210,10 +1294,26 @@ def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
         # diverges (the prompt's own floor(x / y) trick); int32-only draws
         # never differentially test it.
         return st.one_of(st.none(), st.integers(min_value=-(2**63), max_value=2**63 - 1))
-    if t in {"int", "integer", "smallint", "tinyint", "byte", "short"}:
-        return st.one_of(st.none(), st.integers(min_value=-(2**31), max_value=2**31 - 1))
+    if t in _INT_INPUT_RANGES:
+        lo, hi = _INT_INPUT_RANGES[t]
+        return st.one_of(st.none(), st.integers(min_value=lo, max_value=hi))
     if t.startswith("decimal"):
-        return st.one_of(st.none(), st.decimals(allow_nan=False, allow_infinity=False, places=4))
+        shape = _decimal_shape(t)
+        if shape is None:
+            raise VerifyFailed(f"unsupported input type for verify: {spark_type}")
+        precision, scale = shape
+        from decimal import Decimal
+
+        # An unscaled integer shifted by the scale: every draw is exactly
+        # representable in the column, so python and sql see the same value,
+        # and integers() biases toward the 0 / +-max edges. st.decimals is
+        # not used: it rounds its bounds in the 28-digit default context and
+        # draws -1E20 for decimal(38,18), which the column cannot hold.
+        unscaled = 10**precision - 1
+        return st.one_of(
+            st.none(),
+            st.integers(min_value=-unscaled, max_value=unscaled).map(lambda n: Decimal(f"{n}E-{scale}")),
+        )
     if t in {"double", "float"}:
         return st.one_of(
             st.none(),
@@ -1248,7 +1348,7 @@ def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
         key_t, _, val_t = t[4:-1].partition(",")
         if key_t.strip() == "string" and val_t.strip() == "string":
 
-            def _text(max_size: int):
+            def _text(max_size: int) -> SearchStrategy[str]:
                 return st.text(
                     alphabet=st.characters(blacklist_categories=("Cs", "Cn")),
                     max_size=max_size,
@@ -1301,7 +1401,7 @@ def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
     raise VerifyFailed(f"unsupported input type for verify: {spark_type}")
 
 
-def _spark_type(simple: str):
+def _spark_type(simple: str) -> DataType:
     from pyspark.sql.types import (
         BinaryType,
         BooleanType,
@@ -1319,6 +1419,11 @@ def _spark_type(simple: str):
     if t.startswith("map<") and t.endswith(">"):
         key_t, _, val_t = t[4:-1].partition(",")
         return MapType(_spark_type(key_t), _spark_type(val_t))
+    shape = _decimal_shape(t)
+    if shape is not None:
+        from pyspark.sql.types import DecimalType
+
+        return DecimalType(*shape)
     if t.startswith("array<") and t.endswith(">"):
         from pyspark.sql.types import ArrayType
 
@@ -1346,7 +1451,7 @@ def _spark_type(simple: str):
         "boolean": BooleanType(),
         "bool": BooleanType(),
         "binary": BinaryType(),
-    }.get(t, LongType() if t.startswith("decimal") else StringType())
+    }.get(t, StringType())
 
 
 # One Spark job per example dominates verify time. A hundred rows in one
@@ -1355,7 +1460,7 @@ def _spark_type(simple: str):
 SQL_BATCH_ROWS = 100
 
 
-def _param_fields(input_types: list[str]):
+def _param_fields(input_types: list[str]) -> list[StructField]:
     from pyspark.sql.types import StructField
 
     return [
@@ -1374,7 +1479,7 @@ _NATIVE_ROWS: dict[int, dict[str, Any]] = {}
 
 
 @contextmanager
-def _comet_native_rows(spark: Any, native: bool):
+def _comet_native_rows(spark: Any, native: bool) -> Iterator[None]:
     """Let Comet take the operator above an in-memory DataFrame.
 
     A Rust UDF runs only inside Comet's native execution, and the verifier's
@@ -1416,7 +1521,7 @@ class VerifyQueryTimeout(RuntimeError):
 
 
 @contextlib.contextmanager
-def _query_deadline(spark: Any):
+def _query_deadline(spark: Any) -> Iterator[None]:
     """Cancel the Spark jobs started inside after ``verifyQueryTimeoutSeconds``.
 
     A candidate whose loop never ends (Java or Rust; SQL cannot loop) would
@@ -1466,7 +1571,7 @@ def _query_deadline(spark: Any):
 
 def _eval_sql(
     spark: Any, sql: str, args: tuple, input_types: list[str], return_type: str, native: bool = False
-):
+) -> Any:
     from pyspark.sql import Row
     from pyspark.sql.types import StructType
 
@@ -1649,10 +1754,7 @@ def _rust_udf_expr(
     return rustc.call_expr(compiled.name, input_types)
 
 
-_INT_RETURN_RANGES = {
-    "int": (-(2**31), 2**31 - 1),
-    "bigint": (-(2**63), 2**63 - 1),
-}
+_INT_RETURN_RANGES = _INT_INPUT_RANGES
 
 
 def _representable(value: Any, return_type: str) -> bool:
@@ -1663,10 +1765,58 @@ def _representable(value: Any, return_type: str) -> bool:
     column can hold), so the value is out of contract: the sql side may do
     anything there, including raise ANSI overflow on the final cast.
     """
-    rng = _INT_RETURN_RANGES.get(return_type)
+    t = return_type.strip().lower()
+    rng = _INT_RETURN_RANGES.get(t)
     if rng is not None and isinstance(value, int) and not isinstance(value, bool):
         return rng[0] <= value <= rng[1]
+    shape = _decimal_shape(t)
+    if shape is not None:
+        from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
+
+        if isinstance(value, (int, Decimal)) and not isinstance(value, bool):
+            precision, scale = shape
+            try:
+                d = Decimal(value)
+                if not d.is_finite():
+                    return False
+                # Spark rounds to the scale (HALF_UP) first, then fails or
+                # nulls on integer digits past precision - scale: 99999999.995
+                # does not fit decimal(10,2), it rounds to 100000000.00.
+                with localcontext() as ctx:
+                    ctx.prec = max(d.adjusted() + scale + 2, precision + 2, 40)
+                    rounded = d.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP)
+                return rounded.copy_abs() < Decimal(10 ** (precision - scale))
+            except (InvalidOperation, ValueError):
+                return False
     return True
+
+
+_MAX_EXPLICIT_EXAMPLES = 160
+
+
+def _diagonal_combos(sizes: list[int]) -> Iterator[tuple[int, ...]]:
+    """Index tuples of the product of ``range(n) for n in sizes``, lazily, in
+    ``(sum(c), c)`` order: by index sum, then lexicographically within a sum."""
+    if any(n <= 0 for n in sizes):
+        return
+    if not sizes:
+        yield ()
+        return
+    # tail_max[i]: the largest index sum positions i.. can reach.
+    tail_max = [0] * (len(sizes) + 1)
+    for i in range(len(sizes) - 1, -1, -1):
+        tail_max[i] = tail_max[i + 1] + sizes[i] - 1
+
+    def with_sum(i: int, remaining: int) -> Iterator[tuple[int, ...]]:
+        if i == len(sizes) - 1:
+            yield (remaining,)
+            return
+        for v in range(max(0, remaining - tail_max[i + 1]), min(sizes[i] - 1, remaining) + 1):
+            for tail in with_sum(i + 1, remaining - v):
+                yield (v, *tail)
+
+    for total in range(tail_max[0] + 1):
+        yield from with_sum(0, total)
 
 
 def _within_tolerance(py_value: Any, sql_value: Any, tolerance: float) -> bool:
@@ -1780,6 +1930,9 @@ def hypothesis_check(
         if py_exc is not None:
             # Spark's own hypothesis policy: python raise + sql value is allowed.
             return
+        if not _representable(sql_value, return_type):
+            mismatch.append(f"sql result {sql_value!r} does not fit {return_type} on {args!r}")
+            return
         if not _within_tolerance(py_value, sql_value, tolerance):
             mismatch.append(f"mismatch on {args!r}: python={py_value!r} sql={sql_value!r}")
 
@@ -1825,12 +1978,12 @@ def hypothesis_check(
             py_exc = exc
             py_value = _SENTINEL_RAISED
         else:
-            py_successes[0] += 1
             if not _representable(py_value, return_type):
                 # Out of contract: executing the python UDF with the declared
                 # return type would fail as well, so the sql side may do
                 # anything (ANSI overflow on cast(bround(1e37) as bigint)).
                 return
+            py_successes[0] += 1
         queued.append((args, py_value, py_exc))
 
     def _explicit_examples() -> list[tuple]:
@@ -1845,7 +1998,6 @@ def hypothesis_check(
             BUILTIN_ARRAY_EXAMPLES,
             BUILTIN_BOOL_EXAMPLES,
             BUILTIN_DOUBLE_EXAMPLES,
-            BUILTIN_INT_EXAMPLES,
             BUILTIN_MAP_EXAMPLES,
             BUILTIN_NESTED_ARRAY_EXAMPLES,
             BUILTIN_STRING_EXAMPLES,
@@ -1867,12 +2019,15 @@ def hypothesis_check(
             if stype == "string" and party_on_strings:
                 for text in BUILTIN_STRING_EXAMPLES:
                     examples.append(tuple(text if j == i else None for j in range(arity)))
-            elif stype in {"bigint", "long", "int", "integer", "smallint", "tinyint"}:
-                for n in BUILTIN_INT_EXAMPLES:
+            elif stype in _INT_INPUT_RANGES:
+                for n in _int_examples_for(stype):
                     examples.append(tuple(n if j == i else None for j in range(arity)))
+            elif stype.startswith("decimal"):
+                for d in _decimal_examples_for(stype):
+                    examples.append(tuple(d if j == i else None for j in range(arity)))
             elif stype in {"double", "float"}:
-                for n in BUILTIN_DOUBLE_EXAMPLES:
-                    examples.append(tuple(n if j == i else None for j in range(arity)))
+                for x in BUILTIN_DOUBLE_EXAMPLES:
+                    examples.append(tuple(x if j == i else None for j in range(arity)))
             elif stype.startswith("map<"):
                 for m in BUILTIN_MAP_EXAMPLES:
                     examples.append(tuple(dict(m) if j == i else None for j in range(arity)))
@@ -1897,15 +2052,17 @@ def hypothesis_check(
             # 5 arrays x 5 arrays = 2500 for a 4-param UDF), so enumerate
             # diagonally (by index sum): every param's values appear within
             # the first few combos instead of being truncated lexicographically.
-            import itertools
-
+            # Generated lazily and cut at the cap: eight decimal params alone
+            # are 11**8 combos, far too many to build and sort first.
             per_param: list[list] = []
             for spark_type in input_types:
                 stype = spark_type.strip().lower()
                 if stype == "string":
                     per_param.append(list(CROSS_STRING_EXAMPLES) if party_on_strings else [None])
-                elif stype in {"bigint", "long", "int", "integer", "smallint", "tinyint"}:
-                    per_param.append(list(BUILTIN_INT_EXAMPLES))
+                elif stype in _INT_INPUT_RANGES:
+                    per_param.append(_int_examples_for(stype))
+                elif stype.startswith("decimal"):
+                    per_param.append(_decimal_examples_for(stype) or [None])
                 elif stype in {"double", "float"}:
                     per_param.append(list(BUILTIN_DOUBLE_EXAMPLES))
                 elif stype.startswith("map<"):
@@ -1920,13 +2077,11 @@ def hypothesis_check(
                     per_param.append(list(BUILTIN_TIMESTAMP_EXAMPLES))
                 else:
                     per_param.append([None])
-            index_combos = sorted(
-                itertools.product(*(range(len(p)) for p in per_param)),
-                key=lambda c: (sum(c), c),
-            )
-            for combo in index_combos:
+            for combo in _diagonal_combos([len(p) for p in per_param]):
+                if len(examples) >= _MAX_EXPLICIT_EXAMPLES:
+                    break
                 examples.append(tuple(per_param[i][idx] for i, idx in enumerate(combo)))
-        return examples[:160]
+        return examples[:_MAX_EXPLICIT_EXAMPLES]
 
     check = _run
     for ex in _explicit_examples():

@@ -17,13 +17,17 @@ usage() {
 Usage: examples/setup_comet.sh [options]
 
 Options:
-  --spark-home PATH        Spark checkout/build root (default: $SPARK_HOME or ~/spark)
+  --spark-home PATH        Spark checkout/build root or unpacked release (default: $SPARK_HOME or ~/spark)
   --comet-home PATH        Comet clone/build root (default: $COMET_HOME or ~/datafusion-comet)
   --ref REF                Comet git ref to checkout (default: main)
   --profile PROFILE        Override Comet Spark profile (spark-3.4|spark-3.5|spark-4.0|spark-4.1|spark-4.2)
   --scala-binary VERSION   Override scala binary version (2.12 or 2.13)
   --write-env-file PATH    Write COMET_JAR / COMET_HOME exports to PATH for `source PATH`
   --skip-build             Skip `make release`; only resolve jar path from existing build output
+  --target-cpu CPU         Build libcomet for this rustc target CPU instead of `make release`'s
+                           -Ctarget-cpu=native (e.g. x86-64-v2). Needed when the build is cached
+                           and reused on other machines: a native build can die with SIGILL on a
+                           CPU that lacks an instruction the build machine had.
   --dry-run                Skip build and stop after showing detected settings
   -h, --help               Show this help
 
@@ -108,6 +112,7 @@ SCALA_OVERRIDE=""
 WRITE_ENV_FILE=""
 SKIP_BUILD=0
 DRY_RUN=0
+TARGET_CPU=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -141,6 +146,11 @@ while [ $# -gt 0 ]; do
       WRITE_ENV_FILE="$2"
       shift
       ;;
+    --target-cpu)
+      [ $# -ge 2 ] || error "--target-cpu needs a value"
+      TARGET_CPU="$2"
+      shift
+      ;;
     --skip-build)
       SKIP_BUILD=1
       ;;
@@ -159,7 +169,14 @@ while [ $# -gt 0 ]; do
 done
 
 [ -d "$SPARK_HOME_ARG" ] || error "spark home does not exist: $SPARK_HOME_ARG"
-[ -f "$SPARK_HOME_ARG/pom.xml" ] || error "spark pom missing: $SPARK_HOME_ARG/pom.xml"
+# A source checkout has a pom; a binary release (examples/setup_spark.sh
+# --spark 4.3) only has jars, whose names carry the same two facts.
+SPARK_CORE_JAR=""
+if [ ! -f "$SPARK_HOME_ARG/pom.xml" ]; then
+  SPARK_CORE_JAR="$(ls "$SPARK_HOME_ARG"/jars/spark-core_*.jar 2>/dev/null | head -n1)"
+  [ -n "$SPARK_CORE_JAR" ] \
+    || error "no pom.xml and no jars/spark-core_*.jar under $SPARK_HOME_ARG"
+fi
 
 require_cmd git
 require_cmd make
@@ -179,6 +196,12 @@ if [ -z "$PYTHON_BIN" ]; then
   fi
 fi
 
+if [ -n "$SPARK_CORE_JAR" ]; then
+  # spark-core_2.13-4.3.0.jar -> "4.3 2.13"
+  _jar="$(basename "$SPARK_CORE_JAR" .jar)"
+  SPARK_SCALA="$(echo "$_jar" | sed -nE 's/^spark-core_([0-9]+\.[0-9]+)-.*$/\1/p')"
+  SPARK_MINOR="$(echo "$_jar" | sed -nE 's/^spark-core_[0-9.]+-([0-9]+\.[0-9]+).*$/\1/p')"
+else
 read -r SPARK_MINOR SPARK_SCALA <<EOF
 $("$PYTHON_BIN" - "$SPARK_HOME_ARG/pom.xml" <<'PY'
 import re
@@ -213,8 +236,9 @@ print(minor, scala)
 PY
 )
 EOF
+fi
 
-[ -n "$SPARK_MINOR" ] || error "could not detect Spark version from $SPARK_HOME_ARG/pom.xml"
+[ -n "$SPARK_MINOR" ] || error "could not detect Spark version from $SPARK_HOME_ARG"
 if [ -z "$SPARK_SCALA" ]; then
   warn "could not detect scala.binary.version from Spark pom; defaulting to 2.13"
   SPARK_SCALA="2.13"
@@ -288,10 +312,22 @@ echo "Comet profile: $PROFILE (build profiles: $PROFILES)"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "dry-run: skipping build"
-  echo "would run: (cd $COMET_HOME_ARG && make release PROFILES=\"$PROFILES\")"
+  if [ -n "$TARGET_CPU" ]; then
+    echo "would run: (cd $COMET_HOME_ARG/native && RUSTFLAGS=-Ctarget-cpu=$TARGET_CPU cargo build --release)"
+    echo "           (cd $COMET_HOME_ARG && ./mvnw install -Prelease -DskipTests $PROFILES)"
+  else
+    echo "would run: (cd $COMET_HOME_ARG && make release PROFILES=\"$PROFILES\")"
+  fi
   exit 0
 elif [ "$SKIP_BUILD" -eq 1 ]; then
   echo "skip-build: not rebuilding Comet"
+elif [ -n "$TARGET_CPU" ]; then
+  # `make release` without its hard-coded -Ctarget-cpu=native (which wins
+  # over any RUSTFLAGS passed in): the same two steps, portable CPU target.
+  echo "building libcomet for target-cpu=$TARGET_CPU"
+  (cd "$COMET_HOME_ARG/native" && RUSTFLAGS="${RUSTFLAGS:-} -Ctarget-cpu=$TARGET_CPU" cargo build --release)
+  # shellcheck disable=SC2086  # PROFILES is a word list of -P flags
+  (cd "$COMET_HOME_ARG" && ./mvnw install -Prelease -DskipTests $PROFILES)
 else
   (cd "$COMET_HOME_ARG" && make release PROFILES="$PROFILES")
 fi

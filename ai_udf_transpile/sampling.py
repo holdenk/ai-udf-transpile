@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Best-effort capture of real input values seen by the Python UDF.
 
-On a cache miss the transpiler wraps the UDF's ``func`` (before PySpark
+Opt-in via ``spark.sql.experimental.aiUdfTranspile.sampling=true`` (off by
+default: it copies real argument values into the catalog file). When on, on
+a cache miss the transpiler wraps the UDF's ``func`` (before PySpark
 pickles it) with a sampler that records a few argument tuples per executor
 process into the catalog's ``samples`` table. Purely random strings can make
 a wrong rewrite look fine -- a JSON-parser UDF raises on random text and so
@@ -296,14 +298,14 @@ def udf_instance_from_spark_stack() -> Any:
         from pyspark.sql.udf import UserDefinedFunction
     except Exception:
         return None
-    frame = _inspect.currentframe()
+    current = _inspect.currentframe()
+    frame = current.f_back if current is not None else None
     try:
-        frame = frame.f_back
         while frame is not None:
             candidate = frame.f_locals.get("self")
             if isinstance(candidate, UserDefinedFunction):
                 return candidate
             frame = frame.f_back
     finally:
-        del frame
+        del frame, current
     return None

@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -33,7 +33,7 @@ class CandidateResult:
 def _substitute_params(sql: str, cols: list[str]) -> str:
     """Replace _udf_param_N placeholders with actual column names."""
 
-    def repl(m):
+    def repl(m: re.Match[str]) -> str:
         idx = int(m.group(1))
         return cols[idx] if idx < len(cols) else m.group(0)
 
@@ -46,7 +46,16 @@ def _noop_seconds(spark: SparkSession, df: Any) -> float:
     return time.perf_counter() - start
 
 
-def _benchmark_one(spark, backend, model, sql, input_df, cols, rows, rounds):
+def _benchmark_one(
+    spark: SparkSession,
+    backend: str,
+    model: str,
+    sql: str,
+    input_df: Any,
+    cols: list[str],
+    rows: int,
+    rounds: int,
+) -> Optional[CandidateResult]:
     """Returns CandidateResult, or None if unparseable."""
     real_sql = _substitute_params(sql, cols)
     try:
