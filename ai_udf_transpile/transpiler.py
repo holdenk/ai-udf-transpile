@@ -71,8 +71,11 @@ def _pin_session(spark: Any) -> None:
 
 
 # The function names _reconstruct_column registers: javac.verify_function_name
-# ("ai_udf" / "ai_udf_gpu") and rustc's library names ("ai_udf_rs_").
-_SERVED_CALL = re.compile(r"\bai_udf_(rs_|gpu_)?[0-9a-f]{16}\(")
+# ("ai_udf" / "ai_udf_gpu") and rustc's library names ("ai_udf_rs_"). Every
+# such rewrite is served as exactly `CAST(<name>(args) AS <type>)`, so the call
+# is anchored to the head of the expression: the same name inside a SQL
+# rewrite's string literal (or anywhere but the outermost call) is not a match.
+_SERVED_CALL = re.compile(r"^(?:Column<')?CAST\(ai_udf_(rs_|gpu_)?[0-9a-f]{16}\(")
 _SERVED_KINDS = {"rs_": "rust", "gpu_": "gpu_kernel", "": "java_udf"}
 
 
@@ -88,9 +91,11 @@ def served_kind(udf: Any) -> Optional[str]:
     transpiled = getattr(udf, "transpiled", None)
     if not transpiled:
         return None
-    text = " ".join(str(part) for part in transpiled)
-    found = _SERVED_CALL.search(text)
-    return _SERVED_KINDS[found.group(1) or ""] if found else "catalyst"
+    for part in transpiled:
+        found = _SERVED_CALL.match(str(part).strip())
+        if found:
+            return _SERVED_KINDS[found.group(1) or ""]
+    return "catalyst"
 
 
 def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
