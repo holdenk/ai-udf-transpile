@@ -219,9 +219,8 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                 ):
                     rate = r.get(f"transpiled_{column}_rows_per_second")
                     if rate and r.get(f"transpile_succeeded_{column}") == "True":
-                        arms[f"ai:{kind}"] = (
-                            f"{_fmt_rate(rate)} rows/s ({r[f'{column}_speedup_vs_regular']}x vs python{where})"
-                        )
+                        speedup = r[f"{column}_speedup_vs_regular"]
+                        arms[f"ai:{kind}"] = f"{_fmt_rate(rate)} rows/s ({speedup}x vs python{where})"
                 _record_perf(perf, r["function"], arms)
         elif "declined" in rows[0]:  # bench_tpcds CSV
             for r in rows:

@@ -269,6 +269,10 @@ def fill_from_ai(spark, args, names, funcs, rtypes, cols):
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")
     spark.conf.set(TRANSPILE_CONF, "true")
     conf.set_value(conf.PARTY_ON_STRINGS, "false" if args.sampled_strings_only else "true", spark)
+    # The seed rows below reach verification only through real-row sampling,
+    # which is off by default; without it --sampled-strings-only would verify
+    # on no strings at all.
+    conf.set_value(conf.SAMPLING, "true", spark)
     string_gate = "sampled" if args.sampled_strings_only else "party"
     version = str(spark.version)
     sources = {n: canonical_source_from_func(funcs[n]) for n in names}

@@ -78,7 +78,7 @@ def test_batched_sql_result_must_fit_return_type(monkeypatch):
     monkeypatch.setattr(
         verify,
         "_eval_sql_batch",
-        lambda spark, sql, rows, input_types: [2**63 for _ in rows],
+        lambda spark, sql, rows, input_types, native=False: [2**63 for _ in rows],
     )
     ok, err = verify.hypothesis_check(
         source_text="def max_long(x: int) -> int:\n    return 2**63 - 1\n",
