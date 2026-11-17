@@ -125,8 +125,10 @@ CASES = [
         "decimal(38,18)",
         P0,
         {
-            # Rounds away the scale: 0.50 -> 1 (HALF_UP).
-            "drops_scale": (f"CAST({P0} AS DECIMAL(38,0))", "mismatch"),
+            # Rounds away the scale: 0.50 -> 1 (HALF_UP). At the column's edge
+            # the rounded value no longer fits decimal(38,18), and the range
+            # check may reject it before the comparison does: either is a kill.
+            "drops_scale": (f"CAST({P0} AS DECIMAL(38,0))", "mismatch|does not fit"),
         },
     ),
 ]
@@ -165,4 +167,5 @@ def test_mutant_rejected(spark, case, mutant_id, sql, reason):
     # killing, so a pass here never depends on what Hypothesis happened to draw.
     ok, err = _check(spark, source, sql, input_types, return_type, max_examples=1)
     assert not ok, f"mutant {mutant_id} survived: {sql}"
-    assert reason in (err or ""), err
+    # `reason` is one expected substring, or several separated by "|".
+    assert any(r in (err or "") for r in reason.split("|")), err
