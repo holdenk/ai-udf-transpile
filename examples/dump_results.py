@@ -181,7 +181,9 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     arms["udf_key"] = key
                 if any(arms.values()):
                     for k in keys:
-                        perf[k] = dict(arms)
+                        # Merged, not replaced: a later CSV of this schema (fhi
+                        # after catalog) must not blank arms it did not measure.
+                        _record_perf(perf, k, arms)
         elif "java_eval_rows_per_second" in rows[0]:  # bench_bytecode_vs_static CSV
             for r in rows:
                 arms = _empty_perf()
@@ -249,8 +251,14 @@ def _perf_for(perf: dict[str, dict[str, str]], name: str, udf_key: str) -> dict[
     then only this row's own keyed entry, if any, applies.
     """
     p = perf.get(name) or {}
-    if not p or (p.get("udf_key") and p["udf_key"] != udf_key):
-        p = perf.get(udf_key) or {}
+    if not p:
+        return perf.get(udf_key) or {}
+    if p.get("udf_key") and p["udf_key"] != udf_key:
+        # The micro bench's per-kind rates (ai:<kind>) belong to the function,
+        # not to one catalog row; dump() picks the one for the kind this row
+        # was served as, so a Rust rate never lands on a Java twin.
+        per_kind = {k: v for k, v in p.items() if k.startswith("ai:")}
+        return {**(perf.get(udf_key) or {}), **per_kind}
     return p
 
 

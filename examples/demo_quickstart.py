@@ -53,6 +53,21 @@ def gave_up(func: Callable[..., Any]) -> bool:
     return row is not None and row[0] == "failed"
 
 
+def served_kind(func: Callable[..., Any]) -> str:
+    """What the catalog actually serves for func: a row filled earlier with
+    other targets (the cache key has no kind) is not a Java UDF just because
+    java_udf is the target now."""
+    catalog = cast(SqliteCatalog, getattr(get_catalog(), "_staging", get_catalog()))
+    with catalog._lock:
+        row = catalog._conn.execute(
+            "SELECT target_kind FROM cache WHERE source_text = ? AND status = 'success'",
+            (canonical_source_from_func(func),),
+        ).fetchone()
+    return {"catalyst": "Catalyst SQL", "java_udf": "Java UDF", "rust": "Rust UDF"}.get(
+        row[0] if row else "", "not served"
+    )
+
+
 def wait_for_hit(func: Callable[..., Any], rtype: DataType, timeout: float = 900) -> UserDefinedFunction:
     """Re-create the UDF until the catalog hit flips transpiled=True."""
     deadline = time.time() + timeout
@@ -102,7 +117,7 @@ def main() -> int:
     conf.set_value(conf.TARGETS, conf.DEFAULTS[conf.TARGETS], spark)
     ok = ok and hit.transpiled
     rows = [r[0] for r in names.select(hit("name")).collect()]
-    label = " (Java UDF)" if hit.transpiled else " (TIMED OUT, still Python)"
+    label = f" ({served_kind(backwards)})" if hit.transpiled else " (TIMED OUT, still Python)"
     print(f"backwards: second call transpiled={bool(hit.transpiled)} results={rows}{label}")
 
     try:  # _conn is sqlite-catalog-only; skip the dump on wrapped catalogs

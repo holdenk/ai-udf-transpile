@@ -88,8 +88,10 @@ resolve_release() {
   local m listing best=""
   for m in "${MIRRORS[@]}"; do
     listing="$(curl -fsSL --max-time 30 "$m/" 2>/dev/null || true)"
+    # No match on this mirror is expected (try the next one): under pipefail
+    # a bare grep would abort the script before the archive is asked.
     best="$(printf '%s\n' "$listing" \
-      | grep -oE "spark-${spec//./\\.}\.[0-9]+/" \
+      | { grep -oE "spark-${spec//./\\.}\.[0-9]+/" || true; } \
       | sed -E 's#spark-(.*)/#\1#' | sort -uV | tail -n1)"
     [ -n "$best" ] && break
   done
@@ -160,8 +162,13 @@ fetch_ref() {
     echo "$home"
     return
   fi
-  if [ ! -d "$home/.git" ]; then
-    git init -q "$home"
+  [ -d "$home/.git" ] || git init -q "$home"
+  # A cached checkout may have been made for another --repo: point origin at
+  # the requested one before fetching (the built-SHA stamp still skips a
+  # rebuild when the fetched commit is the one already built).
+  if git -C "$home" remote get-url origin >/dev/null 2>&1; then
+    git -C "$home" remote set-url origin "$REPO_URL"
+  else
     git -C "$home" remote add origin "$REPO_URL"
   fi
   log "fetching $ref from $REPO_URL"

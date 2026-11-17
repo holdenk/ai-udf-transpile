@@ -239,3 +239,31 @@ def test_aggregate_collects_every_catalog_arm(tmp_path):
     assert points["ai_catalyst_comet"] == [("catalog/cat", 6.0)]
     assert points["ai_java"] == [("catalog/java", 7.0)]
     assert points["ai_java_comet"] == [("catalog/java", 8.0)]
+
+
+def test_aggregate_keeps_a_comet_catalog_files_baseline_arms_off_the_plain_arms(tmp_path):
+    path = tmp_path / "bench_catalog_comet.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "function",
+                "status",
+                "target_kind",
+                "static_speedup_vs_python",
+                "bytecode_static_speedup_vs_python",
+                "transpiled_speedup_vs_python",
+            ]
+        )
+        writer.writerow(["cat", "success", "catalyst", 2.0, 3.0, 5.0])
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("bench_graph_aggregate", AGGREGATE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    points = module.collect([path])
+
+    assert points["static"] == [] and points["ai_catalyst"] == [] and points["bytecode_static"] == []
+    assert points["static_comet"] == [("catalog comet/cat", 2.0)]
+    assert points["ai_catalyst_comet"] == [("catalog comet/cat", 5.0)]

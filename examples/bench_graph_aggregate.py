@@ -23,6 +23,7 @@ import argparse
 import csv
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -89,6 +90,22 @@ def _collect_by_kind(path: Path, rows: list[dict], points: dict[str, list[tuple[
     otherwise sniff them onto. bench_catalog also carries the static,
     bytecode and java_eval arms beside the AI one; those go to their arms."""
     bench = path.stem.replace("bench_", "").replace("_", " ")
+    comet = "comet" in path.stem
+    skipped: set[str] = set()
+
+    def route(arm: str) -> Optional[str]:
+        """The arm a point from this file belongs on: a Comet file's go to the
+        Comet variant (never folded into the plain arm), or nowhere."""
+        if not comet or arm in COMET_ONLY_ARMS:
+            return arm
+        variant = f"{arm}_comet"
+        if variant in ARMS:
+            return variant
+        if variant not in skipped:
+            skipped.add(variant)
+            print(f"skipping {path.name} points: no {variant} arm", file=sys.stderr)
+        return None
+
     for row in rows:
         # bench_fhi_udfs: only the live AI arm on the nullable column is an
         # AI rewrite as served; its pinned arms are exhibits, not output.
@@ -101,14 +118,16 @@ def _collect_by_kind(path: Path, rows: list[dict], points: dict[str, list[tuple[
             ("java_eval", "java_eval_speedup_vs_python"),
         ):
             raw = row.get(speedup_col, "")
-            if raw and float(raw) > 0:
-                points[arm].append((label, float(raw)))
+            target = route(arm)
+            if raw and float(raw) > 0 and target:
+                points[target].append((label, float(raw)))
         kind_arm = _KIND_ARMS.get(row.get("target_kind", ""))
         if kind_arm is None or row.get("status") != "success":
             continue  # declined, failed, or verified but not served: no rewrite ran
         raw = row.get("transpiled_speedup_vs_python", "")
-        if raw and float(raw) > 0:
-            points[kind_arm].append((label, float(raw)))
+        target = route(kind_arm)
+        if raw and float(raw) > 0 and target:
+            points[target].append((label, float(raw)))
         raw_comet = row.get("comet_speedup_vs_python", "")
         if raw_comet and float(raw_comet) > 0 and f"{kind_arm}_comet" in ARMS:
             points[f"{kind_arm}_comet"].append((label, float(raw_comet)))

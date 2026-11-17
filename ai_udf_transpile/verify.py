@@ -1771,13 +1771,21 @@ def _representable(value: Any, return_type: str) -> bool:
         return rng[0] <= value <= rng[1]
     shape = _decimal_shape(t)
     if shape is not None:
-        from decimal import Decimal, InvalidOperation
+        from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 
         if isinstance(value, (int, Decimal)) and not isinstance(value, bool):
+            precision, scale = shape
             try:
-                # Spark rounds the scale (HALF_UP) and fails or nulls on
-                # integer digits past precision - scale.
-                return Decimal(value).copy_abs() < Decimal(10 ** (shape[0] - shape[1]))
+                d = Decimal(value)
+                if not d.is_finite():
+                    return False
+                # Spark rounds to the scale (HALF_UP) first, then fails or
+                # nulls on integer digits past precision - scale: 99999999.995
+                # does not fit decimal(10,2), it rounds to 100000000.00.
+                with localcontext() as ctx:
+                    ctx.prec = max(d.adjusted() + scale + 2, precision + 2, 40)
+                    rounded = d.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP)
+                return rounded.copy_abs() < Decimal(10 ** (precision - scale))
             except (InvalidOperation, ValueError):
                 return False
     return True

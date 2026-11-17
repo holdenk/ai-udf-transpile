@@ -302,7 +302,7 @@ if [ "$DUMP" -eq 1 ]; then
     # micro/tpcds/fhi benches. Each later file replaces only arms it measured.
     [ -f "$CATALOG_CSV" ] && DUMP_ARGS+=(--perf-csv "$CATALOG_CSV")
     [ -f "$BYTECODE_CSV" ] && DUMP_ARGS+=(--perf-csv "$BYTECODE_CSV")
-    DUMP_ARGS+=(--perf-csv "$CSV")
+    [ -f "$CSV" ] && DUMP_ARGS+=(--perf-csv "$CSV")
     [ -f "$TPCDS_CSV" ] && DUMP_ARGS+=(--perf-csv "$TPCDS_CSV")
     [ -f "$FHI_CSV" ] && DUMP_ARGS+=(--perf-csv "$FHI_CSV")
   fi

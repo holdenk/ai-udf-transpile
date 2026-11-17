@@ -247,6 +247,21 @@ def gave_up(func: Callable[..., Any]) -> bool:
     return row is not None and row[0] == "failed"
 
 
+def served_kind(func: Callable[..., Any]) -> str:
+    """What the catalog actually serves for func: a row filled earlier with
+    other targets (the cache key has no kind) is not a Java UDF just because
+    java_udf is the target now."""
+    catalog = cast(SqliteCatalog, getattr(get_catalog(), "_staging", get_catalog()))
+    with catalog._lock:
+        row = catalog._conn.execute(
+            "SELECT target_kind FROM cache WHERE source_text = ? AND status = 'success'",
+            (canonical_source_from_func(func),),
+        ).fetchone()
+    return {"catalyst": "Catalyst SQL", "java_udf": "Java UDF", "rust": "Rust UDF"}.get(
+        row[0] if row else "", "not served"
+    )
+
+
 def wait_transpiled(
     desc: str, func: Callable[..., Any], rtype: DataType, timeout: float = 900
 ) -> UserDefinedFunction:
@@ -454,7 +469,9 @@ def main() -> int:
     bw = wait_transpiled("bw not transpiled", backwards, StringType())
     conf.set_value(conf.TARGETS, conf.DEFAULTS[conf.TARGETS], spark)
     bw_rows = [r[0] for r in names.select(bw("name")).collect()]
-    print(f"backwards: transpiled={bool(bw.transpiled)} results={bw_rows} (Java UDF from cache)")
+    print(
+        f"backwards: transpiled={bool(bw.transpiled)} results={bw_rows} ({served_kind(backwards)} from cache)"
+    )
 
     b = wait_transpiled("b not transpiled", both_positive, BooleanType())
     pairs = spark.createDataFrame([(1, 2), (-1, 2)], ["a", "b"])

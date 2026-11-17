@@ -75,6 +75,7 @@ from ai_udf_transpile.backends.fake import always_decline  # noqa: E402
 from ai_udf_transpile.catalog import Catalog  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 from ai_udf_transpile.targets import KIND_CATALYST, KIND_JAVA_UDF, KIND_RUST  # noqa: E402
+from ai_udf_transpile.transpiler import _spark_version  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
 PY_TRANSPLIERS_CONF = "spark.sql.experimental.optimizer.pyTranspilers"
@@ -198,8 +199,15 @@ def _plan(df: DataFrame) -> str:
     return str(df._jdf.queryExecution().toString())
 
 
-def wait_for_catalog_result(catalog: Catalog, source_text: str, timeout: float = 10.0) -> Fill:
-    """The row's settled state (success or failed), or the last one seen at the deadline."""
+def wait_for_catalog_result(
+    catalog: Catalog, source_text: str, spark_version: str, timeout: float = 10.0
+) -> Fill:
+    """The row's settled state (success or failed), or the last one seen at the deadline.
+
+    By source AND this session's Spark version, newest first: a per-kind
+    catalog persists across runs, and a row another Spark version left for
+    the same source must not end the wait (its key is not this session's).
+    """
     deadline = time.monotonic() + timeout
     fill = Fill()
     conn = catalog._conn  # type: ignore[attr-defined]  # sqlite catalog only
@@ -207,8 +215,9 @@ def wait_for_catalog_result(catalog: Catalog, source_text: str, timeout: float =
     while time.monotonic() < deadline:
         with lock:
             got = conn.execute(
-                "SELECT status, backend, model, target_kind, error FROM cache WHERE source_text = ?",
-                (source_text,),
+                "SELECT status, backend, model, target_kind, error FROM cache "
+                "WHERE source_text = ? AND spark_version = ? ORDER BY updated_at DESC",
+                (source_text, spark_version),
             ).fetchone()
         if got is not None:
             fill = Fill(*got)
@@ -267,12 +276,14 @@ def use_kind(spark: SparkSession, run: KindRun, backend: str, *, inline_worker: 
     is already in the session.
     """
     shutdown()
+    # Before enable(): the inline worker's first poll may claim a pending row
+    # left in a resumed catalog, and must ask for this kind only.
+    conf.set_value(conf.TARGETS, run.kind, spark)
     catalog = enable(spark, sqlite_path=run.sqlite, backend=backend, inline_worker=inline_worker)
     spark.conf.set(PY_TRANSPLIERS_CONF, "ai")  # the built-in has its own arm
     # zfill/backwards/edit_distance take text, and zfill raises on NULL.
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
     conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
-    conf.set_value(conf.TARGETS, run.kind, spark)
     return catalog
 
 
@@ -293,7 +304,9 @@ def fill_kind(
             continue
         start = time.perf_counter()
         UserDefinedFunction(f.fn, f.rtype)  # construction queues the pending row
-        fill = wait_for_catalog_result(catalog, canonical_source_from_func(f.fn), timeout=timeout)
+        fill = wait_for_catalog_result(
+            catalog, canonical_source_from_func(f.fn), _spark_version(spark), timeout=timeout
+        )
         fill.seconds = time.perf_counter() - start
         run.fills[f.name] = fill
         if f.name == DECLINER:
@@ -562,6 +575,9 @@ def main() -> int:
     kinds = requested or [KIND_CATALYST, KIND_JAVA_UDF]
     if requested is None and comet_preset:
         kinds = [*kinds, KIND_RUST]
+    # Kinds named in --targets that this machine cannot run: never filled,
+    # but still missing arms (with `all`, rust is only added when it can run).
+    unavailable: list[str] = []
     if KIND_RUST in kinds:
         # The probes read the targets conf; the rust run pins it the same way.
         conf.set_value(conf.TARGETS, KIND_RUST, spark)
@@ -571,6 +587,8 @@ def main() -> int:
         if reason:
             print(f"warning: no rust arm: {reason}", file=sys.stderr)
             kinds = [k for k in kinds if k != KIND_RUST]
+            if requested is not None:
+                unavailable.append(f"every function ({KIND_RUST}: {reason})")
     shared = os.environ.get("AI_UDF_TRANSPILE_SQLITE")
     workdir = tempfile.mkdtemp(prefix="ai-udf-bench-")
     runs = [KindRun(kind, kind_catalog_path(shared, workdir, kind)) for kind in kinds]
@@ -714,6 +732,7 @@ def main() -> int:
         print(f"transpilation timing csv: wrote {len(timing_rows)} rows to {timing_csv}")
 
     missing = [f"{f.name} ({run.kind})" for run in runs for f in convertible if f.name not in run.udfs]
+    missing += unavailable
     decliner_problem = runs[0].problems.get(DECLINER) if runs else None
     if decliner_problem:
         missing.append(f"{DECLINER}: {decliner_problem}")

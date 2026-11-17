@@ -289,3 +289,16 @@ def test_reflect_and_process_builder_rejected_without_spark():
         )
         is None
     )
+
+
+def test_decimal_return_fits_only_after_rounding_to_the_scale():
+    """Spark rounds to the scale (HALF_UP) before checking precision."""
+    from decimal import Decimal
+
+    from ai_udf_transpile.verify import _representable
+
+    assert not _representable(Decimal("99999999.995"), "decimal(10,2)")  # rounds to 100000000.00
+    assert _representable(Decimal("99999999.994"), "decimal(10,2)")
+    assert _representable(Decimal("1.23456"), "decimal(10,2)")  # extra scale that rounds in range
+    assert not _representable(Decimal("NaN"), "decimal(10,2)")
+    assert not _representable(10**400, "decimal(38,18)")

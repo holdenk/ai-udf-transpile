@@ -400,7 +400,7 @@ def main() -> int:
         assert ai_udfs[name].transpiled, f"{name} did not transpile"
 
     # -- Benchmark: interleave arms so warmup is fair.
-    arms: list[tuple[str, object]] = []
+    arms: list[tuple[str, DataFrame]] = []
     for name, _func, _rtype, cols, _sql in PATTERNS:
         df = get_frame(cols, name)
         col_names = [c[0] for c in cols]

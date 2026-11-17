@@ -33,8 +33,10 @@ _SAMPLES_SHOWN = 3
 
 NO_SAMPLES_WARNING = (
     "!! NO REAL INPUT ROWS SAMPLED: verified only on built-in and generated values.\n"
-    "!! Set spark.sql.experimental.aiUdfTranspile.sampling=true and run the UDF\n"
-    "!! again to check it against real rows before approving."
+    "!! Rows are sampled only when a UDF has no catalog row yet, so rerunning it\n"
+    "!! will not add any to this parked rewrite. To check it against real rows,\n"
+    "!! reject it, delete its row from the catalog, set\n"
+    "!! spark.sql.experimental.aiUdfTranspile.sampling=true and run the UDF again."
 )
 
 

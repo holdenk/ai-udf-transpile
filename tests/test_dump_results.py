@@ -502,3 +502,51 @@ def test_dump_writes_perf_bullets(spark, tmp_path):
     # not benched -> no perf anywhere
     backwards = text.split("## backwards")[1].split("## ")[0]
     assert "perf" not in backwards
+
+
+def test_micro_kind_rates_reach_both_catalog_twins(tmp_path):
+    """An only-Rust catalog CSV binds the name entry to the Rust row's key; the
+    micro bench's per-kind rates must still reach the Java twin."""
+    dump = _load_dump_module()
+    only_rust = tmp_path / "only_rust.csv"
+    only_rust.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,udf_key\n"
+        "edit_distance,1000,300000,6000000,20.0,,,success,rust,claude,m,krust\n",
+        encoding="utf-8",
+    )
+    micro = tmp_path / "micro.csv"
+    micro.write_text(
+        "function,kinds,regular_rows_per_second,transpiled_static_rows_per_second,"
+        "transpiled_ai_catalyst_rows_per_second,transpiled_ai_java_rows_per_second,"
+        "transpiled_ai_rust_rows_per_second,static_speedup_vs_regular,ai_catalyst_speedup_vs_regular,"
+        "ai_java_speedup_vs_regular,ai_rust_speedup_vs_regular,transpile_succeeded_static,"
+        "transpile_succeeded_ai_catalyst,transpile_succeeded_ai_java,transpile_succeeded_ai_rust,"
+        "ai_backend,ai_model\n"
+        "edit_distance,java+rust,100000,,,500000,2000000,,,5.0,20.0,False,False,True,True,claude,m\n",
+        encoding="utf-8",
+    )
+    perf = dump._perf_lines([str(only_rust), str(micro)])
+    twin = dump._perf_for(perf, "edit_distance", "kjava")
+    assert twin["ai:java_udf"] == "500k rows/s (5.0x vs python)"
+    assert "ai" not in twin  # the catalog's generic (Rust) rate stays bound to its own row
+    rust = dump._perf_for(perf, "edit_distance", "krust")
+    assert rust["ai"].endswith("Comet native)")
+    assert rust["ai:rust"] == "2.0M rows/s (20.0x vs python, Comet native)"
+
+
+def test_a_later_catalog_schema_csv_keeps_arms_it_did_not_measure(tmp_path):
+    dump = _load_dump_module()
+    cat = tmp_path / "catalog.csv"
+    cat.write_text(CATALOG_CSV, encoding="utf-8")
+    fhi = tmp_path / "fhi.csv"
+    fhi.write_text(
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,status,target_kind,backend,model,bench\n"
+        "has_item,1000,2000000,7000000,3.5,success,catalyst,ensemble,coco/auto,fhi\n",
+        encoding="utf-8",
+    )
+    perf = dump._perf_lines([str(cat), str(fhi)])
+    assert perf["has_item"]["static"] == "3.0M rows/s (1.5x vs python)"  # catalog's, kept
+    assert perf["has_item"]["ai"].startswith("7.0M rows/s (3.5x vs python)")  # fhi's, newer
