@@ -24,6 +24,10 @@ Options:
   --scala-binary VERSION   Override scala binary version (2.12 or 2.13)
   --write-env-file PATH    Write COMET_JAR / COMET_HOME exports to PATH for `source PATH`
   --skip-build             Skip `make release`; only resolve jar path from existing build output
+  --target-cpu CPU         Build libcomet for this rustc target CPU instead of `make release`'s
+                           -Ctarget-cpu=native (e.g. x86-64-v2). Needed when the build is cached
+                           and reused on other machines: a native build can die with SIGILL on a
+                           CPU that lacks an instruction the build machine had.
   --dry-run                Skip build and stop after showing detected settings
   -h, --help               Show this help
 
@@ -108,6 +112,7 @@ SCALA_OVERRIDE=""
 WRITE_ENV_FILE=""
 SKIP_BUILD=0
 DRY_RUN=0
+TARGET_CPU=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -139,6 +144,11 @@ while [ $# -gt 0 ]; do
     --write-env-file)
       [ $# -ge 2 ] || error "--write-env-file needs a value"
       WRITE_ENV_FILE="$2"
+      shift
+      ;;
+    --target-cpu)
+      [ $# -ge 2 ] || error "--target-cpu needs a value"
+      TARGET_CPU="$2"
       shift
       ;;
     --skip-build)
@@ -302,10 +312,22 @@ echo "Comet profile: $PROFILE (build profiles: $PROFILES)"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "dry-run: skipping build"
-  echo "would run: (cd $COMET_HOME_ARG && make release PROFILES=\"$PROFILES\")"
+  if [ -n "$TARGET_CPU" ]; then
+    echo "would run: (cd $COMET_HOME_ARG/native && RUSTFLAGS=-Ctarget-cpu=$TARGET_CPU cargo build --release)"
+    echo "           (cd $COMET_HOME_ARG && ./mvnw install -Prelease -DskipTests $PROFILES)"
+  else
+    echo "would run: (cd $COMET_HOME_ARG && make release PROFILES=\"$PROFILES\")"
+  fi
   exit 0
 elif [ "$SKIP_BUILD" -eq 1 ]; then
   echo "skip-build: not rebuilding Comet"
+elif [ -n "$TARGET_CPU" ]; then
+  # `make release` without its hard-coded -Ctarget-cpu=native (which wins
+  # over any RUSTFLAGS passed in): the same two steps, portable CPU target.
+  echo "building libcomet for target-cpu=$TARGET_CPU"
+  (cd "$COMET_HOME_ARG/native" && RUSTFLAGS="${RUSTFLAGS:-} -Ctarget-cpu=$TARGET_CPU" cargo build --release)
+  # shellcheck disable=SC2086  # PROFILES is a word list of -P flags
+  (cd "$COMET_HOME_ARG" && ./mvnw install -Prelease -DskipTests $PROFILES)
 else
   (cd "$COMET_HOME_ARG" && make release PROFILES="$PROFILES")
 fi

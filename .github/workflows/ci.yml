@@ -213,8 +213,11 @@ jobs:
           path: |
             ~/.cargo
             comet/spark/target
-          key: comet-${{ steps.comet.outputs.sha }}-${{ env.SPARK_REF }}-${{ runner.os }}
-          restore-keys: comet-
+          # "portable": built for x86-64-v2, not the build runner's native CPU.
+          # A native libcomet restored onto a runner whose CPU lacks one of
+          # its instructions kills the JVM with SIGILL mid-suite.
+          key: comet-portable-${{ steps.comet.outputs.sha }}-${{ env.SPARK_REF }}-${{ runner.os }}
+          restore-keys: comet-portable-
       - name: Restore Maven repo
         uses: actions/cache@v4
         with:
@@ -228,7 +231,7 @@ jobs:
         run: |
           export PYTHONPATH="${SPARK_HOME}/python:$(echo ${SPARK_HOME}/python/lib/py4j-*-src.zip | awk '{print $1}')"
           ./examples/setup_comet.sh --comet-home comet --spark-home "$SPARK_HOME" \
-            --ref ${{ env.COMET_REF }} --write-env-file comet.env
+            --ref ${{ env.COMET_REF }} --target-cpu x86-64-v2 --write-env-file comet.env
           # comet.env is shell-export format; $GITHUB_ENV wants NAME=value.
           sed 's/^export //; s/"//g' comet.env >> "$GITHUB_ENV"
       - name: Resolve Comet jar (cached path)

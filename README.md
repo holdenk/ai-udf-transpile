@@ -607,7 +607,10 @@ whenever a Comet jar is configured, so the regenerated
 `AI_UDF_TRANSPILE_COMET_JAR` (or `COMET_JAR`) so the plugin jar is on Spark's
 classpath; a missing jar is an error, not silent plain-Spark output.
 `examples/setup_comet.sh` can clone/build Comet from source and emit the exports
-for your current Spark checkout. With `--all-benches`, plain and Comet micro
+for your current Spark checkout. Comet's `make release` compiles for the build
+machine's own CPU (`-Ctarget-cpu=native`); pass `--target-cpu x86-64-v2` (as CI
+does) for a build you cache or copy to other machines, or the JVM can die with
+`SIGILL` inside `libcomet.so` on a CPU missing one of those instructions. With `--all-benches`, plain and Comet micro
 runs write separate `bench.csv` / `bench_comet.csv` files and separate graphs,
 so Comet measurements are never mislabeled as plain Spark.
 

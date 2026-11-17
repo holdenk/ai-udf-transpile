@@ -18,6 +18,13 @@ were fine). The README's Rust section records the conflict; the Spark and Comet
 pins have to move together. `setup_spark.sh --spark branch-4.x` still works for
 the SQL/Java benchmarks.
 
+The Comet job's other failure, also red on main (the test JVM dying with
+`SIGILL` in `libcomet.so`, then hundreds of `ConnectionRefusedError`s), was the
+CI cache: Comet's `make release` compiles with `-Ctarget-cpu=native`, and the
+cached build was restored onto runners whose CPUs lack an instruction the build
+runner had. `setup_comet.sh --target-cpu CPU` builds the same two steps for a
+portable target; CI uses `x86-64-v2` under a new cache key.
+
 ### Every target filled separately; no more `*_java` / `*_rust` twin UDFs (2026-11-17)
 
 The bench, demos and tests used to reach the Java and Rust arms through
