@@ -91,3 +91,42 @@ def test_unknown_source_declines():
     with make_sandbox(job) as sandbox:
         with pytest.raises(BackendDecline):
             backend.run(job, sandbox)
+
+
+def _job_with_targets(func, targets, **kwargs) -> TranspileJob:
+    job = _job_for(func, **kwargs)
+    job.targets = list(targets)
+    return job
+
+
+@pytest.mark.parametrize(
+    ("targets", "kind"),
+    [
+        (["catalyst", "java_udf"], "catalyst"),
+        (["catalyst", "java_udf", "rust"], "catalyst"),
+        (["java_udf", "rust"], "rust"),
+        (["java_udf"], "java_udf"),
+        (["rust"], "rust"),
+    ],
+)
+def test_one_udf_answers_every_pinned_kind(targets, kind):
+    """No renamed copies: pinning targets picks which rewrite of the same UDF comes back."""
+    job = _job_with_targets(plus_one, targets)
+    with make_sandbox(job) as sandbox:
+        assert FakeBackend().run(job, sandbox).kind == kind
+
+
+def test_a_kind_with_no_fixture_is_a_decline():
+    from ai_udf_transpile.backends.fake import zfill3
+
+    job = _job_with_targets(zfill3, ["rust"], input_types=["string"], return_type="string")
+    with make_sandbox(job) as sandbox:
+        with pytest.raises(BackendDecline, match="does not accept"):
+            FakeBackend().run(job, sandbox)
+
+
+def test_fixtures_for_orders_by_preference():
+    from ai_udf_transpile.backends.fake import fixtures_for
+
+    kinds = [r.kind for r in fixtures_for(canonical_source_from_func(plus_one))]
+    assert kinds == ["catalyst", "rust", "java_udf"]

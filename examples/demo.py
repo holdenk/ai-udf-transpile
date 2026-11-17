@@ -143,9 +143,9 @@ def zfill3(s: str) -> str:
     return s.zfill(3)
 
 
-def backwards_java(name: str) -> str:
-    # The Java-UDF twin: same body as a catalyst reverse() would cover, but
-    # the def name maps to the java fixture -- one key, one rewrite kind.
+def backwards(name: str) -> str:
+    # SQL reverse() covers this; the demo pins the targets conf to java_udf
+    # to show the Java UDF target on the same function.
     if name is None:
         return None
     return name[::-1]
@@ -435,9 +435,11 @@ def main() -> int:
 
     print()
     print("=== JAVA UDF TARGET (compiled on the driver, Hypothesis-verified) ===")
-    bw = wait_transpiled("bw not transpiled", backwards_java, StringType())
+    conf.set_value(conf.TARGETS, "java_udf", spark)  # only a Java UDF is asked for, or accepted
+    bw = wait_transpiled("bw not transpiled", backwards, StringType())
+    conf.set_value(conf.TARGETS, conf.DEFAULTS[conf.TARGETS], spark)
     bw_rows = [r[0] for r in names.select(bw("name")).collect()]
-    print(f"backwards_java: transpiled={bool(bw.transpiled)} results={bw_rows} (Java UDF from cache)")
+    print(f"backwards: transpiled={bool(bw.transpiled)} results={bw_rows} (Java UDF from cache)")
 
     b = wait_transpiled("b not transpiled", both_positive, BooleanType())
     pairs = spark.createDataFrame([(1, 2), (-1, 2)], ["a", "b"])

@@ -89,7 +89,6 @@ def _collect_by_kind(path: Path, rows: list[dict], points: dict[str, list[tuple[
     otherwise sniff them onto. bench_catalog also carries the static,
     bytecode and java_eval arms beside the AI one; those go to their arms."""
     bench = path.stem.replace("bench_", "").replace("_", " ")
-    comet = "comet" in path.stem
     for row in rows:
         # bench_fhi_udfs: only the live AI arm on the nullable column is an
         # AI rewrite as served; its pinned arms are exhibits, not output.

@@ -148,7 +148,9 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                 py_rate = r.get("python_rows_per_second", "")
                 bench = r.get("bench") or "catalog"  # bench_fhi_udfs.py names itself
                 if py_rate:
-                    arms["top"] = f"- **perf ({bench} bench)**: interpreted python {_fmt_rate(py_rate)} rows/s"
+                    arms["top"] = (
+                        f"- **perf ({bench} bench)**: interpreted python {_fmt_rate(py_rate)} rows/s"
+                    )
                 for arm, prefix in (
                     ("static", "static"),
                     ("bytecode", "bytecode_static"),
@@ -207,29 +209,20 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     arms["static"] = (
                         f"{_fmt_rate(static)} rows/s ({r['static_speedup_vs_regular']}x vs python)"
                     )
-                catalyst = r.get("transpiled_ai_catalyst_rows_per_second")
-                if catalyst and r["transpile_succeeded_ai_catalyst"] == "True":
-                    arms["ai"] = (
-                        f"{_fmt_rate(catalyst)} rows/s ({r['ai_catalyst_speedup_vs_regular']}x vs python)"
-                    )
+                # Every AI arm is the same function, each kind filled with
+                # targets pinned to it: keyed by kind, so a catalog row gets
+                # the number for the rewrite it actually holds.
+                for kind, column, where in (
+                    ("catalyst", "ai_catalyst", ""),
+                    ("java_udf", "ai_java", ""),
+                    ("rust", "ai_rust", ", Comet native"),
+                ):
+                    rate = r.get(f"transpiled_{column}_rows_per_second")
+                    if rate and r.get(f"transpile_succeeded_{column}") == "True":
+                        arms[f"ai:{kind}"] = (
+                            f"{_fmt_rate(rate)} rows/s ({r[f'{column}_speedup_vs_regular']}x vs python{where})"
+                        )
                 _record_perf(perf, r["function"], arms)
-                java = r.get("transpiled_ai_java_rows_per_second")
-                if java:
-                    java_arms = _empty_perf()
-                    java_arms["top"] = top
-                    java_arms["ai"] = (
-                        f"{_fmt_rate(java)} rows/s ({r['ai_java_speedup_vs_regular']}x vs python)"
-                    )
-                    _record_perf(perf, r["function"] + "_java", java_arms)
-                rust = r.get("transpiled_ai_rust_rows_per_second")
-                if rust:
-                    rust_arms = _empty_perf()
-                    rust_arms["top"] = top
-                    rust_arms["ai"] = (
-                        f"{_fmt_rate(rust)} rows/s"
-                        f" ({r['ai_rust_speedup_vs_regular']}x vs python, Comet native)"
-                    )
-                    _record_perf(perf, r["function"] + "_rust", rust_arms)
         elif "declined" in rows[0]:  # bench_tpcds CSV
             for r in rows:
                 arms = _empty_perf()
@@ -397,8 +390,10 @@ def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[st
                 java_eval_lines[0] += f" — {p['java_eval']}"
             lines += java_eval_lines
             ai_lines = _ai_section(row)
-            if p.get("ai") and row.status == "success":
-                ai_lines[0] += f" — {p['ai']}"
+            served = KIND_JAVA_UDF if row.target_kind == KIND_GPU_KERNEL else row.target_kind
+            ai_perf = p.get(f"ai:{served}") or p.get("ai")
+            if ai_perf and row.status == "success":
+                ai_lines[0] += f" — {ai_perf}"
             lines += ai_lines
             lines.append("")
     finally:

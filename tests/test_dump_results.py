@@ -292,15 +292,12 @@ def test_perf_lines_unit(tmp_path):
         "static": "3.0M rows/s (1.5x vs python)",
         "bytecode": "",
         "java_eval": "",
-        "ai": "8.0M rows/s (4.0x vs python)",
+        "ai": "",
+        # One function, each kind filled separately: keyed by the kind it was served as.
+        "ai:catalyst": "8.0M rows/s (4.0x vs python)",
+        "ai:java_udf": "4.0M rows/s (2.0x vs python)",
     }
-    assert perf["plus_one_java"] == {
-        "top": "- **perf (micro bench)**: interpreted python 2.0M rows/s",
-        "static": "",
-        "bytecode": "",
-        "java_eval": "",
-        "ai": "4.0M rows/s (2.0x vs python)",
-    }
+    assert "plus_one_java" not in perf
     # always_decline: the fallback perf is the top line's story; no rewrite was served
     assert perf["always_decline"]["top"].endswith("interpreted python 1.0M rows/s")
     assert perf["always_decline"]["static"] == ""
@@ -428,7 +425,7 @@ def test_perf_lines_unit(tmp_path):
     )
     perf = dump._perf_lines([str(keyed), str(micro)])
     assert dump._perf_for(perf, "plus_one", "kplus")["static"] == "3.0M rows/s (1.5x vs python)"  # micro won
-    # micro: a rust twin gets its own section key, like the java twin
+    # micro: the rust arm is keyed by kind on the function itself
     rust_micro = tmp_path / "rust_micro.csv"
     rust_micro.write_text(
         "function,kinds,regular_rows_per_second,transpiled_static_rows_per_second,"
@@ -441,8 +438,10 @@ def test_perf_lines_unit(tmp_path):
         encoding="utf-8",
     )
     perf = _load_dump_module()._perf_lines([str(rust_micro)])
-    assert perf["edit_distance_rust"]["ai"] == "2.0M rows/s (20.0x vs python, Comet native)"
-    assert "edit_distance_java" not in perf
+    assert perf["edit_distance"]["ai:rust"] == "2.0M rows/s (20.0x vs python, Comet native)"
+    assert perf["edit_distance"]["ai:catalyst"] == "9.0M rows/s (90.0x vs python)"
+    assert "ai:java_udf" not in perf["edit_distance"]
+    assert "edit_distance_rust" not in perf
     # merge precedence: later files take over per function with their deeper arms
     perf = _load_dump_module()._perf_lines([str(cat), str(micro)])
     assert perf["has_item"]["top"].endswith("interpreted python 2.0M rows/s")  # catalog-only

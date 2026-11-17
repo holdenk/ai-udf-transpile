@@ -42,7 +42,7 @@ from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.backends import ai_backend  # noqa: E402
 from ai_udf_transpile.backends.fake import (  # noqa: E402
-    backwards_java,
+    backwards,
     contains_ingredient,
     greet,
     is_none_branch,
@@ -167,10 +167,13 @@ def main() -> int:
         (round_half, LongType()),
         (weekday_of, LongType()),
         (zfill3, StringType()),
-        (backwards_java, StringType()),
     ]
     for func, rtype in udfs:
         wait_transpiled(func, rtype)
+    # The Java UDF target on a function SQL also covers: pin targets to it.
+    conf.set_value(conf.TARGETS, "java_udf", spark)
+    wait_transpiled(backwards, StringType())
+    conf.set_value(conf.TARGETS, conf.DEFAULTS[conf.TARGETS], spark)
 
     rows = catalog._conn.execute(
         "SELECT source_text, target_kind, catalyst_sql, impl_class, "

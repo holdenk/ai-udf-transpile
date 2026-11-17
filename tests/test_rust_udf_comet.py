@@ -25,9 +25,9 @@ from ai_udf_transpile.backends.fake import (
     COLLATZ_STEPS_RS,
     PLUS_ONE_RS,
     FakeBackend,
-    backwards_rust,
+    backwards,
     collatz_steps,
-    plus_one_rust,
+    plus_one,
 )
 from ai_udf_transpile.keys import canonical_source_from_func
 from ai_udf_transpile.targets import KIND_RUST, TranspileResult
@@ -170,14 +170,14 @@ def test_hypothesis_accepts_a_faithful_rewrite(rust_session):
 def test_hypothesis_rejects_a_wrong_rewrite(rust_session):
     wrong = PLUS_ONE_RS.replace("checked_add(1)", "checked_add(2)")
     ok, err = hypothesis_check(
-        source_text=canonical_source_from_func(plus_one_rust),
+        source_text=canonical_source_from_func(plus_one),
         captures={},
         result=TranspileResult(kind=KIND_RUST, rust_source=wrong),
         input_types=["bigint"],
         return_type="bigint",
         spark=rust_session,
         max_examples=8,
-        func=plus_one_rust,
+        func=plus_one,
     )
     assert ok is False and "mismatch" in err
 
@@ -191,14 +191,14 @@ def test_hypothesis_rejects_code_points_counted_as_bytes(rust_session):
         "}\n"
     )
     ok, err = hypothesis_check(
-        source_text=canonical_source_from_func(backwards_rust),
+        source_text=canonical_source_from_func(backwards),
         captures={},
         result=TranspileResult(kind=KIND_RUST, rust_source=wrong),
         input_types=["string"],
         return_type="string",
         spark=rust_session,
         max_examples=8,
-        func=backwards_rust,
+        func=backwards,
         party_on_strings=True,
     )
     assert ok is False and "mismatch" in err
@@ -207,13 +207,13 @@ def test_hypothesis_rejects_code_points_counted_as_bytes(rust_session):
 def test_compile_failure_fails_verification_with_rustc_output(rust_session):
     broken = "pub fn udf(x: Option<i64>) -> Result<Option<i64>, String> { Ok(x.map(|v| v + nope)) }\n"
     ok, err = hypothesis_check(
-        source_text=canonical_source_from_func(plus_one_rust),
+        source_text=canonical_source_from_func(plus_one),
         captures={},
         result=TranspileResult(kind=KIND_RUST, rust_source=broken),
         input_types=["bigint"],
         return_type="bigint",
         spark=rust_session,
-        func=plus_one_rust,
+        func=plus_one,
     )
     assert ok is False
     assert "rust verify setup failed" in err and "cannot find value `nope`" in err
@@ -240,10 +240,12 @@ def test_end_to_end_miss_then_native_hit(rust_session, tmp_path):
 
 def test_end_to_end_string_udf(rust_session, tmp_path):
     spark = rust_session
-    assert not UserDefinedFunction(backwards_rust, StringType()).transpiled
+    # backwards has a SQL fixture too, and SQL is preferred: pin the target.
+    conf.set_value(conf.TARGETS, "rust")
+    assert not UserDefinedFunction(backwards, StringType()).transpiled
     assert poll_once(get_catalog(), FakeBackend(), spark)
     assert _status(get_catalog())[:2] == ("success", "rust")
-    served = UserDefinedFunction(backwards_rust, StringType())
+    served = UserDefinedFunction(backwards, StringType())
     df = _parquet(spark, tmp_path, [("abc",), (None,), ("añb",)], "s string")
     assert {r[0] for r in df.select(served("s")).collect()} == {"cba", None, "bña"}
 
@@ -262,11 +264,12 @@ def test_target_off_means_no_rust_is_asked_for_or_served(comet, sqlite_path, tmp
 
 def test_served_row_goes_back_to_python_when_the_target_is_switched_off(rust_session):
     spark = rust_session
-    UserDefinedFunction(plus_one_rust, LongType())
+    conf.set_value(conf.TARGETS, "rust")
+    UserDefinedFunction(plus_one, LongType())
     assert poll_once(get_catalog(), FakeBackend(), spark)
-    assert UserDefinedFunction(plus_one_rust, LongType()).transpiled
+    assert UserDefinedFunction(plus_one, LongType()).transpiled
     conf.set_value(conf.TARGETS, "catalyst,java_udf")
-    assert not UserDefinedFunction(plus_one_rust, LongType()).transpiled
+    assert not UserDefinedFunction(plus_one, LongType()).transpiled
 
 
 def test_a_session_without_rust_gets_its_own_rewrite_queued(rust_session):
@@ -277,25 +280,28 @@ def test_a_session_without_rust_gets_its_own_rewrite_queued(rust_session):
 
     spark = rust_session
     catalog = get_catalog()
-    UserDefinedFunction(plus_one_rust, LongType())
+    conf.set_value(conf.TARGETS, "rust")
+    UserDefinedFunction(plus_one, LongType())
     assert poll_once(catalog, FakeBackend(), spark)
     conf.set_value(conf.TARGETS, "catalyst,java_udf")
-    assert not UserDefinedFunction(plus_one_rust, LongType()).transpiled
+    assert not UserDefinedFunction(plus_one, LongType()).transpiled
     rows = catalog._conn.execute(
         "SELECT spark_version, status, target_kind FROM cache ORDER BY created_at"
     ).fetchall()
     assert len(rows) == 2
     assert rows[0][1:] == ("success", "rust")
     assert rows[1][0].endswith(NO_RUST_SUFFIX) and rows[1][1] == "pending"
-    # The fake's only answer for plus_one_rust is Rust, which the twin never accepts.
+    # The twin is offered SQL and Java only, and gets the fake's SQL fixture.
     assert poll_once(catalog, FakeBackend(), spark)
     twin = catalog._conn.execute(
-        "SELECT status, error FROM cache WHERE spark_version LIKE ?", (f"%{NO_RUST_SUFFIX}",)
+        "SELECT status, target_kind FROM cache WHERE spark_version LIKE ?", (f"%{NO_RUST_SUFFIX}",)
     ).fetchone()
-    assert twin[0] == "failed" and "does not accept" in twin[1]
+    assert tuple(twin) == ("success", "catalyst")
+    assert UserDefinedFunction(plus_one, LongType()).transpiled
     # And the Comet-capable session still serves the original Rust row.
-    conf.set_value(conf.TARGETS, "catalyst,java_udf,rust")
-    assert UserDefinedFunction(plus_one_rust, LongType()).transpiled
+    conf.set_value(conf.TARGETS, "rust")
+    served = UserDefinedFunction(plus_one, LongType())
+    assert served.transpiled and "ai_udf_rs_" in str(served.transpiled[0])
 
 
 def test_register_impl_rust(rust_session, tmp_path):
@@ -369,14 +375,14 @@ def test_a_candidate_that_never_finishes_fails_verification_in_time(rust_session
     try:
         start = time.monotonic()
         ok, err = hypothesis_check(
-            source_text=canonical_source_from_func(plus_one_rust),
+            source_text=canonical_source_from_func(plus_one),
             captures={},
             result=TranspileResult(kind=KIND_RUST, rust_source=_SLOW_RS),
             input_types=["bigint"],
             return_type="bigint",
             spark=rust_session,
             max_examples=4,
-            func=plus_one_rust,
+            func=plus_one,
         )
         elapsed = time.monotonic() - start
     finally:
