@@ -25,14 +25,16 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pyspark.sql import SparkSession  # noqa: E402
+from pyspark.sql import DataFrame, SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
 from pyspark.sql.types import BooleanType, DoubleType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
@@ -73,6 +75,7 @@ from ai_udf_transpile.backends.fake import (  # noqa: E402
     udfb_extractmonth,
     udfb_extractyear,
 )
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 
 TRANSPILE_CONF = "spark.sql.experimental.optimizer.transpilePyUDFs"
@@ -267,7 +270,7 @@ FRAME_EXPRS: dict[str, dict[str, str]] = {
 }
 
 
-def _frame(spark, pattern: str, cols: list[tuple[str, str]], n: int):
+def _frame(spark: SparkSession, pattern: str, cols: list[tuple[str, str]], n: int) -> DataFrame:
     exprs = FRAME_EXPRS.get(pattern, {})
     base = spark.range(0, n, numPartitions=PARTITIONS).toDF("x")
     sel = []
@@ -291,13 +294,15 @@ def _substitute(sql: str, cols: list[str]) -> str:
     return sql
 
 
-def noop_seconds(df) -> float:
+def noop_seconds(df: DataFrame) -> float:
     start = time.perf_counter()
     df.write.format("noop").mode("overwrite").save()
     return time.perf_counter() - start
 
 
-def wait_for_catalog(catalog, source_text, timeout=900):
+def wait_for_catalog(
+    catalog: SqliteCatalog, source_text: str, timeout: float = 900
+) -> sqlite3.Row | tuple[Any, ...]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with catalog._lock:
@@ -332,9 +337,9 @@ def main() -> int:
     print(f"=== TPC-DS UDF BENCHMARK ({rows:,} rows, min of {args.rounds} rounds) ===\n")
 
     # Build one cached frame per distinct column signature.
-    frames: dict[tuple, object] = {}
+    frames: dict[tuple[str, tuple[tuple[str, str], ...]], DataFrame] = {}
 
-    def get_frame(cols: list[tuple[str, str]], name: str):
+    def get_frame(cols: list[tuple[str, str]], name: str) -> DataFrame:
         key = (name, tuple(cols))
         if key not in frames:
             frames[key] = _frame(spark, name, cols, rows)

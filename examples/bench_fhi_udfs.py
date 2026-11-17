@@ -53,10 +53,12 @@ import argparse
 import csv
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any, Callable, Optional, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -65,15 +67,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
-from pyspark.sql import SparkSession  # noqa: E402
+from pyspark.sql import Column, DataFrame, SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
-from pyspark.sql.types import _parse_datatype_string  # noqa: E402
+from pyspark.sql.types import DataType, _parse_datatype_string  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.backends import ai_backend  # noqa: E402
 from ai_udf_transpile.backends.fhi_rewrites import VARIANTS, fhi_rewrite  # noqa: E402
 from ai_udf_transpile.backends.fhi_udfs import FHI_UDFS  # noqa: E402
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.javac import compile_java, register_java_udf, verify_function_name  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 from ai_udf_transpile.regress import NOT_SERVED, regression_risk  # noqa: E402
@@ -208,28 +211,32 @@ ROW_SCALE = {
 }
 
 
-def frame(spark, name: str, n: int, flavor: str = "nullable"):
+def frame(spark: SparkSession, name: str, n: int, flavor: str = "nullable") -> DataFrame:
     base = spark.range(0, n, numPartitions=min(PARTITIONS, max(1, n))).toDF("x")
     wrap = FLAVORS[flavor]
     df = base.select(*[F.expr(wrap.format(e=expr)).alias(col) for col, expr in FRAME_EXPRS[name].items()])
     return df.cache() if n > 64 else df
 
 
-def rewrite_column(spark, result: TranspileResult, cols: list[str], rtype, tag: str):
+def rewrite_column(
+    spark: SparkSession, result: TranspileResult, cols: list[str], rtype: DataType, tag: str
+) -> Column:
     """A pinned rewrite as a Column over `cols`, the way the plugin would
     reconstruct it: SQL with its placeholders bound, or a registered Java UDF."""
     if result.kind == KIND_CATALYST:
         sql = result.sql
+        assert sql is not None  # a pinned catalyst rewrite is read from its .sql file
         for i, col in enumerate(cols):
             sql = re.sub(rf"_udf_param_{i}(?!\d)", f"`{col}`", sql)
         return F.expr(sql).cast(rtype)
+    assert result.java_source is not None  # a pinned java rewrite is read from its .java file
     compiled = compile_java(spark, result.java_source, result.class_name)
     fname = verify_function_name(f"fhi_{tag}", compiled.jar_bytes)
     register_java_udf(spark, fname, compiled.class_name, compiled.jar_bytes, rtype, janino=compiled.janino)
     return F.expr(f"{fname}({', '.join(f'`{c}`' for c in cols)})").cast(rtype)
 
 
-def noop_seconds(df) -> float:
+def noop_seconds(df: DataFrame) -> float:
     start = time.perf_counter()
     df.write.format("noop").mode("overwrite").save()
     return time.perf_counter() - start
@@ -241,7 +248,7 @@ _ROW_SQL = (
 )
 
 
-def catalog_row(catalog, source_text, spark_version):
+def catalog_row(catalog: SqliteCatalog, source_text: str, spark_version: str) -> Optional[sqlite3.Row]:
     """This session's row for a function. The key includes the Spark version,
     so a shared catalog can hold the same source under another key; that row
     must not answer for the one this session queued."""
@@ -249,7 +256,9 @@ def catalog_row(catalog, source_text, spark_version):
         return catalog._conn.execute(_ROW_SQL, (source_text, spark_version)).fetchone()
 
 
-def wait_for_catalog(catalog, source_text, spark_version, timeout=900):
+def wait_for_catalog(
+    catalog: SqliteCatalog, source_text: str, spark_version: str, timeout: float = 900
+) -> sqlite3.Row | tuple[Any, ...]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         row = catalog_row(catalog, source_text, spark_version)
@@ -259,7 +268,14 @@ def wait_for_catalog(catalog, source_text, spark_version, timeout=900):
     return ("timeout", None, None, None, None, None)
 
 
-def fill_from_ai(spark, args, names, funcs, rtypes, cols):
+def fill_from_ai(
+    spark: SparkSession,
+    args: argparse.Namespace,
+    names: list[str],
+    funcs: dict[str, Callable[..., Any]],
+    rtypes: dict[str, DataType],
+    cols: dict[str, list[str]],
+) -> dict[str, tuple[Optional[UserDefinedFunction], str, str, str, str, str]]:
     """The live arm: enable the plugin, let the backend fill each UDF, and
     return {name: (served udf or None, status, kind, backend, model, string_gate)}."""
     sqlite = os.environ.get("AI_UDF_TRANSPILE_SQLITE") or os.path.join(
@@ -290,7 +306,7 @@ def fill_from_ai(spark, args, names, funcs, rtypes, cols):
         frame(spark, n, 48).select(seed_udf(*cols[n])).collect()
     conf.set_value(conf.POLL_INTERVAL, "0.2", spark)
 
-    out = {}
+    out: dict[str, tuple[Optional[UserDefinedFunction], str, str, str, str, str]] = {}
     for n in names:
         UserDefinedFunction(funcs[n], rtypes[n])  # construction queues the pending row
         status, error, backend, model, kind, attempts = wait_for_catalog(
@@ -363,7 +379,8 @@ def main() -> int:
     )
     print(f"=== FHI PIPELINE UDF BENCHMARK ({args.rows:,} rows base, min of {args.rounds} rounds) ===\n")
 
-    funcs = {n: FHI_UDFS[n][0] for n in names}
+    # FHI_UDFS infers its functions as the bare `function` type, which mypy will not pass as a Callable.
+    funcs: dict[str, Callable[..., Any]] = {n: cast(Callable[..., Any], FHI_UDFS[n][0]) for n in names}
     rtypes = {n: _parse_datatype_string(FHI_UDFS[n][1]) for n in names}
     cols = {n: list(FRAME_EXPRS[n]) for n in names}
 
@@ -373,7 +390,7 @@ def main() -> int:
         assert not py_udfs[n].transpiled
     live = fill_from_ai(spark, args, names, funcs, rtypes, cols) if args.ai else {}
 
-    def runs_python(df) -> bool:
+    def runs_python(df: DataFrame) -> bool:
         return "EvalPython" in df._jdf.queryExecution().executedPlan().toString()
 
     out = []

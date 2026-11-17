@@ -49,7 +49,7 @@ ARMS = {
 COMET_ONLY_ARMS = frozenset({"ai_rust"})
 
 # csv signature column -> [(arm, speedup column, (fallback flag col, skip value))]
-_SCHEMAS = {
+_SCHEMAS: dict[str, list[tuple[str, str, tuple[str, str] | None]]] = {
     "regular_rows_per_second": [
         ("static", "static_speedup_vs_regular", ("transpile_succeeded_static", "False")),
         (
@@ -103,15 +103,15 @@ def _collect_by_kind(path: Path, rows: list[dict], points: dict[str, list[tuple[
             raw = row.get(speedup_col, "")
             if raw and float(raw) > 0:
                 points[arm].append((label, float(raw)))
-        arm = _KIND_ARMS.get(row.get("target_kind", ""))
-        if arm is None or row.get("status") != "success":
+        kind_arm = _KIND_ARMS.get(row.get("target_kind", ""))
+        if kind_arm is None or row.get("status") != "success":
             continue  # declined, failed, or verified but not served: no rewrite ran
         raw = row.get("transpiled_speedup_vs_python", "")
         if raw and float(raw) > 0:
-            points[arm].append((label, float(raw)))
+            points[kind_arm].append((label, float(raw)))
         raw_comet = row.get("comet_speedup_vs_python", "")
-        if raw_comet and float(raw_comet) > 0 and f"{arm}_comet" in ARMS:
-            points[f"{arm}_comet"].append((label, float(raw_comet)))
+        if raw_comet and float(raw_comet) > 0 and f"{kind_arm}_comet" in ARMS:
+            points[f"{kind_arm}_comet"].append((label, float(raw_comet)))
 
 
 def collect(paths: list[Path]) -> dict[str, list[tuple[str, float]]]:

@@ -30,6 +30,7 @@ import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
+from typing import Callable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -74,7 +75,7 @@ def _bad_backend_rows(rows: list[CacheRow], backend: str) -> list[CacheRow]:
     ]
 
 
-def _safe(label: str, fn) -> list[str]:
+def _safe(label: str, fn: Callable[..., object]) -> list[str]:
     """Run one transpiler path; a crash is a dump finding, not a dump death."""
     try:
         return [f"- **{label}**: `{fn()}`"]
@@ -259,6 +260,7 @@ def _builtin_result(row: CacheRow) -> str:
         path = Path(tmp) / "udf.py"
         path.write_text("from __future__ import annotations\n" + row.source_text, encoding="utf-8")
         spec = importlib.util.spec_from_file_location("dump_row", path)
+        assert spec is not None and spec.loader is not None  # a .py path always gets a source loader
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         udf = UserDefinedFunction(getattr(module, name), _parse_datatype_string(row.return_type))
@@ -267,7 +269,7 @@ def _builtin_result(row: CacheRow) -> str:
     return "  |  ".join(str(sql) for sql in udf.transpiled)
 
 
-def _bytecode_result(row: CacheRow) -> str:
+def _bytecode_result(row: CacheRow) -> Optional[str]:
     job = row.as_job()
     try:
         with make_sandbox(job) as sandbox:
@@ -330,7 +332,9 @@ def _write_doc(out_path: str, lines: list[str]) -> None:
         os.replace(temporary, path)
 
 
-def dump(spark, rows: list[CacheRow], out_path: str, backend: str, perf: dict[str, dict[str, str]]) -> int:
+def dump(
+    spark: SparkSession, rows: list[CacheRow], out_path: str, backend: str, perf: dict[str, dict[str, str]]
+) -> int:
     spark.conf.set(TRANSPILE_CONF, "true")
     spark.conf.set(PY_TRANSPLIERS_CONF, "catalyst")
     by_status = dict(Counter(row.status for row in rows))
@@ -475,7 +479,7 @@ def _verdict(entry: tuple[CacheRow, dict[str, str]] | None) -> str:
     return f"{_fmt_rate(rate)}/s" if rate else "accepted"
 
 
-def dump_targets(spark, targets_dir: str, out_path: str, backend: str) -> int:
+def dump_targets(spark: SparkSession, targets_dir: str, out_path: str, backend: str) -> int:
     """One section per UDF: python, the two non-AI transpilers, then SQL / Java / Rust each."""
     by_kind = _load_targets(targets_dir)
     if not any(by_kind.values()):

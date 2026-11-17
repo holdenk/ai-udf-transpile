@@ -36,7 +36,7 @@ from bench_catalog import _function_name, _session  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.backends import get_backend  # noqa: E402
-from ai_udf_transpile.catalog import infra_failure  # noqa: E402
+from ai_udf_transpile.catalog import CacheRow, infra_failure  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
 from ai_udf_transpile.targets import NO_RUST_SUFFIX  # noqa: E402
 from ai_udf_transpile.worker import process_row  # noqa: E402
@@ -103,7 +103,7 @@ def main() -> int:
         print(f"no source catalog at {args.source}", file=sys.stderr)
         return 1
     src = SqliteCatalog(Path(args.source))
-    sources: dict[str, object] = {}
+    sources: dict[str, CacheRow] = {}
     for raw in src._conn.execute("SELECT * FROM cache").fetchall():
         row = _row_from_sql(raw)
         if not row.spark_version.endswith(NO_RUST_SUFFIX) and row.origin != "human":

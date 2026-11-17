@@ -18,15 +18,17 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any, Callable, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pyspark.sql import SparkSession  # noqa: E402
-from pyspark.sql.types import LongType, StringType  # noqa: E402
+from pyspark.sql.types import DataType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
 from ai_udf_transpile.backends import ai_backend  # noqa: E402
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
 
@@ -41,9 +43,9 @@ def backwards(name: str) -> str:
     return name[::-1]
 
 
-def gave_up(func) -> bool:
+def gave_up(func: Callable[..., Any]) -> bool:
     """The backend already failed func; failed rows cool down instead of re-queueing."""
-    catalog = get_catalog()
+    catalog = cast(SqliteCatalog, get_catalog())
     with catalog._lock:
         row = catalog._conn.execute(
             "SELECT status FROM cache WHERE source_text = ?", (canonical_source_from_func(func),)
@@ -51,7 +53,7 @@ def gave_up(func) -> bool:
     return row is not None and row[0] == "failed"
 
 
-def wait_for_hit(func, rtype, timeout=900):
+def wait_for_hit(func: Callable[..., Any], rtype: DataType, timeout: float = 900) -> UserDefinedFunction:
     """Re-create the UDF until the catalog hit flips transpiled=True."""
     deadline = time.time() + timeout
     udf = UserDefinedFunction(func, rtype)
@@ -104,7 +106,7 @@ def main() -> int:
     print(f"backwards: second call transpiled={bool(hit.transpiled)} results={rows}{label}")
 
     try:  # _conn is sqlite-catalog-only; skip the dump on wrapped catalogs
-        catalog_rows = get_catalog()._conn.execute(
+        catalog_rows = cast(SqliteCatalog, get_catalog())._conn.execute(
             "SELECT target_kind, status, origin, hypothesis_passed FROM cache ORDER BY udf_key"
         )
         for kind, status, origin, hyp in catalog_rows:

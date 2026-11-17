@@ -37,6 +37,7 @@ import tempfile
 import time
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -63,15 +64,16 @@ os.environ["AWS_CONFIG_FILE"] = "/dev/null"
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
-from pyspark.sql import SparkSession  # noqa: E402
+from pyspark.sql import Column, DataFrame, SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
-from pyspark.sql.types import _parse_datatype_string  # noqa: E402
+from pyspark.sql.types import DataType, _parse_datatype_string  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, rustc, shutdown  # noqa: E402
 from ai_udf_transpile.backends.base import BackendDecline  # noqa: E402
 from ai_udf_transpile.backends.bytecode import BytecodeBackend  # noqa: E402
 from ai_udf_transpile.backends.bytecode_eval import emit_java_eval  # noqa: E402
+from ai_udf_transpile.catalog import CacheRow  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog, _row_from_sql  # noqa: E402
 from ai_udf_transpile.javac import compile_java, register_java_udf, verify_function_name  # noqa: E402
 from ai_udf_transpile.sandbox import make_sandbox  # noqa: E402
@@ -137,23 +139,24 @@ def _import_dir() -> Path:
     return _IMPORT_DIR
 
 
-def _import_function(source_text: str, name: str):
+def _import_function(source_text: str, name: str) -> Callable[..., Any]:
     """Exec row.source_text in its own module; the file stays on disk for the run."""
     path = _import_dir() / f"udf_{name}.py"
     path.write_text("from __future__ import annotations\n" + source_text, encoding="utf-8")
     spec = importlib.util.spec_from_file_location(f"bench_{name}", path)
+    assert spec is not None and spec.loader is not None  # a .py path always gets a source loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return getattr(module, name)
 
 
-def noop_seconds(df) -> float:
+def noop_seconds(df: DataFrame) -> float:
     start = time.perf_counter()
     df.write.format("noop").mode("overwrite").save()
     return time.perf_counter() - start
 
 
-def _time_df(arm, rounds: int) -> float | None:
+def _time_df(arm: DataFrame, rounds: int) -> float | None:
     """Best (min) of N rounds; None when the arm raises on the sample."""
     try:
         noop_seconds(arm)  # warmup doubles as the raise check
@@ -168,11 +171,11 @@ def _time_df(arm, rounds: int) -> float | None:
     return best if best < float("inf") else None
 
 
-def _time_arm(df, udf, rounds: int) -> float | None:
+def _time_arm(df: DataFrame, udf: UserDefinedFunction, rounds: int) -> float | None:
     return _time_df(df.select(udf(*[f"arg{i}" for i in range(len(df.columns))])), rounds)
 
 
-def _plans_python(df, udf) -> bool:
+def _plans_python(df: DataFrame, udf: UserDefinedFunction) -> bool:
     """True when the served arm's physical plan still evaluates the python UDF.
 
     `udf.transpiled` only says a rewrite was offered. Spark drops one it
@@ -187,7 +190,7 @@ def _plans_python(df, udf) -> bool:
         return False  # planning errors surface in _time_arm, as before
 
 
-def _bytecode_df(df, row, rtype):
+def _bytecode_df(df: DataFrame, row: CacheRow, rtype: DataType) -> DataFrame:
     job = row.as_job()
     with make_sandbox(job) as sandbox:
         sql = BytecodeBackend().run(job, sandbox).sql
@@ -195,7 +198,7 @@ def _bytecode_df(df, row, rtype):
     return df.select(*params).select(F.expr(sql).cast(rtype))
 
 
-def _java_eval_expr(spark, func, rtype, arity: int):
+def _java_eval_expr(spark: SparkSession, func: Callable[..., Any], rtype: DataType, arity: int) -> Column:
     emitted = emit_java_eval(func)
     compiled = compile_java(spark, emitted.java_source, emitted.class_name)
     sql_name = verify_function_name("bce_catalog", compiled.jar_bytes)
@@ -216,7 +219,13 @@ def _session(app: str, extra: dict[str, str] | None = None) -> SparkSession:
     return builder.getOrCreate()
 
 
-def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], comet_jar: str) -> None:
+def _comet_phase(
+    args: argparse.Namespace,
+    rows: list[CacheRow],
+    out: dict[str, dict],
+    py_secs: dict[str, float],
+    comet_jar: str,
+) -> None:
     """The same served SQL, executed natively by Comet, in a fresh JVM: the jar
     must be on the driver classpath at launch, so the first session's gateway
     (and its JVM) is retired first."""
@@ -279,6 +288,9 @@ def _comet_phase(args, rows, out: dict[str, dict], py_secs: dict[str, float], co
                     rust_failures.append(name)
                     continue
             values = _values_for(row.input_types)
+            # Rust rows were checked above; any other row only has a transpiled
+            # number when the first phase found sample values for it.
+            assert values is not None
             try:
                 func = _import_function(row.source_text, name)
             except Exception as exc:

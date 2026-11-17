@@ -32,11 +32,12 @@ import tempfile
 import textwrap
 import time
 from pathlib import Path
+from typing import Any, Callable, Optional, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pyspark.sql import SparkSession  # noqa: E402
-from pyspark.sql.types import BooleanType, LongType, StringType  # noqa: E402
+from pyspark.sql.types import BooleanType, DataType, LongType, StringType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, shutdown  # noqa: E402
@@ -54,6 +55,7 @@ from ai_udf_transpile.backends.fake import (  # noqa: E402
     zfill3,
 )
 from ai_udf_transpile.catalog import configured_tolerance  # noqa: E402
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.keys import (  # noqa: E402
     canonical_source,
     canonical_source_from_func,
@@ -65,9 +67,9 @@ from ai_udf_transpile.types import input_spark_types, return_spark_type  # noqa:
 from ai_udf_transpile.verify import hypothesis_check  # noqa: E402
 
 
-def gave_up(func) -> bool:
+def gave_up(func: Callable[..., Any]) -> bool:
     """The backend already failed func; failed rows cool down instead of re-queueing."""
-    catalog = get_catalog()
+    catalog = cast(SqliteCatalog, get_catalog())
     with catalog._lock:
         row = catalog._conn.execute(
             "SELECT status FROM cache WHERE source_text = ?", (canonical_source_from_func(func),)
@@ -75,7 +77,7 @@ def gave_up(func) -> bool:
     return row is not None and row[0] == "failed"
 
 
-def wait_transpiled(func, rtype, timeout=900):
+def wait_transpiled(func: Callable[..., Any], rtype: DataType, timeout: float = 900) -> UserDefinedFunction:
     """Re-create the UDF until the cache hit transpiles it."""
     deadline = time.time() + timeout
     udf = UserDefinedFunction(func, rtype)
@@ -85,7 +87,9 @@ def wait_transpiled(func, rtype, timeout=900):
     return udf
 
 
-def verify_candidate(spark, func, return_type, candidate_sql):
+def verify_candidate(
+    spark: SparkSession, func: Callable[..., Any], return_type: DataType, candidate_sql: str
+) -> tuple[bool, Optional[str]]:
     """Run Hypothesis on a candidate SQL rewrite without touching the catalog."""
     src = textwrap.dedent(inspect.getsource(func))
     tree = ast.parse(src)
@@ -95,6 +99,7 @@ def verify_candidate(spark, func, return_type, candidate_sql):
     captures = extract_captures(func, function_ast, params) or {}
     in_types = input_spark_types(function_ast, params) or []
     out_type = return_spark_type(return_type)
+    assert out_type is not None  # callers pass atomic types (LongType, BooleanType)
     result = TranspileResult(kind=KIND_CATALYST, sql=candidate_sql)
     ok, err = hypothesis_check(
         source_text=source,
@@ -112,9 +117,9 @@ def verify_candidate(spark, func, return_type, candidate_sql):
     return ok, err
 
 
-def _faithful_sql(func):
+def _faithful_sql(func: Callable[..., Any]) -> Optional[str]:
     """This run's verified catalyst SQL for func, or None."""
-    catalog = get_catalog()
+    catalog = cast(SqliteCatalog, get_catalog())
     with catalog._lock:  # the inline worker writes through the same connection
         row = catalog._conn.execute(
             "SELECT catalyst_sql FROM cache WHERE source_text = ? AND status = 'success'",
@@ -123,14 +128,14 @@ def _faithful_sql(func):
     return row[0] if row else None
 
 
-def _truncate(text, width=80):
+def _truncate(text: Optional[str], width: int = 80) -> str:
     if text is None:
         return "(none)"
     text = " ".join(text.split())
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def _func_name(source_text):
+def _func_name(source_text: Optional[str]) -> str:
     if not source_text:
         return "?"
     return source_text.split("(")[0].replace("def ", "").strip()
@@ -149,7 +154,7 @@ def main() -> int:
         tempfile.mkdtemp(prefix="ai-udf-inspect-"), "cache.sqlite"
     )
     enable(spark, sqlite_path=sqlite, backend=ai_backend(spark), inline_worker=True)
-    catalog = get_catalog()
+    catalog = cast(SqliteCatalog, get_catalog())
     spark.conf.set("spark.sql.experimental.optimizer.pyTranspilers", "ai")
     # weekday_of takes a datetime (timestamp category); opt in.
     conf.set_value(conf.INPUT_CATEGORIES, "numeric,string,bool,binary,timestamp", spark)
@@ -157,7 +162,7 @@ def main() -> int:
     conf.set_value(conf.PARTY_ON_STRINGS, "true", spark)
 
     print("=== TRANSPILATION RESULTS (what each UDF became) ===")
-    udfs = [
+    udfs: list[tuple[Callable[..., Any], DataType]] = [
         (plus_one, LongType()),
         (is_none_branch, LongType()),
         (greet, StringType()),
@@ -204,7 +209,7 @@ def main() -> int:
     print("agents. Hypothesis decides which ship and which get rejected.")
     print()
 
-    candidates = [
+    candidates: list[tuple[str, Callable[..., Any], DataType, list[tuple[str, Optional[str]]]]] = [
         (
             "mod_bucket (value % modulus; python floors, Spark truncates)",
             mod_bucket,
@@ -266,10 +271,10 @@ def main() -> int:
     from ai_udf_transpile.targets import TranspileJob as _TJ
 
     class _NoopSandbox:
-        def __truediv__(self, o):
+        def __truediv__(self, o: object) -> _NoopSandbox:
             return self
 
-        def write_text(self, *a, **k):
+        def write_text(self, *a: object, **k: object) -> None:
             pass
 
     bc = _BC()

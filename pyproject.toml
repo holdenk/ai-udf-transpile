@@ -69,7 +69,7 @@ select = ["E", "F", "I", "W"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["ai_udf_transpile"]
+files = ["ai_udf_transpile", "examples"]
 explicit_package_bases = true
 # PySpark comes from $SPARK_HOME, not PyPI, so it is often not importable here.
 ignore_missing_imports = true
@@ -84,6 +84,12 @@ exclude = ["questionable_benchmark_results/"]
 [[tool.mypy.overrides]]
 module = ["ai_udf_transpile.backends.fake", "ai_udf_transpile.backends.fhi_udfs"]
 disable_error_code = ["return-value", "return", "var-annotated", "no-untyped-def"]
+
+# Same for the demos' sample UDFs (`t: datetime` is the module on purpose,
+# `untyped(x)` demonstrates an untyped UDF, loop UDFs return None).
+[[tool.mypy.overrides]]
+module = ["examples.demo", "examples.demo_rust_udf", "demo", "demo_rust_udf"]
+disable_error_code = ["return-value", "valid-type", "var-annotated", "attr-defined", "no-untyped-def"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

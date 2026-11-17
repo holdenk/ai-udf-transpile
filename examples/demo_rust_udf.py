@@ -28,19 +28,22 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any, Callable, Optional, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pyspark.sql import SparkSession  # noqa: E402
-from pyspark.sql.types import BooleanType, LongType  # noqa: E402
+from pyspark.sql import DataFrame, SparkSession  # noqa: E402
+from pyspark.sql.types import BooleanType, DataType, LongType  # noqa: E402
 from pyspark.sql.udf import UserDefinedFunction  # noqa: E402
 
 from ai_udf_transpile import conf, enable, rustc, shutdown  # noqa: E402
 from ai_udf_transpile.backends import ai_backend  # noqa: E402
+from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
 from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
 
@@ -111,13 +114,13 @@ UDFS = [
 ]
 
 
-def _row(func):
+def _row(func: Callable[..., Any]) -> Optional[sqlite3.Row]:
     """This session's row for ``func``: same source AND same Spark version.
 
     A shared cache can hold the same source under another Spark version, or
     the "+no-rust" twin a session without Comet queued; neither is ours.
     """
-    catalog = get_catalog()
+    catalog = cast(SqliteCatalog, get_catalog())
     spark = SparkSession.getActiveSession()
     with catalog._lock:
         return catalog._conn.execute(
@@ -127,7 +130,7 @@ def _row(func):
         ).fetchone()
 
 
-def wait_for_row(func, rtype, timeout: float):
+def wait_for_row(func: Callable[..., Any], rtype: DataType, timeout: float) -> UserDefinedFunction:
     """Re-create the UDF until the worker has answered (success or failed)."""
     deadline = time.time() + timeout
     udf = UserDefinedFunction(func, rtype)
@@ -140,7 +143,7 @@ def wait_for_row(func, rtype, timeout: float):
     return udf
 
 
-def rows_per_second(df, rows: int, rounds: int = 3) -> float:
+def rows_per_second(df: DataFrame, rows: int, rounds: int = 3) -> float:
     best = float("inf")
     for _ in range(rounds):
         started = time.perf_counter()
