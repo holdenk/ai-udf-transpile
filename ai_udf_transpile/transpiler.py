@@ -8,7 +8,7 @@ import contextlib
 import contextvars
 import logging
 import weakref
-from typing import Any, List, Optional
+from typing import Any, Iterator, List, Optional
 
 from ai_udf_transpile import conf
 from ai_udf_transpile.catalog import HIT, MISS, Catalog
@@ -150,7 +150,7 @@ _NO_RUST_ROUTING: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 
 @contextlib.contextmanager
-def no_rust_routing():
+def no_rust_routing() -> Iterator[None]:
     """Resolve UDFs to their no-Rust twin key inside the block (the worker's
     smoke test of a twin row must reconstruct that row, not the Rust one)."""
     token = _NO_RUST_ROUTING.set(True)
@@ -226,7 +226,7 @@ def _maybe_wrap_sampling(spark: Any, key: str, in_cats: list[str]) -> None:
         logger.debug("could not wrap UDF for sampling", exc_info=True)
 
 
-def get_transpiler_class() -> type:
+def get_transpiler_class() -> type[Any]:
     global _TRANSPILER_CLS
     if _TRANSPILER_CLS is not None:
         return _TRANSPILER_CLS
@@ -307,7 +307,7 @@ def get_transpiler_class() -> type:
     return AITranspiler
 
 
-def register_transpiler() -> type:
+def register_transpiler() -> type[Any]:
     cls = get_transpiler_class()
     cls.register()
     return cls

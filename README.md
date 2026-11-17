@@ -860,11 +860,16 @@ use `catalog.awaiting_approval()`, `catalog.approve(key, reviewer)`, and
 
 ```bash
 pytest -m "not spark" tests/   # no JVM
-SPARK_HOME=/path/to/spark-master pytest tests/   # plus classic SparkSession tests
+SPARK_HOME=/path/to/spark-4.3+ pytest tests/   # plus classic SparkSession tests
+ruff check . && ruff format --check . && mypy   # lint, format, types (config in pyproject.toml)
 ```
 
-The Spark tests need a package-only build of `apache/spark@master`
-(`./build/mvn -DskipTests -Phadoop-3 package -pl sql/core,assembly -am`).
+The Spark tests need Spark 4.3+: a release, or a package-only build of
+`branch-4.x` / master (`./build/mvn -DskipTests -Phadoop-3 package -pl sql/core,assembly -am`;
+`examples/setup_spark.sh` does either). `mypy` checks the package and the
+examples with untyped defs disallowed; the fixture UDFs in `backends/fake.py`
+and `backends/fhi_udfs.py` are exempt from the return-type checks, because
+their source and annotations are what the catalog keys and Spark read.
 `tests/conftest.py` puts `$SPARK_HOME/python` and py4j on `sys.path` and pins
 `PYSPARK_PYTHON` to the running interpreter so workers match the driver.
 

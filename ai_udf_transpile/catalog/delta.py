@@ -71,7 +71,7 @@ def _row_from_spark(rec: Any) -> CacheRow:
     as_dict = rec.asDict() if hasattr(rec, "asDict") else dict(rec)
     hyp = as_dict.get("hypothesis_passed")
     binary = as_dict.get("impl_binary")
-    if binary is not None and not isinstance(binary, (bytes, bytearray, type(None))):
+    if binary is not None and not isinstance(binary, bytes):
         binary = bytes(binary)
     return CacheRow(
         udf_key=as_dict["udf_key"],

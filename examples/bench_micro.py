@@ -563,6 +563,8 @@ def main() -> int:
     if requested is None and comet_preset:
         kinds = [*kinds, KIND_RUST]
     if KIND_RUST in kinds:
+        # The probes read the targets conf; the rust run pins it the same way.
+        conf.set_value(conf.TARGETS, KIND_RUST, spark)
         reason = rustc.rust_unservable(spark)
         if not reason and not rustc.rust_offered(spark, ["bigint"], "bigint"):
             reason = "no cargo or no comet-udf-sdk to build against"

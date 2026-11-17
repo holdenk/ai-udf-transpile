@@ -15,7 +15,13 @@ import re
 import textwrap
 import threading
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
+
+if TYPE_CHECKING:
+    from decimal import Decimal
+
+    from hypothesis.strategies import SearchStrategy
+    from pyspark.sql.types import DataType, StructField
 
 logger = logging.getLogger(__name__)
 
@@ -597,7 +603,7 @@ def _rust_std_receiver(before: str, fields: set[str]) -> bool:
     return not tail[i:].strip()
 
 
-def _rust_alias_resolver(scanned: str):
+def _rust_alias_resolver(scanned: str) -> Callable[[str], str]:
     """A function mapping a ``use .. as`` alias (chains included) to the name it renames."""
     aliases = {}
     for use in _RUST_USE.finditer(scanned):
@@ -707,7 +713,7 @@ def _rust_int_expr(text: str) -> float:
     return float(result) if result >= 0 else _RUST_INFINITE
 
 
-def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Optional[str]:
+def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve: Callable[[str], str]) -> Optional[str]:
     """Why the source may need more stack than ``_RUST_STACK_BUDGET``, if it may.
 
     Counts every array type or repeat expression (``[T; N]``, ``[x; N]``,
@@ -766,13 +772,13 @@ def _rust_stack_estimate(scanned: str, types: dict[str, str], resolve) -> Option
         else:
             words = [resolve(w) for w in re.findall(r"[A-Za-z_]\w*", elem)]
             local = [w for w in words if w in types]
-            prim = [_RUST_PRIM_SIZE[w] for w in words if w in _RUST_PRIM_SIZE]
+            prim: list[float] = [_RUST_PRIM_SIZE[w] for w in words if w in _RUST_PRIM_SIZE]
             each = max([local_size(w, seen | {w}) for w in local] + prim or [8])
         if each == _RUST_INFINITE:
             return _RUST_INFINITE  # an unsizable element stays unsizable, even times 0
         return n * each
 
-    def occurrences(text: str):
+    def occurrences(text: str) -> Iterator[str]:
         """Every array to count: ``vec![x; n]`` is heap, but an array inside it is not."""
         for i in _rust_top_brackets(text):
             inner = text[i + 1 : _rust_close(text, i)]
@@ -817,7 +823,8 @@ def _rust_close(text: str, i: int) -> int:
 
 def _rust_top_brackets(text: str) -> list[int]:
     """Start of every outermost ``[..]`` in ``text`` (nested ones are their contents)."""
-    out, i = [], 0
+    out: list[int] = []
+    i = 0
     while True:
         i = text.find("[", i)
         if i < 0:
@@ -1034,7 +1041,7 @@ def _rust_recursion(scanned: str) -> Optional[str]:
             if mentions(text, other, fields):
                 edges[name].add(other)
     for node in sorted(names):
-        seen: set[str] = set()
+        seen = set()
         stack = list(edges[node])
         while stack:
             cur = stack.pop()
@@ -1231,7 +1238,7 @@ def _decimal_shape(spark_type: str) -> Optional[tuple[int, int]]:
     return precision, scale
 
 
-def _decimal_bound(precision: int, scale: int):
+def _decimal_bound(precision: int, scale: int) -> Decimal:
     """Largest magnitude a decimal(precision, scale) column holds."""
     from decimal import Decimal
 
@@ -1278,7 +1285,7 @@ def _decimal_examples_for(stype: str) -> list:
     return list(dict.fromkeys(out))
 
 
-def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
+def _strategy_for(spark_type: str, *, party_on_strings: bool = False) -> SearchStrategy[Any]:
     from hypothesis import strategies as st
 
     t = spark_type.strip().lower()
@@ -1341,7 +1348,7 @@ def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
         key_t, _, val_t = t[4:-1].partition(",")
         if key_t.strip() == "string" and val_t.strip() == "string":
 
-            def _text(max_size: int):
+            def _text(max_size: int) -> SearchStrategy[str]:
                 return st.text(
                     alphabet=st.characters(blacklist_categories=("Cs", "Cn")),
                     max_size=max_size,
@@ -1394,7 +1401,7 @@ def _strategy_for(spark_type: str, *, party_on_strings: bool = False):
     raise VerifyFailed(f"unsupported input type for verify: {spark_type}")
 
 
-def _spark_type(simple: str):
+def _spark_type(simple: str) -> DataType:
     from pyspark.sql.types import (
         BinaryType,
         BooleanType,
@@ -1453,7 +1460,7 @@ def _spark_type(simple: str):
 SQL_BATCH_ROWS = 100
 
 
-def _param_fields(input_types: list[str]):
+def _param_fields(input_types: list[str]) -> list[StructField]:
     from pyspark.sql.types import StructField
 
     return [
@@ -1472,7 +1479,7 @@ _NATIVE_ROWS: dict[int, dict[str, Any]] = {}
 
 
 @contextmanager
-def _comet_native_rows(spark: Any, native: bool):
+def _comet_native_rows(spark: Any, native: bool) -> Iterator[None]:
     """Let Comet take the operator above an in-memory DataFrame.
 
     A Rust UDF runs only inside Comet's native execution, and the verifier's
@@ -1514,7 +1521,7 @@ class VerifyQueryTimeout(RuntimeError):
 
 
 @contextlib.contextmanager
-def _query_deadline(spark: Any):
+def _query_deadline(spark: Any) -> Iterator[None]:
     """Cancel the Spark jobs started inside after ``verifyQueryTimeoutSeconds``.
 
     A candidate whose loop never ends (Java or Rust; SQL cannot loop) would
@@ -1564,7 +1571,7 @@ def _query_deadline(spark: Any):
 
 def _eval_sql(
     spark: Any, sql: str, args: tuple, input_types: list[str], return_type: str, native: bool = False
-):
+) -> Any:
     from pyspark.sql import Row
     from pyspark.sql.types import StructType
 
@@ -1983,8 +1990,8 @@ def hypothesis_check(
                 for d in _decimal_examples_for(stype):
                     examples.append(tuple(d if j == i else None for j in range(arity)))
             elif stype in {"double", "float"}:
-                for n in BUILTIN_DOUBLE_EXAMPLES:
-                    examples.append(tuple(n if j == i else None for j in range(arity)))
+                for x in BUILTIN_DOUBLE_EXAMPLES:
+                    examples.append(tuple(x if j == i else None for j in range(arity)))
             elif stype.startswith("map<"):
                 for m in BUILTIN_MAP_EXAMPLES:
                     examples.append(tuple(dict(m) if j == i else None for j in range(arity)))

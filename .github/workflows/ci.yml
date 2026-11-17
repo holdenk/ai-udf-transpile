@@ -33,6 +33,8 @@ jobs:
         run: |
           ruff check .
           ruff format --check .
+      - name: Mypy
+        run: mypy
       - name: Unit tests
         env:
           AI_UDF_TRANSPILE_BACKEND: fake

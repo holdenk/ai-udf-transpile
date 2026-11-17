@@ -128,8 +128,8 @@ def python_regex_calls(source_text: str) -> int:
             for child in node.body + node.orelse:
                 total += count(child, inner)
             return total
-        for child in ast.iter_child_nodes(node):
-            total += count(child, multiplier)
+        for sub in ast.iter_child_nodes(node):
+            total += count(sub, multiplier)
         return total
 
     return sum(count(stmt, 1) for stmt in func.body)

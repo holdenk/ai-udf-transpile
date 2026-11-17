@@ -298,14 +298,14 @@ def udf_instance_from_spark_stack() -> Any:
         from pyspark.sql.udf import UserDefinedFunction
     except Exception:
         return None
-    frame = _inspect.currentframe()
+    current = _inspect.currentframe()
+    frame = current.f_back if current is not None else None
     try:
-        frame = frame.f_back
         while frame is not None:
             candidate = frame.f_locals.get("self")
             if isinstance(candidate, UserDefinedFunction):
                 return candidate
             frame = frame.f_back
     finally:
-        del frame
+        del frame, current
     return None

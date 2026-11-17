@@ -9,7 +9,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Protocol
+from typing import Any, Iterator, Optional, Protocol
 
 from ai_udf_transpile import conf
 from ai_udf_transpile.targets import (
@@ -39,7 +39,7 @@ def provisional_visible() -> bool:
 
 
 @contextmanager
-def expose_provisional():
+def expose_provisional() -> Iterator[None]:
     previous = provisional_visible()
     _provisional.on = True
     try:
@@ -336,7 +336,8 @@ def open_catalog(spark: Any = None, *, sqlite_path: Optional[str] = None) -> Cat
         path = sqlite_path or conf.get_value(conf.SQLITE_PATH, spark, "")
         if not path:
             raise ValueError("sqlite catalog requires spark.sql.experimental.aiUdfTranspile.sqlitePath")
-        catalog: Catalog = SqliteCatalog(path)
+        sqlite = SqliteCatalog(path)
+        catalog: Catalog = sqlite
         table = conf.get_value(conf.WRITEBACK_TABLE, spark, conf.DEFAULTS[conf.WRITEBACK_TABLE]).strip()
         if table:
             if spark is None:
@@ -350,7 +351,7 @@ def open_catalog(spark: Any = None, *, sqlite_path: Optional[str] = None) -> Cat
                 threshold = conf.get_int(
                     conf.WRITEBACK_THRESHOLD, spark, int(conf.DEFAULTS[conf.WRITEBACK_THRESHOLD])
                 )
-                catalog = WritebackCatalog(catalog, spark, table, fmt.strip().lower(), threshold)
+                catalog = WritebackCatalog(sqlite, spark, table, fmt.strip().lower(), threshold)
         return catalog
     if kind == "delta":
         from ai_udf_transpile.catalog.delta import DeltaCatalog
