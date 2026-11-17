@@ -93,8 +93,9 @@ examples/setup_spark.sh --spark 4.3 --write-env-file .spark-env && source .spark
 examples/setup_spark.sh --spark branch-4.x --write-env-file .spark-env && source .spark-env
 ```
 
-CI still builds Spark from a pinned `apache/spark` SHA on `branch-4.x`
-(`SPARK_REF` in `.github/workflows/ci.yml`) with `-DskipTests`.
+CI still builds Spark from a pinned `apache/spark` master SHA
+(`SPARK_REF` in `.github/workflows/ci.yml`) with `-DskipTests`, not
+`branch-4.x`: see the Rust target's Arrow caveat below.
 
 ## Usage
 
@@ -404,6 +405,12 @@ fallback; until then this target trades the plugin's safety for speed.
 
 **Other limits.**
 
+- Spark builds that ship `arrow-c-data` (`branch-4.x` as of 2026-11) break it
+  with the Comet we pin: Spark's unshaded `org.apache.arrow.c` classes shadow
+  the ones Comet's native UDF path calls with its shaded allocator, and every
+  Rust UDF fails with `NoSuchMethodError` on `ArrowArrayStream.allocateNew`.
+  The SQL and Java targets are unaffected. Use the CI-pinned master build, or
+  a Comet built against that Spark.
 - Atomic inputs and outputs only: `bigint`, `int`, `smallint`, `tinyint`,
   `double`, `float`, `boolean`, `string`, `binary`. No arrays, maps,
   timestamps or decimals yet.

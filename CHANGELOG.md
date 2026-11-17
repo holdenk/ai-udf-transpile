@@ -7,6 +7,17 @@ evidence for a direction, not a promise about your cluster.
 
 ## Unreleased
 
+### CI stays on its Spark master pin; Rust target vs `branch-4.x` (2026-11-17)
+
+The ported move of CI's Spark pin to the `branch-4.x` tip is reverted.
+`branch-4.x`'s `sql/core` ships `arrow-c-data`, whose unshaded
+`org.apache.arrow.c` classes shadow the ones the pinned Comet's native UDF
+path calls with its shaded allocator: every Rust UDF failed with
+`NoSuchMethodError` on `ArrowArrayStream.allocateNew` (the SQL and Java targets
+were fine). The README's Rust section records the conflict; the Spark and Comet
+pins have to move together. `setup_spark.sh --spark branch-4.x` still works for
+the SQL/Java benchmarks.
+
 ### Every target filled separately; no more `*_java` / `*_rust` twin UDFs (2026-11-17)
 
 The bench, demos and tests used to reach the Java and Rust arms through
