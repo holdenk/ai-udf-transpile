@@ -83,7 +83,8 @@ examples/setup_spark.sh --spark 4.3 --write-env-file .spark-env && source .spark
 examples/setup_spark.sh --spark branch-4.x --write-env-file .spark-env && source .spark-env
 ```
 
-CI still builds Spark from a pinned `apache/spark` SHA with `-DskipTests`.
+CI still builds Spark from a pinned `apache/spark` SHA on `branch-4.x`
+(`SPARK_REF` in `.github/workflows/ci.yml`) with `-DskipTests`.
 
 ## Usage
 
