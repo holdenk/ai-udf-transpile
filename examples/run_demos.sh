@@ -303,6 +303,8 @@ if [ "$DUMP" -eq 1 ]; then
     [ -f "$CATALOG_CSV" ] && DUMP_ARGS+=(--perf-csv "$CATALOG_CSV")
     [ -f "$BYTECODE_CSV" ] && DUMP_ARGS+=(--perf-csv "$BYTECODE_CSV")
     [ -f "$CSV" ] && DUMP_ARGS+=(--perf-csv "$CSV")
+    # The Comet micro run: dump_results takes only its Rust arm from it.
+    [ -f "$MICRO_COMET_CSV" ] && DUMP_ARGS+=(--perf-csv "$MICRO_COMET_CSV")
     [ -f "$TPCDS_CSV" ] && DUMP_ARGS+=(--perf-csv "$TPCDS_CSV")
     [ -f "$FHI_CSV" ] && DUMP_ARGS+=(--perf-csv "$FHI_CSV")
   fi

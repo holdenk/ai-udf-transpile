@@ -550,3 +550,45 @@ def test_a_later_catalog_schema_csv_keeps_arms_it_did_not_measure(tmp_path):
     perf = dump._perf_lines([str(cat), str(fhi)])
     assert perf["has_item"]["static"] == "3.0M rows/s (1.5x vs python)"  # catalog's, kept
     assert perf["has_item"]["ai"].startswith("7.0M rows/s (3.5x vs python)")  # fhi's, newer
+
+
+def test_a_new_key_does_not_inherit_another_rows_ai_rate(tmp_path):
+    dump = _load_dump_module()
+    head = (
+        "function,rows,python_rows_per_second,transpiled_rows_per_second,"
+        "transpiled_speedup_vs_python,comet_rows_per_second,comet_speedup_vs_python,"
+        "status,target_kind,backend,model,udf_key\n"
+    )
+    rust = tmp_path / "rust.csv"
+    rust.write_text(head + "collatz_steps,1000,300000,6000000,20.0,,,success,rust,claude,m,krust\n")
+    java = tmp_path / "java.csv"
+    java.write_text(head + "collatz_steps,1000,300000,,,,,failed,java_udf,claude,m,kjava\n")
+    perf = dump._perf_lines([str(rust), str(java)])
+    assert not dump._perf_for(perf, "collatz_steps", "kjava").get("ai")  # the Rust rate stays on krust
+    assert dump._perf_for(perf, "collatz_steps", "krust")["ai"].endswith("Comet native)")
+
+
+def test_the_comet_micro_csv_contributes_only_its_rust_arm(tmp_path):
+    dump = _load_dump_module()
+    header = (
+        "function,kinds,regular_rows_per_second,transpiled_static_rows_per_second,"
+        "transpiled_ai_catalyst_rows_per_second,transpiled_ai_java_rows_per_second,"
+        "transpiled_ai_rust_rows_per_second,static_speedup_vs_regular,ai_catalyst_speedup_vs_regular,"
+        "ai_java_speedup_vs_regular,ai_rust_speedup_vs_regular,transpile_succeeded_static,"
+        "transpile_succeeded_ai_catalyst,transpile_succeeded_ai_java,transpile_succeeded_ai_rust,"
+        "ai_backend,ai_model\n"
+    )
+    plain = tmp_path / "bench.csv"
+    plain.write_text(
+        header + "plus_one,catalyst+java,1000000,,4000000,2000000,,,4.0,2.0,,False,True,True,False,c,m\n"
+    )
+    comet = tmp_path / "bench_comet.csv"
+    comet.write_text(
+        header + "plus_one,catalyst+java+rust,900000,,9000000,8000000,5000000,"
+        ",10.0,8.9,5.6,False,True,True,True,c,m\n"
+    )
+    perf = dump._perf_lines([str(plain), str(comet)])["plus_one"]
+    assert perf["ai:catalyst"] == "4.0M rows/s (4.0x vs python)"  # plain run's, not Comet's
+    assert perf["ai:java_udf"] == "2.0M rows/s (2.0x vs python)"
+    assert perf["top"].endswith("interpreted python 1.0M rows/s")
+    assert perf["ai:rust"] == "5.0M rows/s (5.6x vs python, Comet native)"

@@ -98,6 +98,11 @@ def _empty_perf() -> dict[str, str]:
 
 def _record_perf(perf: dict[str, dict[str, str]], name: str, arms: dict[str, str]) -> None:
     current = perf.setdefault(name, {})
+    if current.get("udf_key") and arms.get("udf_key") and current["udf_key"] != arms["udf_key"]:
+        # Another catalog row under the same name: the generic AI rate was
+        # measured on the old row and must not be rebound to the new key.
+        # Function-wide arms (python, static, bytecode, micro ai:<kind>) stay.
+        current.pop("ai", None)
     for arm, value in arms.items():
         if value or arm not in current:
             current[arm] = value
@@ -202,6 +207,10 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     )
                 _record_perf(perf, r["function"], arms)
         elif "kinds" in rows[0]:  # bench_micro wide CSV
+            # The --rust-accel run (run_demos names it *_comet.csv) measured its
+            # python/static/SQL/Java arms under Comet: only its Rust arm, which
+            # exists nowhere else, is taken from it.
+            comet_run = "comet" in Path(path).stem
             for r in rows:
                 py = _fmt_rate(r["regular_rows_per_second"])
                 top = f"- **perf (micro bench)**: interpreted python {py} rows/s"
@@ -224,7 +233,10 @@ def _perf_lines(paths: list[str]) -> dict[str, dict[str, str]]:
                     if rate and r.get(f"transpile_succeeded_{column}") == "True":
                         speedup = r[f"{column}_speedup_vs_regular"]
                         arms[f"ai:{kind}"] = f"{_fmt_rate(rate)} rows/s ({speedup}x vs python{where})"
-                _record_perf(perf, r["function"], arms)
+                if comet_run:
+                    arms = {"ai:rust": arms["ai:rust"]} if "ai:rust" in arms else {}
+                if arms:
+                    _record_perf(perf, r["function"], arms)
         elif "declined" in rows[0]:  # bench_tpcds CSV
             for r in rows:
                 arms = _empty_perf()
