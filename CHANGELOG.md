@@ -7,6 +7,31 @@ evidence for a direction, not a promise about your cluster.
 
 ## Unreleased
 
+### Every target filled separately; no more `*_java` / `*_rust` twin UDFs (2026-11-17)
+
+The bench, demos and tests used to reach the Java and Rust arms through
+renamed copies of a UDF (`plus_one_java`, `backwards_rust`, ...): same body,
+different def name, so a different catalog key that the fake backend mapped
+to another rewrite kind. A real backend never honored that mapping, and the
+copies showed up in the docs as UDFs of their own. They are gone:
+
+- `bench_micro.py` times one function per row and fills each AI kind in its
+  own catalog with `targets` pinned to that kind (`--targets all`, the
+  default, or any list of `catalyst,java_udf,rust`). A kind the backend
+  cannot produce leaves its arm empty with the reason, and the run still
+  writes its CSVs before exiting 1 (`--allow-missing-arms` to exit 0). The
+  CSV schema is unchanged; the timing CSV's `kind` column now names the
+  kind (`catalyst`, `java_udf`, `rust`).
+- `fill_targets.py --target all` runs every kind, each in its own process.
+- The fake backend keeps per-kind fixtures and answers with the most
+  preferred kind the job accepts, declining when it has none.
+- `dump_results.py` attaches a micro-bench number to a catalog row only for
+  the kind that row was served as.
+- Docs: the Rust target is marked as a preview that is not ready for real
+  use, at the top of the README and in its own section; the `targets` conf
+  is documented as what it is (the kinds a backend may answer with; one kind
+  pins it).
+
 ### Rust target docs: distribution and maturity (2026-11-16)
 
 Docs only. The Rust target is now flagged as very new (local masters only

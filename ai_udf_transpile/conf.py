@@ -55,9 +55,11 @@ WRITEBACK_THRESHOLD = PREFIX + "writebackThreshold"
 # (python -m ai_udf_transpile.approve). none | all | comma list of
 # string,struct,map,array,binary,timestamp,network | hard. See approval.py.
 REQUIRE_APPROVAL = PREFIX + "requireApproval"
-# Rewrite kinds a backend may be asked for and a lookup may serve. `rust`
-# (a Comet native UDF) is opt-in: Spark cannot evaluate it, so a query whose
-# operator Comet does not take FAILS instead of falling back to Python.
+# Rewrite kinds a backend may be asked for and a lookup may serve. A single
+# kind pins it: the worker asks for and accepts only that kind (the bench and
+# fill_targets.py fill each kind this way). `rust` (a Comet native UDF) is an
+# opt-in preview, not ready for real use: Spark cannot evaluate it, so a query
+# whose operator Comet does not take FAILS instead of falling back to Python.
 TARGETS = PREFIX + "targets"
 RUST_CARGO = PREFIX + "rust.cargo"
 # Where UDF libraries are built and cached. Default ~/.cache/ai_udf_transpile/rust.

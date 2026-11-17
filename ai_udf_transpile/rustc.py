@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build a Rust row function into a Comet native UDF and register it.
 
-**Very new.** This target, and the Comet native UDF API under it, are days
-old and lightly exercised: expect sharp edges, especially off a laptop.
+**Preview, not ready for real use.** This target, and the Comet native UDF
+API under it, are days old and have only run on local masters and in CI:
+expect breaking changes and sharp edges, especially off a laptop. Unlike the
+SQL and Java targets it is not fail-open (see below).
 
 The ``rust`` target runs inside Apache DataFusion Comet's native execution:
 Comet loads a ``cdylib`` built against its ``comet-udf-sdk`` and calls it on

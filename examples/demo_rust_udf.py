@@ -8,6 +8,9 @@ rather than a Java UDF. The demo prints whichever rewrite was served, the
 physical plan (a Rust call sits inside CometProject: no JVM or Python hop
 per row), and the throughput against the interpreted Python UDF.
 
+The rust target is a preview and not ready for real use (README, "Rust
+target"): this demo is for trying it on a laptop, not a recommendation.
+
 Needs, on top of the usual Spark setup (see demo_quickstart.py):
 
     examples/setup_comet.sh --write-env-file .comet-env && source .comet-env
