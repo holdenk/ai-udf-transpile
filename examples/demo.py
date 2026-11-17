@@ -39,7 +39,7 @@ from ai_udf_transpile.backends import ai_backend  # noqa: E402
 from ai_udf_transpile.catalog import CacheRow, Catalog  # noqa: E402
 from ai_udf_transpile.catalog.sqlite import SqliteCatalog  # noqa: E402
 from ai_udf_transpile.keys import canonical_source_from_func  # noqa: E402
-from ai_udf_transpile.transpiler import get_catalog  # noqa: E402
+from ai_udf_transpile.transpiler import get_catalog, served_kind  # noqa: E402
 
 
 def plus_one(x: int) -> int:
@@ -235,6 +235,15 @@ def always_decline(x: int) -> int:
 _TIMEOUTS: list[str] = []
 
 
+# What served_kind() names, for the printed label.
+_KIND_LABELS = {
+    "catalyst": "Catalyst SQL",
+    "java_udf": "Java UDF",
+    "gpu_kernel": "Java UDF + CUDA",
+    "rust": "Rust UDF",
+}
+
+
 def gave_up(func: Callable[..., Any]) -> bool:
     """The backend already failed func; failed rows cool down instead of re-queueing."""
     catalog = get_catalog()
@@ -245,21 +254,6 @@ def gave_up(func: Callable[..., Any]) -> bool:
             "SELECT status FROM cache WHERE source_text = ?", (canonical_source_from_func(func),)
         ).fetchone()
     return row is not None and row[0] == "failed"
-
-
-def served_kind(func: Callable[..., Any]) -> str:
-    """What the catalog actually serves for func: a row filled earlier with
-    other targets (the cache key has no kind) is not a Java UDF just because
-    java_udf is the target now."""
-    catalog = cast(SqliteCatalog, getattr(get_catalog(), "_staging", get_catalog()))
-    with catalog._lock:
-        row = catalog._conn.execute(
-            "SELECT target_kind FROM cache WHERE source_text = ? AND status = 'success'",
-            (canonical_source_from_func(func),),
-        ).fetchone()
-    return {"catalyst": "Catalyst SQL", "java_udf": "Java UDF", "rust": "Rust UDF"}.get(
-        row[0] if row else "", "not served"
-    )
 
 
 def wait_transpiled(
@@ -469,9 +463,10 @@ def main() -> int:
     bw = wait_transpiled("bw not transpiled", backwards, StringType())
     conf.set_value(conf.TARGETS, conf.DEFAULTS[conf.TARGETS], spark)
     bw_rows = [r[0] for r in names.select(bw("name")).collect()]
-    print(
-        f"backwards: transpiled={bool(bw.transpiled)} results={bw_rows} ({served_kind(backwards)} from cache)"
-    )
+    # Labeled by what was served, not by the targets conf: the cache key has
+    # no kind, so an earlier run may have left a SQL rewrite for backwards.
+    bw_kind = _KIND_LABELS.get(served_kind(bw) or "", "not served")
+    print(f"backwards: transpiled={bool(bw.transpiled)} results={bw_rows} ({bw_kind} from cache)")
 
     b = wait_transpiled("b not transpiled", both_positive, BooleanType())
     pairs = spark.createDataFrame([(1, 2), (-1, 2)], ["a", "b"])

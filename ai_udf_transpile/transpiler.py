@@ -7,6 +7,7 @@ import ast
 import contextlib
 import contextvars
 import logging
+import re
 import weakref
 from typing import Any, Iterator, List, Optional
 
@@ -67,6 +68,29 @@ def _pin_session(spark: Any) -> None:
             SparkSession._get_j_spark_session_class(jvm).setActiveSession(jspark)
     except Exception:
         logger.debug("could not pin SparkSession to this thread", exc_info=True)
+
+
+# The function names _reconstruct_column registers: javac.verify_function_name
+# ("ai_udf" / "ai_udf_gpu") and rustc's library names ("ai_udf_rs_").
+_SERVED_CALL = re.compile(r"\bai_udf_(rs_|gpu_)?[0-9a-f]{16}\(")
+_SERVED_KINDS = {"rs_": "rust", "gpu_": "gpu_kernel", "": "java_udf"}
+
+
+def served_kind(udf: Any) -> Optional[str]:
+    """The rewrite kind a constructed ``UserDefinedFunction`` actually carries.
+
+    Read from the served expression itself, not the catalog or the targets
+    conf: the cache key has no kind, so a session asking for java_udf can be
+    served a Catalyst rewrite another session filled. None when not
+    transpiled; ``catalyst`` for SQL, or ``java_udf`` / ``gpu_kernel`` /
+    ``rust`` when the expression calls a function this plugin registered.
+    """
+    transpiled = getattr(udf, "transpiled", None)
+    if not transpiled:
+        return None
+    text = " ".join(str(part) for part in transpiled)
+    found = _SERVED_CALL.search(text)
+    return _SERVED_KINDS[found.group(1) or ""] if found else "catalyst"
 
 
 def _reconstruct_column(row: Any, return_type: Any, spark: Any) -> Any:
