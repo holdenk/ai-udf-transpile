@@ -13,7 +13,8 @@ env:
   # Bump a pin to move CI onto a new engine. The build caches key on the
   # SHA, so a bump means exactly one rebuild, not a rebuild every time
   # upstream moves. These are the SHAs the dev box runs against.
-  SPARK_REF: "10a34a06707851ce0ab0afebee3d6c19cb757f27"
+  # SPARK_REF tracks apache/spark branch-4.x (the line the benchmarks target).
+  SPARK_REF: "199da49bf135ed554b0c837cdd7472f5b2ce291a"
   COMET_REF: "330b29cf1013351cd9d7e93d3d37a6bc0b6d956b"
 
 jobs:
